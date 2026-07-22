@@ -19,7 +19,7 @@ How it works, end to end:
 - **`plugin86.py` writes nothing but protocol JSON to stdout** (stderr for all logging) and never crashes on bad input — a dead plugin can wedge the relay.
 - Only the admin pubkey can ban (via kind 1984) or unban (via NIP-98). No other trust roots.
 - The admin pubkey can never end up in the blacklist (silent no-op on any attempt).
-- admin.html styling is limited to centering + one mobile font-size media query. No fonts, no colors, no frameworks, no CDN.
+- admin.html styling is limited to the exact CSS block in the admin.html section (centering, edge padding, npub wrapping, one mobile font-size media query). No fonts, no colors, no frameworks, no CDN.
 
 ## Repo layout
 
@@ -119,7 +119,15 @@ No sessions, cookies, or tokens.
 
 ## admin.html
 
-Raw HTML, one vanilla `<script>` block, no libraries. `<meta name="viewport" content="width=device-width, initial-scale=1">`. One `<style>` block containing ONLY: content centering (`max-width` + `margin: 0 auto`) and one media query bumping base font size on small screens. Nothing else — browser defaults throughout.
+Raw HTML, one vanilla `<script>` block, no libraries. `<meta name="viewport" content="width=device-width, initial-scale=1">`. One `<style>` block containing ONLY these layout rules — nothing else, browser defaults throughout:
+
+```css
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li { overflow-wrap: anywhere; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+```
+
+The `padding: 0 1em` is REQUIRED — without it, content sits flush against the screen edge on mobile (max-width centering does nothing when the viewport is narrower than the max-width). The `overflow-wrap: anywhere` is REQUIRED — npubs are 63-char unbreakable strings and will overflow the viewport horizontally without it. Do not remove either in the name of minimalism; they are the minimum.
 
 Content and behavior:
 
