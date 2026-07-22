@@ -22,6 +22,30 @@ Safe to run any number of times.
 
 If your strfry container isn't named `strfry`, substitute your actual container name in both commands above (`docker ps` to check).
 
+## Container has no network?
+
+strfry-86 is offline-first: if `strfry86-bundle.tar.gz` sits next to the updater script, the updater installs from it directly and never touches the network. Get both files onto the host by any means (the `curl` lines below are just one option — dragging the files over or `scp` work identically), then `docker cp` them in and run the updater exactly as before.
+
+Offline install (two files):
+
+```
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry-86-updater.py
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry86-bundle.tar.gz
+docker cp strfry-86-updater.py strfry:/config/strfry86/
+docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
+docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
+```
+
+Offline update (updater is already installed — one file):
+
+```
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry86-bundle.tar.gz
+docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
+docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
+```
+
+Only the `docker cp` and `docker exec` steps matter — get the file(s) onto the host however is convenient. Applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/` and kept, not deleted, so you can always see what was installed and when.
+
 ## First run
 
 On first run the updater needs your admin pubkey — the one and only key allowed to ban (via a NIP-56 report, kind `1984`) or unban (via NIP-98). It tries to read `relay.info.pubkey` from your `strfry.conf` first and, if found, asks you to confirm before using it; otherwise it prompts you to paste an `npub` or 64-char hex pubkey. It is never adopted silently. The result is stored as a public key only in `/config/strfry86/config.json` — your `nsec` never leaves your extension, and never touches this server.

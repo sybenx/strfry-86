@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# strfry-86 test suite: manifest freshness + plugin86.py accept/reject logic.
+# strfry-86 test suite: manifest/bundle freshness + plugin86.py accept/reject logic.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,18 +10,77 @@ FAILURES=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
-# --- manifest freshness ----------------------------------------------------
+# --- manifest + bundle freshness --------------------------------------------
 
 MANIFEST_BACKUP="$(mktemp)"
+BUNDLE_BACKUP="$(mktemp)"
 cp manifest.json "$MANIFEST_BACKUP"
-python3 tools/make_manifest.py > /dev/null
+cp strfry86-bundle.tar.gz "$BUNDLE_BACKUP"
+python3 tools/make_bundle.py > /dev/null
+
 if diff -q manifest.json "$MANIFEST_BACKUP" > /dev/null; then
     pass "manifest.json matches working tree"
 else
-    fail "manifest.json is stale — run tools/make_manifest.py and commit the result"
+    fail "manifest.json is stale — run tools/make_bundle.py and commit the result"
     cp "$MANIFEST_BACKUP" manifest.json
 fi
-rm -f "$MANIFEST_BACKUP"
+
+if diff -q strfry86-bundle.tar.gz "$BUNDLE_BACKUP" > /dev/null; then
+    pass "strfry86-bundle.tar.gz matches working tree"
+else
+    fail "strfry86-bundle.tar.gz is stale — run tools/make_bundle.py and commit the result"
+    cp "$BUNDLE_BACKUP" strfry86-bundle.tar.gz
+fi
+rm -f "$MANIFEST_BACKUP" "$BUNDLE_BACKUP"
+
+# --- committed bundle contents hash-match the manifest ----------------------
+
+CHECK_BUNDLE_SCRIPT="$(mktemp)"
+cat > "$CHECK_BUNDLE_SCRIPT" <<'PYEOF'
+import hashlib
+import json
+import sys
+import tarfile
+
+bundle_path, manifest_path = sys.argv[1], sys.argv[2]
+
+with open(manifest_path) as f:
+    manifest = json.load(f)
+
+with tarfile.open(bundle_path, "r:gz") as tar:
+    names = set(tar.getnames())
+
+    missing = sorted(rel for rel in manifest if rel not in names)
+    if missing:
+        print(f"bundle missing files listed in manifest: {missing}")
+        sys.exit(1)
+    if "manifest.json" not in names:
+        print("bundle missing manifest.json")
+        sys.exit(1)
+
+    for rel_path, expected_sha in manifest.items():
+        data = tar.extractfile(tar.getmember(rel_path)).read()
+        actual_sha = hashlib.sha256(data).hexdigest()
+        if actual_sha != expected_sha:
+            print(f"hash mismatch for {rel_path}: expected {expected_sha}, got {actual_sha}")
+            sys.exit(1)
+
+    bundled_manifest_raw = tar.extractfile(tar.getmember("manifest.json")).read()
+
+with open(manifest_path, "rb") as f:
+    committed_manifest_raw = f.read()
+
+if bundled_manifest_raw != committed_manifest_raw:
+    print("bundled manifest.json differs from committed manifest.json")
+    sys.exit(1)
+PYEOF
+
+if python3 "$CHECK_BUNDLE_SCRIPT" strfry86-bundle.tar.gz manifest.json; then
+    pass "committed bundle's contents hash-match manifest.json"
+else
+    fail "committed bundle's contents do NOT hash-match manifest.json"
+fi
+rm -f "$CHECK_BUNDLE_SCRIPT"
 
 # --- plugin86.py sandbox ----------------------------------------------------
 

@@ -6,7 +6,13 @@ import lib86. Safe to run any number of times (idempotent). Run via:
 
     docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
 
-See README.md for the one-command curl install.
+Source selection is offline-first: if strfry86-bundle.tar.gz sits next to
+this script, it is the source of truth (no network needed at all). Otherwise
+this falls back to fetching from the repo's raw URL, and if that's also
+unreachable, to the local manifest.json already installed from a previous
+run (a clean no-op — nothing to fetch means nothing has changed).
+
+See README.md for the one-command curl install and the offline install.
 """
 
 import hashlib
@@ -16,15 +22,20 @@ import re
 import shutil
 import signal
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
 
 REPO_BASE_URL = "https://raw.githubusercontent.com/sybenx/strfry-86/main/"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BUNDLE_FILENAME = "strfry86-bundle.tar.gz"
+BUNDLE_PATH = os.path.join(SCRIPT_DIR, BUNDLE_FILENAME)
 INSTALL_DIR = "/config/strfry86"
 STRFRY_CONF_PATH = "/config/strfry.conf"
 PLUGIN_PATH = "/config/strfry86/plugin86.py"
 CONFIG_JSON_PATH = os.path.join(INSTALL_DIR, "config.json")
+LOCAL_MANIFEST_PATH = os.path.join(INSTALL_DIR, "manifest.json")
 DEFAULT_PORT = 8686
 DEFAULT_BIND = "0.0.0.0"
 
@@ -164,13 +175,69 @@ def fetch_url(url, timeout=30):
         return resp.read()
 
 
-def fetch_manifest():
+# --------------------------------------------------------------------------
+# source selection: offline bundle / network / local-fallback
+# --------------------------------------------------------------------------
+
+def open_bundle(bundle_path):
+    try:
+        return tarfile.open(bundle_path, "r:gz")
+    except tarfile.TarError as e:
+        print(f"ERROR: failed to open bundle {bundle_path}: {e}")
+        sys.exit(1)
+
+
+def validate_bundle_members(tar):
+    """Reject absolute paths, '..' components, and links before anything is
+    extracted — a malicious or corrupt bundle must never be allowed to write
+    outside INSTALL_DIR."""
+    for member in tar.getmembers():
+        name = member.name
+        if os.path.isabs(name) or name.startswith("/"):
+            print(f"ERROR: bundle member '{name}' has an absolute path — aborting.")
+            sys.exit(1)
+        parts = name.replace("\\", "/").split("/")
+        if ".." in parts:
+            print(f"ERROR: bundle member '{name}' contains '..' — aborting.")
+            sys.exit(1)
+        if member.issym() or member.islnk():
+            print(f"ERROR: bundle member '{name}' is a link — aborting.")
+            sys.exit(1)
+
+
+def load_manifest_from_bundle(tar):
+    try:
+        member = tar.getmember("manifest.json")
+    except KeyError:
+        print("ERROR: bundle does not contain manifest.json — aborting.")
+        sys.exit(1)
+    f = tar.extractfile(member)
+    if f is None:
+        print("ERROR: manifest.json in bundle is not a regular file — aborting.")
+        sys.exit(1)
+    try:
+        return json.loads(f.read().decode("utf-8"))
+    except ValueError as e:
+        print(f"ERROR: bundle manifest.json is not valid JSON: {e}")
+        sys.exit(1)
+
+
+def read_from_bundle(tar, rel_path):
+    member = tar.getmember(rel_path)
+    f = tar.extractfile(member)
+    if f is None:
+        raise RuntimeError(f"'{rel_path}' is not a regular file in bundle")
+    return f.read()
+
+
+def try_fetch_manifest_network():
+    """Returns the manifest dict, or None if the network is unreachable."""
     url = REPO_BASE_URL + "manifest.json"
     try:
         raw = fetch_url(url)
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"ERROR: failed to fetch manifest.json from {url}: {e}")
-        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"WARNING: failed to fetch manifest.json from {url}: {e}")
+        return None
     try:
         return json.loads(raw.decode("utf-8"))
     except ValueError as e:
@@ -178,13 +245,43 @@ def fetch_manifest():
         sys.exit(1)
 
 
+def read_from_network(rel_path):
+    return fetch_url(REPO_BASE_URL + rel_path)
+
+
+def load_local_manifest():
+    if not os.path.exists(LOCAL_MANIFEST_PATH):
+        return None
+    try:
+        with open(LOCAL_MANIFEST_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_local_manifest(manifest):
+    """Record what's currently installed so a future run with no network and
+    no bundle has something to compare against instead of hard-failing."""
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    tmp_path = LOCAL_MANIFEST_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, LOCAL_MANIFEST_PATH)
+
+
+def refuse_to_fetch(rel_path):
+    raise RuntimeError("no network and no bundle available to fetch this file")
+
+
 # --------------------------------------------------------------------------
 # file sync
 # --------------------------------------------------------------------------
 
-def sync_files(manifest):
-    """Download missing/changed deployable files. Updater itself is deferred
-    to the very end and handled by self_update(). Returns (installed, updated, unchanged)."""
+def sync_files(manifest, fetch_bytes, source_label):
+    """Install missing/changed deployable files via fetch_bytes(rel_path).
+    The updater itself is deferred to the very end and handled by
+    self_update(). Returns (installed, updated, unchanged)."""
     installed = 0
     updated = 0
     unchanged = 0
@@ -206,11 +303,10 @@ def sync_files(manifest):
             action = "installed"
 
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-        url = REPO_BASE_URL + rel_path
         try:
-            raw = fetch_url(url)
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"ERROR: failed to download {rel_path}: {e}")
+            raw = fetch_bytes(rel_path)
+        except Exception as e:
+            print(f"ERROR: failed to read {rel_path} from {source_label}: {e}")
             sys.exit(1)
 
         actual_sha = hashlib.sha256(raw).hexdigest()
@@ -235,8 +331,8 @@ def sync_files(manifest):
     return installed, updated, unchanged
 
 
-def self_update(manifest):
-    """Download strfry-86-updater.py last, if changed. Returns True if updated."""
+def self_update(manifest, fetch_bytes, source_label):
+    """Fetch strfry-86-updater.py last, if changed. Returns True if updated."""
     rel_path = "strfry-86-updater.py"
     if rel_path not in manifest:
         return False
@@ -245,11 +341,10 @@ def self_update(manifest):
     if os.path.exists(local_path) and sha256_file(local_path) == expected_sha:
         return False
 
-    url = REPO_BASE_URL + rel_path
     try:
-        raw = fetch_url(url)
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"ERROR: failed to download updated {rel_path}: {e}")
+        raw = fetch_bytes(rel_path)
+    except Exception as e:
+        print(f"ERROR: failed to read updated {rel_path} from {source_label}: {e}")
         return False
 
     actual_sha = hashlib.sha256(raw).hexdigest()
@@ -484,9 +579,41 @@ def kill_server86():
 def main():
     os.makedirs(INSTALL_DIR, exist_ok=True)
 
-    manifest = fetch_manifest()
+    tar = None
 
-    installed, updated, unchanged = sync_files(manifest)
+    if os.path.exists(BUNDLE_PATH):
+        mode = "offline"
+        source_label = f"bundle {BUNDLE_FILENAME}"
+        tar = open_bundle(BUNDLE_PATH)
+        validate_bundle_members(tar)
+        manifest = load_manifest_from_bundle(tar)
+        fetch_bytes = lambda rel: read_from_bundle(tar, rel)
+    else:
+        manifest = try_fetch_manifest_network()
+        if manifest is not None:
+            mode = "network"
+            source_label = REPO_BASE_URL
+            fetch_bytes = read_from_network
+        else:
+            local_manifest = load_local_manifest()
+            if local_manifest is None:
+                print(
+                    "ERROR: no bundle present, manifest.json unreachable over "
+                    "the network, and no local manifest.json to fall back on. "
+                    f"Provide network access or drop {BUNDLE_FILENAME} next to "
+                    "the updater."
+                )
+                sys.exit(1)
+            mode = "local-fallback"
+            source_label = "local manifest.json (no network, no bundle)"
+            manifest = local_manifest
+            fetch_bytes = refuse_to_fetch
+            print(
+                "no network reachable and no bundle present — falling back to "
+                "the local manifest.json; files will report unchanged."
+            )
+
+    installed, updated, unchanged = sync_files(manifest, fetch_bytes, source_label)
 
     config_status = ensure_config()
 
@@ -498,15 +625,32 @@ def main():
     if killed:
         print(f"stopped {killed} running server86.py process(es); will respawn with fresh code.")
 
-    updater_self_updated = self_update(manifest)
+    if mode == "offline":
+        applied_path = f"{BUNDLE_PATH}.applied-{int(time.time())}"
+        os.rename(BUNDLE_PATH, applied_path)
+        print(f"bundle applied — renamed to {os.path.basename(applied_path)}")
+        updater_self_updated = self_update(manifest, fetch_bytes, source_label)
+        self_update_msg = "updater updated — effective next run."
+    elif mode == "network":
+        updater_self_updated = self_update(manifest, fetch_bytes, source_label)
+        self_update_msg = "updater updated — already effective next run."
+    else:
+        updater_self_updated = False
+        self_update_msg = ""
+
+    if tar is not None:
+        tar.close()
+
+    save_local_manifest(manifest)
 
     print()
     print("=== strfry-86 update summary ===")
+    print(f"mode: {mode}")
     print(f"files installed: {installed}, updated: {updated}, unchanged: {unchanged}")
     print(f"config.json: {config_status}")
     print(f"strfry.conf: {conf_status}")
     if updater_self_updated:
-        print("updater updated — already effective next run.")
+        print(self_update_msg)
     print("if in doubt: docker restart <container>")
 
 

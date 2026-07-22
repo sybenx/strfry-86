@@ -33,7 +33,8 @@ lib86/bech32.py        # vendored bech32/npub encode+decode (pure python referen
 lib86/blacklist.py     # shared blacklist load/save/add/remove, atomic writes, mtime reload
 admin.html
 manifest.json          # sha256 of every deployable file, consumed by the updater
-tools/make_manifest.py # regenerates manifest.json; run before every release commit
+strfry86-bundle.tar.gz # all deployable files + manifest, for offline (no-network-container) installs
+tools/make_bundle.py   # regenerates manifest.json AND strfry86-bundle.tar.gz; run before every release commit
 README.md
 test.sh
 ```
@@ -54,7 +55,17 @@ Deployed layout inside the container (created by the updater):
 
 ## strfry-86-updater.py
 
-Single file, self-contained (may not import lib86 — it must run before lib86 exists). Idempotent: safe to run any number of times. Flow:
+Single file, self-contained (may not import lib86 — it must run before lib86 exists). Idempotent: safe to run any number of times.
+
+**Source selection (offline-first):** on startup, look for `strfry86-bundle.tar.gz` in the updater's own directory. If present → OFFLINE MODE: the bundle is the source; read `manifest.json` from inside it and extract files from it instead of downloading. If absent → NETWORK MODE: fetch from the repo raw URL as described below. All downstream logic (diffing, verification, config, strfry.conf, server restart, self-update) is identical in both modes.
+
+Offline-mode specifics:
+- Open with stdlib `tarfile`. Before extracting ANYTHING, validate every member name: reject absolute paths, `..` components, and links; abort loudly on violation.
+- Extract each needed file to `<name>.tmp`, verify sha256 against the bundle's manifest, then `os.replace` into place — same atomicity as network mode. Only extract files that are missing or hash-differ locally (same diffing).
+- After a fully successful run, rename the bundle to `strfry86-bundle.tar.gz.applied-<unixtime>` so a re-run without a fresh bundle cleanly no-ops (it falls back to comparing local files against the local `manifest.json` and reports "unchanged"). Never delete applied bundles.
+- Self-update in offline mode: if the bundle contains a changed updater, extract it LAST (after the rename step is queued), replace atomically, print "updater updated — effective next run."
+
+Network-mode flow:
 
 1. **Fetch `manifest.json`** from `https://raw.githubusercontent.com/sybenx/strfry-86/main/` (repo base URL is a constant at the top of the file). Manifest maps relative path → sha256 for every deployable file. `config.json` and `blacklist.json` are NEVER in the manifest.
 2. **Diff against local**: sha256 each local file; download only missing/changed files. Download to `<name>.tmp` then `os.replace` (atomic). Verify sha256 of each download against the manifest before installing; abort loudly on mismatch.
@@ -131,11 +142,29 @@ Immediately followed by the update command (same thing, shorter — updater is a
 docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
 ```
 
+README must include a "Container has no network?" section with the offline install (two files) and offline update (one file) command sequences, each in its own fenced code block for one-click copy:
+
+```
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry-86-updater.py
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry86-bundle.tar.gz
+docker cp strfry-86-updater.py strfry:/config/strfry86/
+docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
+docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
+```
+
+```
+curl -LO https://raw.githubusercontent.com/sybenx/strfry-86/main/strfry86-bundle.tar.gz
+docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
+docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
+```
+
+with a note that the curl lines can be replaced by downloading/dragging the files onto the host by any means — only the `docker cp` and `docker exec` steps matter, and applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/`.
+
 README must also cover, briefly: adjusting the container name if not `strfry`; that the admin key is asked for once on first run (defaulting to relay.info.pubkey from strfry.conf if set) and stored in `/config/strfry86/config.json`, public key only, nsec never leaves your extension; the compose `ports:` line (`127.0.0.1:8686:8686`, with a note on tailnet/reverse-proxy exposure); adding the relay to your write relays in jumble.social so your reports actually reach it; that bans are forward-looking and existing events are purged with `strfry delete --filter '{"authors":["<hex>"]}'`; where the strfry.conf backups land; and the trust model in one honest sentence (the updater executes code from this repo's main branch — don't run someone else's fork blindly).
 
 ## Release discipline
 
-`tools/make_manifest.py` regenerates `manifest.json` (sha256 over every deployable file, sorted keys, trailing newline). Any commit that changes a deployable file MUST regenerate the manifest — an out-of-date manifest makes the updater skip or reject files. test.sh should verify the manifest matches the working tree in addition to piping crafted JSONL through `python3 plugin86.py` and asserting accept/reject for: normal event accepted; banned author rejected; admin 1984 bans its p-tags; non-admin 1984 does not ban; admin pubkey cannot be banned.
+`tools/make_bundle.py` regenerates BOTH `manifest.json` (sha256 over every deployable file, sorted keys, trailing newline) and `strfry86-bundle.tar.gz` (every deployable file plus the manifest, deterministic member order). Any commit that changes a deployable file MUST regenerate both — a stale manifest or stale bundle makes the updater skip, reject, or install outdated files. The bundle is committed to the repo so it has one stable raw URL. test.sh should verify that the manifest matches the working tree AND that the committed bundle's contents hash-match the manifest, in addition to piping crafted JSONL through `python3 plugin86.py` and asserting accept/reject for: normal event accepted; banned author rejected; admin 1984 bans its p-tags; non-admin 1984 does not ban; admin pubkey cannot be banned.
 
 ## Vendored crypto (lib86)
 
