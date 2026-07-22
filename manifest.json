@@ -1,0 +1,10 @@
+{
+  "admin.html": "c2a3bafce58e353bea2ce25c8ce40fd81be334b31d4572724f43053dc725c26a",
+  "lib86/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "lib86/bech32.py": "b151bbeb3937dea151278f830050a31ded16f39a663d4a2092cf8f5807fc0d17",
+  "lib86/bip340.py": "c9c6eef55fddc912e2eaec93dcbd69a2f983a407764a0c7b19e49d9ce2bcb66d",
+  "lib86/blacklist.py": "d275502a3759b0a698195aad514630f2cef0bada21b8d52714b07f19b789fe9b",
+  "plugin86.py": "8202c485d9fed6133472b0900c07c8a7d41fa387fad46b09990e1095d3b0975f",
+  "server86.py": "335911a053d66e36fb2ae12711d9ca6a33f775e4e9dfea04ed2a89d72e4ee2a8",
+  "strfry-86-updater.py": "483acd9f2ef777f5cccbdd1bfaa2eed9f2d018d6e20243bba00916dcb0d9026e"
+}

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strfry-86</title>
+<style>
+body {
+  max-width: 640px;
+  margin: 0 auto;
+}
+@media (max-width: 480px) {
+  body {
+    font-size: 1.25em;
+  }
+}
+</style>
+</head>
+<body>
+<h1>strfry-86</h1>
+<button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
+<ul id="ban-list"></ul>
+<button id="unban-btn" type="button" disabled>Unban selected</button>
+<script>
+var adminPubkey = null;
+var loggedInPubkey = null;
+var lastBanned = [];
+
+var statusEl = document.getElementById('status');
+var loginBtn = document.getElementById('login-btn');
+var unbanBtn = document.getElementById('unban-btn');
+var listEl = document.getElementById('ban-list');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function renderBans(banned) {
+  lastBanned = banned;
+  listEl.textContent = '';
+  for (var i = 0; i < banned.length; i++) {
+    var ban = banned[i];
+    var li = document.createElement('li');
+
+    var checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = ban.pubkey;
+    checkbox.className = 'ban-checkbox';
+    li.appendChild(checkbox);
+
+    li.appendChild(document.createTextNode(' '));
+
+    var link = document.createElement('a');
+    link.href = 'https://njump.me/' + ban.npub;
+    link.target = '_blank';
+    link.textContent = ban.npub;
+    li.appendChild(link);
+
+    var dateText = ban.banned_at
+      ? new Date(ban.banned_at * 1000).toISOString()
+      : 'unknown date';
+    li.appendChild(document.createTextNode(' — ' + dateText + ' — '));
+
+    var reasonSpan = document.createElement('span');
+    reasonSpan.textContent = ban.reason || '';
+    li.appendChild(reasonSpan);
+
+    listEl.appendChild(li);
+  }
+}
+
+function loadBans() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      adminPubkey = data.admin;
+      renderBans(data.banned);
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+loginBtn.addEventListener('click', function () {
+  if (!window.nostr) {
+    setStatus('a NIP-07 extension is required');
+    return;
+  }
+  window.nostr.getPublicKey()
+    .then(function (pk) {
+      if (pk !== adminPubkey) {
+        setStatus('this key is not the admin');
+        return;
+      }
+      loggedInPubkey = pk;
+      setStatus('logged in as admin');
+      unbanBtn.disabled = false;
+    })
+    .catch(function () {
+      setStatus('a NIP-07 extension is required');
+    });
+});
+
+unbanBtn.addEventListener('click', function () {
+  if (loggedInPubkey === null || loggedInPubkey !== adminPubkey) {
+    return;
+  }
+  var checkboxes = listEl.querySelectorAll('.ban-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  if (selected.length === 0) {
+    setStatus('nothing selected');
+    return;
+  }
+
+  var url = window.location.origin + '/api/unban';
+  var event = {
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [['u', url], ['method', 'POST']],
+    content: ''
+  };
+
+  window.nostr.signEvent(event)
+    .then(function (signed) {
+      return fetch('/api/unban', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auth: signed, pubkeys: selected })
+      });
+    })
+    .then(function (res) {
+      return res.json().then(function (body) {
+        return { ok: res.ok, body: body };
+      });
+    })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('unban failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
+        return;
+      }
+      setStatus('unbanned ' + result.body.removed.length + ' pubkey(s)');
+      return loadBans();
+    })
+    .catch(function () {
+      setStatus('unban failed');
+    });
+});
+
+loadBans();
+</script>
+</body>
+</html>
