@@ -17,6 +17,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -32,8 +33,10 @@ from lib86 import audit, bech32, bip340, blacklist  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ADMIN_HTML_PATH = os.path.join(SCRIPT_DIR, "admin.html")
-STRFRY_BIN = "strfry"
 STRFRY_CONF_PATH = "/config/strfry.conf"
+# dockurr/strfry ships the binary at /app/strfry, which is NOT on PATH for a
+# detached process; the official image installs to /usr/local/bin.
+STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry")
 
 NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
@@ -41,6 +44,9 @@ NAME_CACHE_TTL = 24 * 3600
 STRFRY_SCAN_TIMEOUT = 5
 
 _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
+
+_strfry_bin_path = None
+_strfry_bin_checked = False
 
 CONFIG_CHECK_INTERVAL = 1.0
 _dynamic_config_cache = {"contact_appeal": "", "relay_url": ""}
@@ -154,6 +160,36 @@ def get_tag(tags, name):
     return None
 
 
+def get_strfry_bin():
+    """Discover the strfry binary path once per process lifetime and cache
+    it for every subsequent scan (name lookup and audit alike): prefer
+    PATH via shutil.which, else the first existing+executable fallback
+    candidate. Returns None if nothing is found."""
+    global _strfry_bin_path, _strfry_bin_checked
+    if _strfry_bin_checked:
+        return _strfry_bin_path
+    _strfry_bin_checked = True
+    found = shutil.which("strfry")
+    if not found:
+        for candidate in STRFRY_BIN_CANDIDATES:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found = candidate
+                break
+    _strfry_bin_path = found
+    return found
+
+
+def require_strfry_bin():
+    """Return the discovered strfry binary path or raise, so callers report
+    a clear cause instead of a bare 'file not found' from subprocess."""
+    bin_path = get_strfry_bin()
+    if bin_path is None:
+        raise RuntimeError(
+            "strfry binary not found (tried PATH and " + ", ".join(STRFRY_BIN_CANDIDATES) + ")"
+        )
+    return bin_path
+
+
 def resolve_names(pubkeys):
     """Return {pubkey: name_or_None} for the given pubkeys, querying the local
     strfry database for uncached (or stale-miss) pubkeys in one batched scan."""
@@ -167,9 +203,10 @@ def resolve_names(pubkeys):
 
     if to_query:
         try:
+            strfry_bin = require_strfry_bin()
             filter_json = json.dumps({"kinds": [0], "authors": to_query})
             result = subprocess.run(
-                [STRFRY_BIN, "--config", STRFRY_CONF_PATH, "scan", filter_json],
+                [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
                 capture_output=True,
                 timeout=STRFRY_SCAN_TIMEOUT,
             )
@@ -209,9 +246,10 @@ def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
     Raises on any failure (bad binary, non-zero exit, timeout) so callers can
     treat a broken scan environment as a single reportable failure rather
     than silently returning an empty result set."""
+    strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj)
     result = subprocess.run(
-        [STRFRY_BIN, "--config", STRFRY_CONF_PATH, "scan", filter_json],
+        [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
         capture_output=True,
         timeout=timeout,
     )
