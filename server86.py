@@ -17,6 +17,7 @@ import errno
 import hashlib
 import json
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,12 @@ NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
 NAME_CACHE_TTL = 24 * 3600
 STRFRY_SCAN_TIMEOUT = 5
+# Hard safety net enforced by run_strfry_scan on every call (name lookup and
+# audit alike): kills the subprocess if stdout exceeds this regardless of
+# what filter produced it, so a future filter change that drops a `limit`
+# or authors bound can't reintroduce unbounded streaming.
+STRFRY_SCAN_MAX_STDOUT_BYTES = 16 * 1024 * 1024
+STRFRY_SCAN_READ_CHUNK = 65536
 
 _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 
@@ -266,33 +273,18 @@ def resolve_names(pubkeys):
 
     if to_query:
         try:
-            strfry_bin = require_strfry_bin()
-            filter_json = json.dumps({"kinds": [0], "authors": to_query}, separators=(",", ":"))
-            result = subprocess.run(
-                [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
-                capture_output=True,
-                timeout=STRFRY_SCAN_TIMEOUT,
-                cwd=get_relay_cwd(),
-            )
+            events = run_strfry_scan({"kinds": [0], "authors": to_query}, timeout=STRFRY_SCAN_TIMEOUT)
             found = set()
-            if result.returncode == 0:
-                for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                        content = json.loads(ev.get("content", "{}"))
-                        name = content.get("display_name") or content.get("name")
-                        pk = ev.get("pubkey")
-                    except Exception:
-                        continue
-                    if pk in to_query:
-                        _name_cache[pk] = (name if isinstance(name, str) and name else None, now)
-                        found.add(pk)
-            else:
-                log(f"server86: strfry scan exited {result.returncode}: "
-                    f"{stderr_tail(result.stderr)}")
+            for ev in events:
+                try:
+                    content = json.loads(ev.get("content", "{}"))
+                    name = content.get("display_name") or content.get("name")
+                    pk = ev.get("pubkey")
+                except Exception:
+                    continue
+                if pk in to_query:
+                    _name_cache[pk] = (name if isinstance(name, str) and name else None, now)
+                    found.add(pk)
             for pk in to_query:
                 if pk not in found:
                     _name_cache[pk] = (None, now)
@@ -305,25 +297,73 @@ def resolve_names(pubkeys):
     return {pk: _name_cache[pk][0] for pk in pubkeys}
 
 
-def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
+class StdoutCapExceeded(RuntimeError):
+    def __init__(self, max_bytes):
+        super().__init__(f"stdout exceeded {max_bytes} byte cap")
+
+
+def _run_capped(argv, cwd, timeout, max_stdout_bytes):
+    """Run argv to completion, killing it early if stdout exceeds
+    max_stdout_bytes or timeout elapses. Reads via os.read() on the raw pipe
+    fds (not the buffered file objects' .read(), which loops trying to fill
+    the requested size and can block on a pipe) so the byte cap is checked
+    incrementally instead of after an unbounded buffer is already collected.
+    Returns (stdout_bytes, stderr_bytes, returncode). Raises
+    subprocess.TimeoutExpired or StdoutCapExceeded if either limit trips."""
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    out_chunks, err_chunks = [], []
+    out_len = 0
+    open_fds = 2
+    deadline = time.monotonic() + timeout
+    try:
+        while open_fds > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in sel.select(timeout=remaining):
+                data = os.read(key.fileobj.fileno(), STRFRY_SCAN_READ_CHUNK)
+                if not data:
+                    sel.unregister(key.fileobj)
+                    open_fds -= 1
+                    continue
+                if key.data == "out":
+                    out_len += len(data)
+                    if out_len > max_stdout_bytes:
+                        proc.kill()
+                        proc.wait()
+                        raise StdoutCapExceeded(max_stdout_bytes)
+                    out_chunks.append(data)
+                else:
+                    err_chunks.append(data)
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+    finally:
+        sel.close()
+        proc.stdout.close()
+        proc.stderr.close()
+    return b"".join(out_chunks), b"".join(err_chunks), proc.returncode
+
+
+def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT, max_stdout_bytes=STRFRY_SCAN_MAX_STDOUT_BYTES):
     """Run `strfry scan <filter>` and return a list of parsed event dicts.
-    Raises on any failure (bad binary, non-zero exit, timeout) so callers can
-    treat a broken scan environment as a single reportable failure rather
-    than silently returning an empty result set."""
+    `filter_obj` may be a single filter dict or a list of filter dicts (each
+    with its own `limit` — strfry applies limit per FILTER, not per author,
+    so bounding output per-author requires one filter per author). Raises on
+    any failure (bad binary, non-zero exit, timeout, stdout cap) so callers
+    can treat a broken scan environment as a single reportable failure
+    rather than silently returning an empty result set."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
-    result = subprocess.run(
-        [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
-        capture_output=True,
-        timeout=timeout,
-        cwd=get_relay_cwd(),
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"strfry scan exited {result.returncode}: {stderr_tail(result.stderr)}"
-        )
+    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json]
+    stdout_bytes, stderr_bytes, returncode = _run_capped(argv, get_relay_cwd(), timeout, max_stdout_bytes)
+    if returncode != 0:
+        raise RuntimeError(f"strfry scan exited {returncode}: {stderr_tail(stderr_bytes)}")
     events = []
-    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+    for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -349,30 +389,63 @@ class AuditScanError(Exception):
 
 AUTHOR_CHUNK_SIZE = 1000
 AUTHOR_HARD_CAP = 10000
+# Ghost-relevant kinds (0, 3, 10002, 10050) are all strfry-enforced
+# replaceable — at most one stored event per kind per author, ever,
+# regardless of how many times it was republished (verified against the
+# real binary: importing 3 kind-0 events for one pubkey leaves exactly 1
+# stored). So an author's ENTIRE ghost-kind footprint is capped at
+# len(GHOST_ALLOWED_KINDS) events. Requesting one more than that per author
+# means: if fewer come back, that IS their whole stored history (exact, not
+# sampled); if the full limit comes back, at least one of those events must
+# be a non-ghost kind by pigeonhole (only that many replaceable slots
+# exist) — so ghost/non-ghost classification is exact either way, with
+# output capped per author instead of streaming their whole history.
+FOOTPRINT_PER_AUTHOR_LIMIT = len(audit.GHOST_ALLOWED_KINDS) + 1
+# purge_pending only needs existence (>=1 stored event), not a real count.
+PURGE_PENDING_PER_AUTHOR_LIMIT = 1
 
 
-def scan_by_authors(step, name, authors, timeout):
-    """Run an authors-only `strfry scan` in chunks of <=AUTHOR_CHUNK_SIZE.
+def apply_author_cap(authors, name):
+    """Truncate authors to AUTHOR_HARD_CAP, returning (kept, dropped,
+    sampled_note). dropped is the set of authors excluded by truncation
+    (never scanned at all) — callers that would otherwise treat "no
+    footprint events" as a positive signal (ghosts) must fold this into
+    their unknown/excluded set exactly like a failed scan batch, or a huge
+    relay would silently ghost-flag every truncated, never-scanned author."""
+    total = len(authors)
+    if total > AUTHOR_HARD_CAP:
+        kept = authors[:AUTHOR_HARD_CAP]
+        dropped = set(authors[AUTHOR_HARD_CAP:])
+        return kept, dropped, f"audit sampled first {AUTHOR_HARD_CAP} of {total} authors ({name})"
+    return authors, set(), None
 
-    A single argv element listing thousands of hex pubkeys can exceed Linux's
-    MAX_ARG_STRLEN (128 KiB per argv element), which fails with
-    OSError: [Errno 7] Argument list too long — this hit production at
-    ~1900 authors. Splitting into batches run sequentially (each batch gets
-    its own full `timeout`) and deduping the concatenated events by id keeps
-    every batch's argv small regardless of relay size. Total authors is
-    capped at AUTHOR_HARD_CAP (10 batches); returns (events, sampled_note)
-    where sampled_note is set only when the cap truncated the input, so a
-    huge relay degrades to a sampled-but-successful audit instead of a
-    failure.
+
+def scan_by_authors_bounded(step, name, authors, per_author_limit, timeout):
+    """Run a per-author-bounded `strfry scan` in chunks of <=AUTHOR_CHUNK_SIZE.
+
+    Each chunk is submitted as a JSON ARRAY of one filter per author
+    (`[{"authors":[pk],"limit":N}, ...]`) rather than a single
+    `{"authors":[...]}` filter: strfry applies `limit` per FILTER, so a
+    single combined filter's limit would cap the whole batch's output, not
+    each author's — an author with a huge posting history could still
+    starve the rest of the batch's output budget (and, before this
+    per-author bound existed, streamed their entire history un-limited,
+    which is what caused production timeouts on real accounts with
+    thousands of stored events). One filter per author bounds EVERY
+    author's contribution independently, regardless of relay contents.
+    A single argv element with 1000 such filters is ~90KB, safely under
+    Linux's 128KiB MAX_ARG_STRLEN per argv element (the very limit that
+    made chunking necessary in the first place, at ~1900 authors in the old
+    authors-list format).
+
+    Returns (events, unknown_authors): events is the deduped concatenation
+    of every successful batch; unknown_authors is the set of authors whose
+    batch failed (timeout, non-zero exit, or the stdout byte cap) — logged
+    to server86.log per batch, but a batch failure degrades only that
+    batch's authors to "unknown" rather than aborting the whole scan.
     """
     if not authors:
-        return [], None
-
-    total = len(authors)
-    sampled_note = None
-    if total > AUTHOR_HARD_CAP:
-        authors = authors[:AUTHOR_HARD_CAP]
-        sampled_note = f"audit sampled first {AUTHOR_HARD_CAP} of {total} authors ({name})"
+        return [], set()
 
     batches = [
         authors[i:i + AUTHOR_CHUNK_SIZE]
@@ -381,12 +454,17 @@ def scan_by_authors(step, name, authors, timeout):
 
     seen_ids = set()
     events = []
+    unknown_authors = set()
     for idx, batch in enumerate(batches, start=1):
         batch_info = f" batch {idx}/{len(batches)}" if len(batches) > 1 else ""
+        filters = [{"authors": [pk], "limit": per_author_limit} for pk in batch]
         try:
-            batch_events = run_strfry_scan({"authors": batch}, timeout=timeout)
+            batch_events = run_strfry_scan(filters, timeout=timeout)
         except Exception as e:
-            raise AuditScanError(step, name, e, batch_info) from e
+            log(f"server86: audit scan {step} ({name}){batch_info} failed: "
+                f"{type(e).__name__}: {e}")
+            unknown_authors.update(batch)
+            continue
         for ev in batch_events:
             eid = ev.get("id") if isinstance(ev, dict) else None
             if eid is None or eid in seen_ids:
@@ -394,7 +472,7 @@ def scan_by_authors(step, name, authors, timeout):
             seen_ids.add(eid)
             events.append(ev)
 
-    return events, sampled_note
+    return events, unknown_authors
 
 
 def empty_audit_skeleton(relay_url, warning):
@@ -427,23 +505,41 @@ def compute_audit_report(admin_pubkey_hex, scan_timeout):
         and ev.get("pubkey") != admin_pubkey_hex
         and ev.get("pubkey") not in banned
     })
-    footprint_events, footprint_sampled = scan_by_authors(2, "footprint", authors, scan_timeout)
+    authors, dropped_footprint_authors, footprint_sampled = apply_author_cap(authors, "footprint")
+    footprint_events, unknown_footprint_authors = scan_by_authors_bounded(
+        2, "footprint", authors, FOOTPRINT_PER_AUTHOR_LIMIT, scan_timeout
+    )
+    unknown_footprint_authors |= dropped_footprint_authors
 
     since = int(time.time()) - ACTIVITY_WINDOW_DAYS * 86400
     activity_events = scan(3, "activity", {"since": since})
 
-    banned_list = sorted(banned)
-    banned_events, purge_sampled = scan_by_authors(4, "purge_pending", banned_list, scan_timeout)
+    banned_list, _dropped_purge_authors, purge_sampled = apply_author_cap(sorted(banned), "purge_pending")
+    banned_events, unknown_purge_authors = scan_by_authors_bounded(
+        4, "purge_pending", banned_list, PURGE_PENDING_PER_AUTHOR_LIMIT, scan_timeout
+    )
 
     report = audit.build_report(
         relay_list_events, footprint_events, activity_events, banned_events,
         banned, admin_pubkey_hex, relay_url,
+        unknown_pubkeys=unknown_footprint_authors,
     )
-    sampled_notes = [n for n in (footprint_sampled, purge_sampled) if n]
+
+    warning_parts = [n for n in (footprint_sampled, purge_sampled) if n]
+    if unknown_footprint_authors:
+        warning_parts.append(
+            f"audit scan 2 (footprint): {len(unknown_footprint_authors)} authors' footprint "
+            "could not be scanned and were excluded from ghost detection"
+        )
+    if unknown_purge_authors:
+        warning_parts.append(
+            f"audit scan 4 (purge_pending): {len(unknown_purge_authors)} banned authors' "
+            "event counts could not be scanned"
+        )
     return {
         "generated_at": int(time.time()),
         "relay_url": relay_url,
-        "warning": "; ".join(sampled_notes) if sampled_notes else None,
+        "warning": "; ".join(warning_parts) if warning_parts else None,
         "notices": report["notices"],
         "activity": report["activity"],
     }

@@ -55,15 +55,17 @@ def _r_tag_urls(tags):
     return urls
 
 
-def build_ghosts_notice(relay_list_events, footprint_events, banned_pubkeys, admin_pubkey_hex, relay_url_norm):
+def build_ghosts_notice(relay_list_events, footprint_events, banned_pubkeys, admin_pubkey_hex,
+                         relay_url_norm, unknown_pubkeys=None):
     relay_list_events = _valid_events(relay_list_events)
     footprint_events = _valid_events(footprint_events)
     banned_pubkeys = banned_pubkeys or set()
+    unknown_pubkeys = unknown_pubkeys or set()
 
     relay_list_authors = set()
     for ev in relay_list_events:
         pk = ev["pubkey"]
-        if pk == admin_pubkey_hex or pk in banned_pubkeys:
+        if pk == admin_pubkey_hex or pk in banned_pubkeys or pk in unknown_pubkeys:
             continue
         relay_list_authors.add(pk)
 
@@ -210,14 +212,20 @@ def build_activity(activity_events, now_ts=None):
 
 
 def build_report(relay_list_events, footprint_events, activity_events, banned_events,
-                  banned_pubkeys, admin_pubkey_hex, relay_url, now_ts=None):
+                  banned_pubkeys, admin_pubkey_hex, relay_url, now_ts=None, unknown_pubkeys=None):
     """Assemble the full notices+activity structure from already-scanned
-    event lists. Returns {"notices": [...], "activity": [...]}."""
+    event lists. Returns {"notices": [...], "activity": [...]}.
+
+    unknown_pubkeys: authors whose footprint scan batch failed or was
+    capped server-side — excluded from ghost candidacy since an empty
+    footprint_events entry for them would otherwise read as "published
+    only a relay list" (false positive) rather than "we don't know"."""
     relay_url_norm = normalize_relay_url(relay_url)
 
     notices = []
     ghosts = build_ghosts_notice(
-        relay_list_events, footprint_events, banned_pubkeys, admin_pubkey_hex, relay_url_norm
+        relay_list_events, footprint_events, banned_pubkeys, admin_pubkey_hex, relay_url_norm,
+        unknown_pubkeys=unknown_pubkeys,
     )
     if ghosts:
         notices.append(ghosts)

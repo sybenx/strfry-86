@@ -140,6 +140,28 @@ check("admin pubkey is excluded from ghosts", notice2 is not None and ADMIN not 
 check("already-banned pubkey is excluded from ghosts", notice2 is not None and BANNED not in notice2["pubkeys"])
 check("non-admin non-banned ghost is still included", notice2 is not None and GHOST in notice2["pubkeys"])
 
+# a pubkey whose footprint scan failed/was truncated (unknown_pubkeys) is
+# excluded from ghosts rather than defaulting to ghost status on an empty
+# footprint -- this is the scan-2 output-bounding safety property: an
+# author we couldn't scan must never look identical to "published nothing
+# else".
+UNKNOWN = "e" * 64
+relay_list_events3 = [
+    {"pubkey": UNKNOWN, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW, "tags": []},
+]
+notice3 = audit.build_ghosts_notice(
+    relay_list_events3, [], set(), ADMIN, "", unknown_pubkeys={UNKNOWN}
+)
+check(
+    "unknown_pubkeys author with empty footprint is excluded from ghosts",
+    notice3 is not None and UNKNOWN not in notice3["pubkeys"],
+)
+check(
+    "non-unknown ghost is still included alongside an unknown_pubkeys author",
+    notice3 is not None and GHOST in notice3["pubkeys"],
+)
+
 # normalize_relay_url collides wss://X.Y/, wss://x.y, and wss://x.y//.
 check(
     "normalize_relay_url collides wss://X.Y/, wss://x.y, wss://x.y//",
