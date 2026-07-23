@@ -339,9 +339,62 @@ class AuditScanError(Exception):
     /api/audit warning can name it instead of reporting a bare generic
     string."""
 
-    def __init__(self, step, name, original):
-        message = f"audit scan {step} ({name}) failed: {type(original).__name__}: {original}"
+    def __init__(self, step, name, original, batch_info=""):
+        message = (
+            f"audit scan {step} ({name}){batch_info} failed: "
+            f"{type(original).__name__}: {original}"
+        )
         super().__init__(message[:600])
+
+
+AUTHOR_CHUNK_SIZE = 1000
+AUTHOR_HARD_CAP = 10000
+
+
+def scan_by_authors(step, name, authors, timeout):
+    """Run an authors-only `strfry scan` in chunks of <=AUTHOR_CHUNK_SIZE.
+
+    A single argv element listing thousands of hex pubkeys can exceed Linux's
+    MAX_ARG_STRLEN (128 KiB per argv element), which fails with
+    OSError: [Errno 7] Argument list too long — this hit production at
+    ~1900 authors. Splitting into batches run sequentially (each batch gets
+    its own full `timeout`) and deduping the concatenated events by id keeps
+    every batch's argv small regardless of relay size. Total authors is
+    capped at AUTHOR_HARD_CAP (10 batches); returns (events, sampled_note)
+    where sampled_note is set only when the cap truncated the input, so a
+    huge relay degrades to a sampled-but-successful audit instead of a
+    failure.
+    """
+    if not authors:
+        return [], None
+
+    total = len(authors)
+    sampled_note = None
+    if total > AUTHOR_HARD_CAP:
+        authors = authors[:AUTHOR_HARD_CAP]
+        sampled_note = f"audit sampled first {AUTHOR_HARD_CAP} of {total} authors ({name})"
+
+    batches = [
+        authors[i:i + AUTHOR_CHUNK_SIZE]
+        for i in range(0, len(authors), AUTHOR_CHUNK_SIZE)
+    ]
+
+    seen_ids = set()
+    events = []
+    for idx, batch in enumerate(batches, start=1):
+        batch_info = f" batch {idx}/{len(batches)}" if len(batches) > 1 else ""
+        try:
+            batch_events = run_strfry_scan({"authors": batch}, timeout=timeout)
+        except Exception as e:
+            raise AuditScanError(step, name, e, batch_info) from e
+        for ev in batch_events:
+            eid = ev.get("id") if isinstance(ev, dict) else None
+            if eid is None or eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            events.append(ev)
+
+    return events, sampled_note
 
 
 def empty_audit_skeleton(relay_url, warning):
@@ -374,22 +427,23 @@ def compute_audit_report(admin_pubkey_hex, scan_timeout):
         and ev.get("pubkey") != admin_pubkey_hex
         and ev.get("pubkey") not in banned
     })
-    footprint_events = scan(2, "footprint", {"authors": authors}) if authors else []
+    footprint_events, footprint_sampled = scan_by_authors(2, "footprint", authors, scan_timeout)
 
     since = int(time.time()) - ACTIVITY_WINDOW_DAYS * 86400
     activity_events = scan(3, "activity", {"since": since})
 
     banned_list = sorted(banned)
-    banned_events = scan(4, "purge_pending", {"authors": banned_list}) if banned_list else []
+    banned_events, purge_sampled = scan_by_authors(4, "purge_pending", banned_list, scan_timeout)
 
     report = audit.build_report(
         relay_list_events, footprint_events, activity_events, banned_events,
         banned, admin_pubkey_hex, relay_url,
     )
+    sampled_notes = [n for n in (footprint_sampled, purge_sampled) if n]
     return {
         "generated_at": int(time.time()),
         "relay_url": relay_url,
-        "warning": None,
+        "warning": "; ".join(sampled_notes) if sampled_notes else None,
         "notices": report["notices"],
         "activity": report["activity"],
     }
