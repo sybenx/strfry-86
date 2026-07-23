@@ -48,6 +48,9 @@ _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 _strfry_bin_path = None
 _strfry_bin_checked = False
 
+_relay_cwd_pid = None
+_relay_cwd_path = None
+
 CONFIG_CHECK_INTERVAL = 1.0
 _dynamic_config_cache = {"contact_appeal": "", "relay_url": ""}
 _dynamic_config_mtime = None
@@ -190,6 +193,66 @@ def require_strfry_bin():
     return bin_path
 
 
+def get_relay_cwd():
+    """Return the working directory `strfry scan` must run from.
+
+    strfry.conf commonly points `db` at a path relative to wherever the
+    relay process itself was launched (e.g. dockurr/strfry runs `./strfry`
+    from `/app` with `db = "./strfry-db/"`). server86 is spawned by
+    plugin86 with cwd=SCRIPT_DIR (/config/strfry86), which is NOT that
+    directory, so a scan subprocess with no cwd override resolves the
+    relative db path against the wrong directory and strfry exits 1 with
+    `mdb_env_open: No such file or directory`.
+
+    Find the running strfry relay process via /proc and reuse its cwd, so
+    every scan resolves relative paths exactly as the relay does. Falls
+    back to the discovered binary's parent directory if no relay process
+    is found (e.g. /proc unavailable, or the relay hasn't started yet).
+    Cached until the located pid disappears."""
+    global _relay_cwd_pid, _relay_cwd_path
+    if _relay_cwd_pid is not None and os.path.isdir(f"/proc/{_relay_cwd_pid}"):
+        return _relay_cwd_path
+
+    strfry_bin = require_strfry_bin()
+    bin_name = os.path.basename(strfry_bin)
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    args = [a.decode("utf-8", "replace") for a in f.read().split(b"\x00") if a]
+            except OSError:
+                continue
+            if not args or os.path.basename(args[0]) != bin_name or "relay" not in args[1:]:
+                continue
+            try:
+                cwd = os.readlink(f"/proc/{entry}/cwd")
+            except OSError:
+                continue
+            _relay_cwd_pid = entry
+            _relay_cwd_path = cwd
+            return cwd
+    except OSError:
+        pass
+
+    _relay_cwd_pid = None
+    _relay_cwd_path = os.path.dirname(strfry_bin)
+    return _relay_cwd_path
+
+
+STDERR_TAIL_CHARS = 300
+
+
+def stderr_tail(stderr_bytes):
+    """Return the last ~300 chars of a failed scan's stderr. strfry's loguru
+    output puts a startup banner first and the actual error (tao::json parse
+    or LMDB env open) as the LAST line, so the head of stderr is useless for
+    diagnosis — always take the tail."""
+    text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    return text[-STDERR_TAIL_CHARS:]
+
+
 def resolve_names(pubkeys):
     """Return {pubkey: name_or_None} for the given pubkeys, querying the local
     strfry database for uncached (or stale-miss) pubkeys in one batched scan."""
@@ -209,6 +272,7 @@ def resolve_names(pubkeys):
                 [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
                 capture_output=True,
                 timeout=STRFRY_SCAN_TIMEOUT,
+                cwd=get_relay_cwd(),
             )
             found = set()
             if result.returncode == 0:
@@ -228,7 +292,7 @@ def resolve_names(pubkeys):
                         found.add(pk)
             else:
                 log(f"server86: strfry scan exited {result.returncode}: "
-                    f"{result.stderr.decode('utf-8', errors='replace')[:200]}")
+                    f"{stderr_tail(result.stderr)}")
             for pk in to_query:
                 if pk not in found:
                     _name_cache[pk] = (None, now)
@@ -252,11 +316,11 @@ def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
         [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
         capture_output=True,
         timeout=timeout,
+        cwd=get_relay_cwd(),
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"strfry scan exited {result.returncode}: "
-            f"{result.stderr.decode('utf-8', errors='replace')[:200]}"
+            f"strfry scan exited {result.returncode}: {stderr_tail(result.stderr)}"
         )
     events = []
     for line in result.stdout.decode("utf-8", errors="replace").splitlines():
@@ -277,7 +341,7 @@ class AuditScanError(Exception):
 
     def __init__(self, step, name, original):
         message = f"audit scan {step} ({name}) failed: {type(original).__name__}: {original}"
-        super().__init__(message[:300])
+        super().__init__(message[:600])
 
 
 def empty_audit_skeleton(relay_url, warning):
@@ -339,7 +403,7 @@ def _recompute_audit(admin_pubkey_hex, scan_timeout):
         if isinstance(e, AuditScanError):
             warning = str(e)
         else:
-            warning = f"audit recompute failed: {type(e).__name__}: {e}"[:300]
+            warning = f"audit recompute failed: {type(e).__name__}: {e}"[:600]
         log(f"server86: {warning}")
         with _audit_lock:
             if _audit_cache is None:
