@@ -49,15 +49,45 @@ _dynamic_config_last_checked = 0.0
 
 AUDIT_CACHE_TTL = 10 * 60
 AUDIT_SYNC_TIMEOUT = 5
+AUDIT_SYNC_SCAN_TIMEOUT = 5
+AUDIT_BG_SCAN_TIMEOUT = 60
 ACTIVITY_WINDOW_DAYS = 28
 
 _audit_lock = threading.Lock()
 _audit_cache = None  # None until first successful/attempted compute
 _audit_computing = False
 
+SERVER_LOG_PATH = os.path.join(SCRIPT_DIR, "server86.log")
+SERVER_LOG_MAX_BYTES = 64 * 1024
+SERVER_LOG_TRIM_BYTES = 32 * 1024
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+    try:
+        with open(SERVER_LOG_PATH, "a") as f:
+            f.write(f"{int(time.time())} {msg}\n")
+        _trim_server_log()
+    except Exception:
+        pass
+
+
+def _trim_server_log():
+    try:
+        if os.path.getsize(SERVER_LOG_PATH) <= SERVER_LOG_MAX_BYTES:
+            return
+        with open(SERVER_LOG_PATH, "rb") as f:
+            data = f.read()
+        trimmed = data[-SERVER_LOG_TRIM_BYTES:]
+        nl = trimmed.find(b"\n")
+        if nl != -1:
+            trimmed = trimmed[nl + 1:]
+        tmp_path = SERVER_LOG_PATH + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(trimmed)
+        os.replace(tmp_path, SERVER_LOG_PATH)
+    except Exception:
+        pass
 
 
 def load_config():
@@ -174,7 +204,7 @@ def resolve_names(pubkeys):
     return {pk: _name_cache[pk][0] for pk in pubkeys}
 
 
-def run_strfry_scan(filter_obj):
+def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
     """Run `strfry scan <filter>` and return a list of parsed event dicts.
     Raises on any failure (bad binary, non-zero exit, timeout) so callers can
     treat a broken scan environment as a single reportable failure rather
@@ -183,7 +213,7 @@ def run_strfry_scan(filter_obj):
     result = subprocess.run(
         [STRFRY_BIN, "--config", STRFRY_CONF_PATH, "scan", filter_json],
         capture_output=True,
-        timeout=STRFRY_SCAN_TIMEOUT,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -202,6 +232,16 @@ def run_strfry_scan(filter_obj):
     return events
 
 
+class AuditScanError(Exception):
+    """Wraps a scan failure with which numbered/named scan raised it, so the
+    /api/audit warning can name it instead of reporting a bare generic
+    string."""
+
+    def __init__(self, step, name, original):
+        message = f"audit scan {step} ({name}) failed: {type(original).__name__}: {original}"
+        super().__init__(message[:300])
+
+
 def empty_audit_skeleton(relay_url, warning):
     return {
         "generated_at": int(time.time()),
@@ -212,12 +252,18 @@ def empty_audit_skeleton(relay_url, warning):
     }
 
 
-def compute_audit_report(admin_pubkey_hex):
+def compute_audit_report(admin_pubkey_hex, scan_timeout):
     dyn = get_dynamic_config()
     relay_url = dyn["relay_url"]
     banned = set(blacklist.load().keys())
 
-    relay_list_events = run_strfry_scan({"kinds": [10002, 10050]})
+    def scan(step, name, filter_obj):
+        try:
+            return run_strfry_scan(filter_obj, timeout=scan_timeout)
+        except Exception as e:
+            raise AuditScanError(step, name, e) from e
+
+    relay_list_events = scan(1, "relay_lists", {"kinds": [10002, 10050]})
 
     authors = sorted({
         ev.get("pubkey") for ev in relay_list_events
@@ -226,13 +272,13 @@ def compute_audit_report(admin_pubkey_hex):
         and ev.get("pubkey") != admin_pubkey_hex
         and ev.get("pubkey") not in banned
     })
-    footprint_events = run_strfry_scan({"authors": authors}) if authors else []
+    footprint_events = scan(2, "footprint", {"authors": authors}) if authors else []
 
     since = int(time.time()) - ACTIVITY_WINDOW_DAYS * 86400
-    activity_events = run_strfry_scan({"since": since})
+    activity_events = scan(3, "activity", {"since": since})
 
     banned_list = sorted(banned)
-    banned_events = run_strfry_scan({"authors": banned_list}) if banned_list else []
+    banned_events = scan(4, "purge_pending", {"authors": banned_list}) if banned_list else []
 
     report = audit.build_report(
         relay_list_events, footprint_events, activity_events, banned_events,
@@ -247,16 +293,20 @@ def compute_audit_report(admin_pubkey_hex):
     }
 
 
-def _recompute_audit(admin_pubkey_hex):
+def _recompute_audit(admin_pubkey_hex, scan_timeout):
     global _audit_cache, _audit_computing
     try:
-        report = compute_audit_report(admin_pubkey_hex)
+        report = compute_audit_report(admin_pubkey_hex, scan_timeout)
     except Exception as e:
-        log(f"server86: audit recompute failed: {e}")
+        if isinstance(e, AuditScanError):
+            warning = str(e)
+        else:
+            warning = f"audit recompute failed: {type(e).__name__}: {e}"[:300]
+        log(f"server86: {warning}")
         with _audit_lock:
             if _audit_cache is None:
                 _audit_cache = empty_audit_skeleton(
-                    get_dynamic_config()["relay_url"], "audit scan failed"
+                    get_dynamic_config()["relay_url"], warning
                 )
             _audit_computing = False
         return
@@ -282,7 +332,11 @@ def get_audit_report(admin_pubkey_hex):
 
     if should_kickoff:
         if cache is None:
-            t = threading.Thread(target=_recompute_audit, args=(admin_pubkey_hex,), daemon=True)
+            t = threading.Thread(
+                target=_recompute_audit,
+                args=(admin_pubkey_hex, AUDIT_SYNC_SCAN_TIMEOUT),
+                daemon=True,
+            )
             t.start()
             t.join(AUDIT_SYNC_TIMEOUT)
             with _audit_lock:
@@ -292,7 +346,11 @@ def get_audit_report(admin_pubkey_hex):
                 get_dynamic_config()["relay_url"], "audit still computing — try again shortly"
             )
         else:
-            threading.Thread(target=_recompute_audit, args=(admin_pubkey_hex,), daemon=True).start()
+            threading.Thread(
+                target=_recompute_audit,
+                args=(admin_pubkey_hex, AUDIT_BG_SCAN_TIMEOUT),
+                daemon=True,
+            ).start()
 
     if cache is not None:
         return cache
