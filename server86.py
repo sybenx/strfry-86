@@ -204,7 +204,7 @@ def resolve_names(pubkeys):
     if to_query:
         try:
             strfry_bin = require_strfry_bin()
-            filter_json = json.dumps({"kinds": [0], "authors": to_query})
+            filter_json = json.dumps({"kinds": [0], "authors": to_query}, separators=(",", ":"))
             result = subprocess.run(
                 [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
                 capture_output=True,
@@ -247,7 +247,7 @@ def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
     treat a broken scan environment as a single reportable failure rather
     than silently returning an empty result set."""
     strfry_bin = require_strfry_bin()
-    filter_json = json.dumps(filter_obj)
+    filter_json = json.dumps(filter_obj, separators=(",", ":"))
     result = subprocess.run(
         [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json],
         capture_output=True,
