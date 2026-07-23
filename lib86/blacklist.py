@@ -6,7 +6,8 @@ from disk when the file's mtime changes, checked at most once per second so
 the hot path never stats the filesystem on every single event.
 
 Data on disk (blacklist.json) is a JSON object:
-    { "<pubkey_hex>": {"banned_at": <int>, "report_event_id": "<hex>", "reason": "<str>"}, ... }
+    { "<pubkey_hex>": {"banned_at": <int>, "report_event_id": "<hex or null>",
+                       "reason": "<str>", "report_type": "<str or null>"}, ... }
 """
 
 import json
@@ -65,7 +66,7 @@ def is_banned(pubkey_hex):
     return pubkey_hex in load()
 
 
-def add(pubkey_hex, banned_at, report_event_id, reason, admin_pubkey_hex=None):
+def add(pubkey_hex, banned_at, report_event_id, reason, report_type=None, admin_pubkey_hex=None):
     """Add/refresh a ban entry. No-op returning False if pubkey_hex is the admin."""
     global _cache, _cache_mtime
     if admin_pubkey_hex is not None and pubkey_hex == admin_pubkey_hex:
@@ -76,6 +77,7 @@ def add(pubkey_hex, banned_at, report_event_id, reason, admin_pubkey_hex=None):
         "banned_at": banned_at,
         "report_event_id": report_event_id,
         "reason": reason,
+        "report_type": report_type,
     }
     _write_atomic(data)
     _cache = data

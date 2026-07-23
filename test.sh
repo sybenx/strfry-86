@@ -135,6 +135,19 @@ except FileNotFoundError:
 sys.exit(0 if pubkey in data else 1)
 PYEOF
 
+# Helper: assert a pubkey's stored report_type matches expectations.
+cat > "$TESTDIR/check_report_type.py" <<'PYEOF'
+import json
+import sys
+
+pubkey, expected, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+actual = data.get(pubkey, {}).get("report_type")
+expected = None if expected == "__NONE__" else expected
+sys.exit(0 if actual == expected else 1)
+PYEOF
+
 ADMIN_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 OTHER_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 BANNED_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -159,6 +172,10 @@ check_action() {
 
 is_banned_in_file() {
     python3 "$TESTDIR/is_banned.py" "$1" "$TESTDIR/blacklist.json"
+}
+
+check_report_type() {
+    python3 "$TESTDIR/check_report_type.py" "$1" "$2" "$TESTDIR/blacklist.json"
 }
 
 # 1. normal event accepted
@@ -197,6 +214,19 @@ LINE="$(mkevent e5 "$ADMIN_HEX" 1984 "[[\"p\",\"$ADMIN_HEX\"]]" self 1700000000)
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "admin self-report event accepted"; else fail "admin self-report should still be accepted, got: $OUT"; fi
 if is_banned_in_file "$ADMIN_HEX"; then fail "admin pubkey must never be banned"; else pass "admin pubkey cannot be banned"; fi
+
+# 6. admin 1984 with a NIP-56 report type records report_type
+echo '{}' > "$TESTDIR/blacklist.json"
+LINE="$(mkevent e6 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\",\"spam\"]]" "reported for spam" 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "admin 1984 report with type accepted"; else fail "admin 1984 report with type should be accepted, got: $OUT"; fi
+if check_report_type "$TARGET_HEX" "spam"; then pass "admin 1984 records report_type from p tag"; else fail "report_type should have been recorded as 'spam'"; fi
+
+# 7. admin 1984 without a report type records report_type as null
+echo '{}' > "$TESTDIR/blacklist.json"
+LINE="$(mkevent e7 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported" 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_report_type "$TARGET_HEX" "__NONE__"; then pass "admin 1984 without type records report_type as null"; else fail "report_type should be null when p tag has no type"; fi
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

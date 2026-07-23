@@ -12,38 +12,92 @@ li { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>strfry-86</h1>
-<button id="login-btn" type="button">Login with extension</button>
-<p id="status"></p>
+<p>These npubs are banned from this relay.</p>
 <ul id="ban-list"></ul>
-<button id="unban-btn" type="button" disabled>Unban selected</button>
+<p id="status"></p>
+<button id="login-btn" type="button">Login with extension</button>
+<div id="admin-controls" style="display:none">
+  <button id="unban-btn" type="button">Unban selected</button>
+  <h2>Ban a pubkey</h2>
+  <form id="ban-form">
+    <div><input id="ban-input" type="text" placeholder="npub or hex, one or more (comma/space separated)"></div>
+    <div><input id="ban-reason" type="text" placeholder="reason (optional)"></div>
+    <button type="submit">Ban</button>
+  </form>
+</div>
 <script>
+var NAME_CACHE_KEY = 'strfry86_name_cache';
+var NAME_TTL_MS = 24 * 60 * 60 * 1000;
+
 var adminPubkey = null;
 var loggedInPubkey = null;
+var isAdmin = false;
 var lastBanned = [];
+var nameSpans = {}; // pubkey -> array of span elements to fill
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
+var adminControls = document.getElementById('admin-controls');
 var unbanBtn = document.getElementById('unban-btn');
+var banForm = document.getElementById('ban-form');
+var banInput = document.getElementById('ban-input');
+var banReason = document.getElementById('ban-reason');
 var listEl = document.getElementById('ban-list');
 
 function setStatus(text) {
   statusEl.textContent = text;
 }
 
+function loadNameCache() {
+  try {
+    return JSON.parse(localStorage.getItem(NAME_CACHE_KEY)) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveNameCache(cache) {
+  try {
+    localStorage.setItem(NAME_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {
+    // ignore quota/availability errors — display sugar only
+  }
+}
+
+function formatDate(bannedAt) {
+  if (!bannedAt) {
+    return 'unknown date';
+  }
+  var iso = new Date(bannedAt * 1000).toISOString();
+  return iso.slice(0, 10) + ' ' + iso.slice(11, 16) + ' UTC';
+}
+
 function renderBans(banned) {
   lastBanned = banned;
+  nameSpans = {};
   listEl.textContent = '';
   for (var i = 0; i < banned.length; i++) {
     var ban = banned[i];
     var li = document.createElement('li');
 
-    var checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.value = ban.pubkey;
-    checkbox.className = 'ban-checkbox';
-    li.appendChild(checkbox);
+    if (isAdmin) {
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = ban.pubkey;
+      checkbox.className = 'ban-checkbox';
+      li.appendChild(checkbox);
+      li.appendChild(document.createTextNode(' '));
+    }
 
-    li.appendChild(document.createTextNode(' '));
+    var nameSpan = document.createElement('span');
+    if (ban.name) {
+      nameSpan.textContent = ban.name + ' ';
+    }
+    li.appendChild(nameSpan);
+    if (!nameSpans[ban.pubkey]) {
+      nameSpans[ban.pubkey] = [];
+    }
+    nameSpans[ban.pubkey].push(nameSpan);
 
     var link = document.createElement('a');
     link.href = 'https://njump.me/' + ban.npub;
@@ -51,10 +105,13 @@ function renderBans(banned) {
     link.textContent = ban.npub;
     li.appendChild(link);
 
-    var dateText = ban.banned_at
-      ? new Date(ban.banned_at * 1000).toISOString()
-      : 'unknown date';
-    li.appendChild(document.createTextNode(' — ' + dateText + ' — '));
+    li.appendChild(document.createTextNode(' — ' + formatDate(ban.banned_at) + ' — '));
+
+    var typeSpan = document.createElement('span');
+    typeSpan.textContent = ban.report_type || 'unspecified';
+    li.appendChild(typeSpan);
+
+    li.appendChild(document.createTextNode(' — '));
 
     var reasonSpan = document.createElement('span');
     reasonSpan.textContent = ban.reason || '';
@@ -62,6 +119,132 @@ function renderBans(banned) {
 
     listEl.appendChild(li);
   }
+
+  resolveFallbackNames(banned);
+}
+
+function resolveFallbackNames(banned) {
+  var cache = loadNameCache();
+  var now = Date.now();
+  var needQuery = [];
+
+  for (var i = 0; i < banned.length; i++) {
+    var ban = banned[i];
+    if (ban.name) {
+      continue;
+    }
+    var cached = cache[ban.pubkey];
+    if (cached && (cached.name || (now - cached.checked_at) < NAME_TTL_MS)) {
+      if (cached.name) {
+        fillName(ban.pubkey, cached.name);
+      }
+      continue;
+    }
+    if (needQuery.indexOf(ban.pubkey) === -1) {
+      needQuery.push(ban.pubkey);
+    }
+  }
+
+  if (needQuery.length === 0) {
+    return;
+  }
+
+  queryRelay('wss://purplepag.es', needQuery, function (ok) {
+    if (!ok) {
+      queryRelay('wss://relay.damus.io', needQuery, function () {});
+    }
+  });
+}
+
+function fillName(pubkey, name) {
+  var spans = nameSpans[pubkey];
+  if (!spans) {
+    return;
+  }
+  for (var i = 0; i < spans.length; i++) {
+    spans[i].textContent = name + ' ';
+  }
+}
+
+function queryRelay(url, pubkeys, done) {
+  var cache = loadNameCache();
+  var now = Date.now();
+  var settled = false;
+  var connected = false;
+  var ws;
+
+  function finish(ok) {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    try {
+      ws.close();
+    } catch (e) {}
+    done(ok);
+  }
+
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    finish(false);
+    return;
+  }
+
+  var timeout = setTimeout(function () {
+    saveNameCache(cache);
+    finish(connected);
+  }, 5000);
+
+  ws.addEventListener('open', function () {
+    connected = true;
+    ws.send(JSON.stringify(['REQ', 'strfry86', { kinds: [0], authors: pubkeys }]));
+  });
+
+  ws.addEventListener('message', function (evt) {
+    var msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (e) {
+      return;
+    }
+    if (!Array.isArray(msg)) {
+      return;
+    }
+    if (msg[0] === 'EVENT' && msg[2]) {
+      var ev = msg[2];
+      var content;
+      try {
+        content = JSON.parse(ev.content);
+      } catch (e) {
+        content = {};
+      }
+      var name = content.display_name || content.name || null;
+      cache[ev.pubkey] = { name: name, checked_at: now };
+      if (name) {
+        fillName(ev.pubkey, name);
+      }
+    } else if (msg[0] === 'EOSE') {
+      for (var i = 0; i < pubkeys.length; i++) {
+        if (!cache[pubkeys[i]]) {
+          cache[pubkeys[i]] = { name: null, checked_at: now };
+        }
+      }
+      clearTimeout(timeout);
+      saveNameCache(cache);
+      finish(true);
+    }
+  });
+
+  ws.addEventListener('error', function () {
+    clearTimeout(timeout);
+    finish(connected);
+  });
+
+  ws.addEventListener('close', function () {
+    clearTimeout(timeout);
+    finish(connected);
+  });
 }
 
 function loadBans() {
@@ -88,16 +271,43 @@ loginBtn.addEventListener('click', function () {
         return;
       }
       loggedInPubkey = pk;
+      isAdmin = true;
       setStatus('logged in as admin');
-      unbanBtn.disabled = false;
+      adminControls.style.display = '';
+      renderBans(lastBanned);
     })
     .catch(function () {
       setStatus('a NIP-07 extension is required');
     });
 });
 
+function signAndPost(endpoint, extraBody) {
+  var url = window.location.origin + endpoint;
+  var event = {
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [['u', url], ['method', 'POST']],
+    content: ''
+  };
+
+  return window.nostr.signEvent(event)
+    .then(function (signed) {
+      var body = Object.assign({ auth: signed }, extraBody);
+      return fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    })
+    .then(function (res) {
+      return res.json().then(function (body) {
+        return { ok: res.ok, body: body };
+      });
+    });
+}
+
 unbanBtn.addEventListener('click', function () {
-  if (loggedInPubkey === null || loggedInPubkey !== adminPubkey) {
+  if (!isAdmin) {
     return;
   }
   var checkboxes = listEl.querySelectorAll('.ban-checkbox:checked');
@@ -110,27 +320,7 @@ unbanBtn.addEventListener('click', function () {
     return;
   }
 
-  var url = window.location.origin + '/api/unban';
-  var event = {
-    kind: 27235,
-    created_at: Math.floor(Date.now() / 1000),
-    tags: [['u', url], ['method', 'POST']],
-    content: ''
-  };
-
-  window.nostr.signEvent(event)
-    .then(function (signed) {
-      return fetch('/api/unban', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auth: signed, pubkeys: selected })
-      });
-    })
-    .then(function (res) {
-      return res.json().then(function (body) {
-        return { ok: res.ok, body: body };
-      });
-    })
+  signAndPost('/api/unban', { pubkeys: selected })
     .then(function (result) {
       if (!result.ok) {
         setStatus('unban failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
@@ -141,6 +331,38 @@ unbanBtn.addEventListener('click', function () {
     })
     .catch(function () {
       setStatus('unban failed');
+    });
+});
+
+banForm.addEventListener('submit', function (evt) {
+  evt.preventDefault();
+  if (!isAdmin) {
+    return;
+  }
+  var raw = banInput.value.split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  if (raw.length === 0) {
+    setStatus('nothing to ban');
+    return;
+  }
+  var reason = banReason.value;
+  var entries = raw.map(function (pk) {
+    return { pubkey: pk, reason: reason };
+  });
+
+  signAndPost('/api/ban', { entries: entries })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('ban failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
+        return;
+      }
+      setStatus('banned ' + result.body.added.length + ' pubkey(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      banInput.value = '';
+      banReason.value = '';
+      return loadBans();
+    })
+    .catch(function () {
+      setStatus('ban failed');
     });
 });
 

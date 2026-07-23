@@ -48,7 +48,7 @@ Only the `docker cp` and `docker exec` steps matter — get the file(s) onto the
 
 ## First run
 
-On first run the updater needs your admin pubkey — the one and only key allowed to ban (via a NIP-56 report, kind `1984`) or unban (via NIP-98). It tries to read `relay.info.pubkey` from your `strfry.conf` first and, if found, asks you to confirm before using it; otherwise it prompts you to paste an `npub` or 64-char hex pubkey. It is never adopted silently. The result is stored as a public key only in `/config/strfry86/config.json` — your `nsec` never leaves your extension, and never touches this server.
+On first run the updater needs your admin pubkey — the one and only key allowed to ban (via a NIP-56 report, kind `1984`, or manually from the admin page) or unban (via NIP-98). It tries to read `relay.info.pubkey` from your `strfry.conf` first and, if found, asks you to confirm before using it; otherwise it prompts you to paste an `npub` or 64-char hex pubkey. It is never adopted silently. The result is stored as a public key only in `/config/strfry86/config.json` — your `nsec` never leaves your extension, and never touches this server.
 
 ## Expose the admin page
 
@@ -78,6 +78,10 @@ strfry delete --filter '{"authors":["<hex-pubkey>"]}'
 ## Unbanning
 
 Open the admin page, click "Login with extension" (NIP-07), check the pubkeys you want to unban, click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies.
+
+## Manual bans
+
+Logged in as admin, the admin page also shows a ban form: paste one or more npubs or hex pubkeys (space or comma separated), an optional reason, and click "Ban". This is the same trust root as reporting — authorized per-request with NIP-98, no sessions.
 
 ## strfry.conf backups
 

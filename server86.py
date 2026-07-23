@@ -9,12 +9,14 @@ Routes:
   GET  /            -> admin.html
   GET  /api/banned  -> public read of the ban list
   POST /api/unban   -> NIP-98 authenticated unban
+  POST /api/ban     -> NIP-98 authenticated manual ban
 """
 
 import errno
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,9 +30,15 @@ from lib86 import bech32, bip340, blacklist  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ADMIN_HTML_PATH = os.path.join(SCRIPT_DIR, "admin.html")
+STRFRY_BIN = "strfry"
+STRFRY_CONF_PATH = "/config/strfry.conf"
 
 NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
+NAME_CACHE_TTL = 24 * 3600
+STRFRY_SCAN_TIMEOUT = 5
+
+_name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 
 
 def log(msg):
@@ -70,7 +78,57 @@ def get_tag(tags, name):
     return None
 
 
-def verify_nip98(auth, admin_pubkey_hex):
+def resolve_names(pubkeys):
+    """Return {pubkey: name_or_None} for the given pubkeys, querying the local
+    strfry database for uncached (or stale-miss) pubkeys in one batched scan."""
+    now = time.time()
+    to_query = [
+        pk for pk in pubkeys
+        if pk not in _name_cache or (
+            _name_cache[pk][0] is None and now - _name_cache[pk][1] >= NAME_CACHE_TTL
+        )
+    ]
+
+    if to_query:
+        try:
+            filter_json = json.dumps({"kinds": [0], "authors": to_query})
+            result = subprocess.run(
+                [STRFRY_BIN, "--config", STRFRY_CONF_PATH, "scan", filter_json],
+                capture_output=True,
+                timeout=STRFRY_SCAN_TIMEOUT,
+            )
+            found = set()
+            if result.returncode == 0:
+                for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                        content = json.loads(ev.get("content", "{}"))
+                        name = content.get("display_name") or content.get("name")
+                        pk = ev.get("pubkey")
+                    except Exception:
+                        continue
+                    if pk in to_query:
+                        _name_cache[pk] = (name if isinstance(name, str) and name else None, now)
+                        found.add(pk)
+            else:
+                log(f"server86: strfry scan exited {result.returncode}: "
+                    f"{result.stderr.decode('utf-8', errors='replace')[:200]}")
+            for pk in to_query:
+                if pk not in found:
+                    _name_cache[pk] = (None, now)
+        except Exception as e:
+            log(f"server86: strfry scan failed: {e}")
+            for pk in to_query:
+                if pk not in _name_cache:
+                    _name_cache[pk] = (None, now)
+
+    return {pk: _name_cache[pk][0] for pk in pubkeys}
+
+
+def verify_nip98(auth, admin_pubkey_hex, expected_path):
     """Return (ok, error_message)."""
     if not isinstance(auth, dict):
         return False, "malformed auth event"
@@ -117,7 +175,7 @@ def verify_nip98(auth, admin_pubkey_hex):
         return False, "wrong method tag"
 
     u = get_tag(tags, "u")
-    if not isinstance(u, str) or urlparse(u).path != "/api/unban":
+    if not isinstance(u, str) or urlparse(u).path != expected_path:
         return False, "wrong u tag"
 
     now = int(time.time())
@@ -161,6 +219,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/banned":
             cfg = self.server.strfry86_config
             data = blacklist.load()
+            pubkeys = list(data.keys())
+            try:
+                names = resolve_names(pubkeys)
+            except Exception as e:
+                log(f"server86: name resolution failed: {e}")
+                names = {}
             banned = []
             for pubkey, info in data.items():
                 try:
@@ -173,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
                         "npub": npub,
                         "banned_at": info.get("banned_at"),
                         "reason": info.get("reason", ""),
+                        "report_type": info.get("report_type"),
+                        "name": names.get(pubkey),
                     }
                 )
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
@@ -183,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path != "/api/unban":
+        if path not in ("/api/unban", "/api/ban"):
             self._send_json(404, {"error": "not found"})
             return
 
@@ -204,19 +270,62 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         auth = body.get("auth")
-        pubkeys = body.get("pubkeys")
 
-        ok, err = verify_nip98(auth, cfg["admin_pubkey_hex"])
+        ok, err = verify_nip98(auth, cfg["admin_pubkey_hex"], path)
         if not ok:
             self._send_json(401, {"error": err})
             return
 
-        if not isinstance(pubkeys, list) or not all(is_hex64(pk) for pk in pubkeys):
-            self._send_json(400, {"error": "malformed pubkeys list"})
+        if path == "/api/unban":
+            pubkeys = body.get("pubkeys")
+            if not isinstance(pubkeys, list) or not all(is_hex64(pk) for pk in pubkeys):
+                self._send_json(400, {"error": "malformed pubkeys list"})
+                return
+
+            removed = blacklist.remove(pubkeys)
+            self._send_json(200, {"ok": True, "removed": removed})
             return
 
-        removed = blacklist.remove(pubkeys)
-        self._send_json(200, {"ok": True, "removed": removed})
+        # /api/ban
+        entries = body.get("entries")
+        if not isinstance(entries, list):
+            self._send_json(400, {"error": "malformed entries list"})
+            return
+
+        added = []
+        skipped = []
+        now = int(time.time())
+        for entry in entries:
+            if not isinstance(entry, dict):
+                skipped.append(entry)
+                continue
+            raw_pk = entry.get("pubkey")
+            reason = entry.get("reason") or ""
+            pubkey = None
+            if is_hex64(raw_pk):
+                pubkey = raw_pk
+            elif isinstance(raw_pk, str):
+                try:
+                    pubkey = bech32.npub_decode(raw_pk)
+                except (ValueError, TypeError):
+                    pubkey = None
+            if not is_hex64(pubkey):
+                skipped.append(raw_pk)
+                continue
+            ok_added = blacklist.add(
+                pubkey,
+                banned_at=now,
+                report_event_id=None,
+                reason=reason,
+                report_type="manual",
+                admin_pubkey_hex=cfg["admin_pubkey_hex"],
+            )
+            if ok_added:
+                added.append(pubkey)
+            else:
+                skipped.append(raw_pk)
+
+        self._send_json(200, {"ok": True, "added": added, "skipped": skipped})
 
 
 def main():

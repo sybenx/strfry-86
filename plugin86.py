@@ -83,11 +83,13 @@ def process_event(event, admin_pubkey):
                     and tag[0] == "p"
                     and is_valid_hex_pubkey(tag[1])
                 ):
+                    report_type = tag[2] if len(tag) >= 3 and isinstance(tag[2], str) else None
                     blacklist.add(
                         tag[1],
                         banned_at=created_at,
                         report_event_id=event_id,
                         reason=content if isinstance(content, str) else "",
+                        report_type=report_type,
                         admin_pubkey_hex=admin_pubkey,
                     )
         return {"id": event_id, "action": "accept"}
