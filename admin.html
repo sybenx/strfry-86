@@ -105,17 +105,21 @@ function renderBans(banned) {
     link.textContent = ban.npub;
     li.appendChild(link);
 
-    li.appendChild(document.createTextNode(' — ' + formatDate(ban.banned_at) + ' — '));
+    li.appendChild(document.createTextNode(' — ' + formatDate(ban.banned_at)));
 
-    var typeSpan = document.createElement('span');
-    typeSpan.textContent = ban.report_type || 'unspecified';
-    li.appendChild(typeSpan);
+    if (ban.report_type) {
+      li.appendChild(document.createTextNode(' — '));
+      var typeSpan = document.createElement('span');
+      typeSpan.textContent = ban.report_type;
+      li.appendChild(typeSpan);
+    }
 
-    li.appendChild(document.createTextNode(' — '));
-
-    var reasonSpan = document.createElement('span');
-    reasonSpan.textContent = ban.reason || '';
-    li.appendChild(reasonSpan);
+    if (ban.reason) {
+      li.appendChild(document.createTextNode(' — '));
+      var reasonSpan = document.createElement('span');
+      reasonSpan.textContent = ban.reason;
+      li.appendChild(reasonSpan);
+    }
 
     listEl.appendChild(li);
   }

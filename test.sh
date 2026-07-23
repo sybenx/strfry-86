@@ -228,6 +228,12 @@ LINE="$(mkevent e7 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported" 1700
 OUT="$(run_plugin "$LINE")"
 if check_report_type "$TARGET_HEX" "__NONE__"; then pass "admin 1984 without type records report_type as null"; else fail "report_type should be null when p tag has no type"; fi
 
+# 8. admin 1984 note report (bare p tag, type on e tag) falls back to e tag's type
+echo '{}' > "$TESTDIR/blacklist.json"
+LINE="$(mkevent e8 "$ADMIN_HEX" 1984 "[[\"e\",\"someeventid\",\"malware\"],[\"p\",\"$TARGET_HEX\"]]" "" 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_report_type "$TARGET_HEX" "malware"; then pass "admin 1984 note report falls back to e tag's report_type"; else fail "report_type should fall back to the e tag's type ('malware') for a bare p tag"; fi
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "ALL TESTS PASSED"

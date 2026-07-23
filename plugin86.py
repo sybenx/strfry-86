@@ -76,6 +76,17 @@ def process_event(event, admin_pubkey):
         content = event.get("content", "")
         tags = event.get("tags", [])
         if isinstance(tags, list):
+            fallback_type = None
+            for tag in tags:
+                if (
+                    isinstance(tag, list)
+                    and len(tag) >= 3
+                    and tag[0] in ("e", "a")
+                    and isinstance(tag[2], str)
+                ):
+                    fallback_type = tag[2]
+                    break
+
             for tag in tags:
                 if (
                     isinstance(tag, list)
@@ -83,7 +94,10 @@ def process_event(event, admin_pubkey):
                     and tag[0] == "p"
                     and is_valid_hex_pubkey(tag[1])
                 ):
-                    report_type = tag[2] if len(tag) >= 3 and isinstance(tag[2], str) else None
+                    if len(tag) >= 3 and isinstance(tag[2], str):
+                        report_type = tag[2]
+                    else:
+                        report_type = fallback_type
                     blacklist.add(
                         tag[1],
                         banned_at=created_at,
