@@ -17,7 +17,7 @@ How it works, end to end:
 - **Everything lives in `/config/strfry86/`** inside the container — this is on the operator's permanent `strfry_config` named volume, so it survives container recreation. Nothing is written anywhere else except the strfry.conf edit and its backup.
 - **No custom Docker image, no new compose service, no entrypoint changes.** The only compose change the operator makes by hand is adding a `ports:` line for the admin page (document in README).
 - **`plugin86.py` writes nothing but protocol JSON to stdout** (stderr for all logging) and never crashes on bad input — a dead plugin can wedge the relay.
-- Only the admin pubkey can ban (via kind 1984) or unban (via NIP-98). No other trust roots.
+- Only the admin pubkey can ban (via kind 1984, or manually via NIP-98 `/api/ban`) or unban (via NIP-98). No other trust roots.
 - The admin pubkey can never end up in the blacklist (silent no-op on any attempt).
 - admin.html styling is limited to the exact CSS block in the admin.html section (centering, edge padding, npub wrapping, one mobile font-size media query). No fonts, no colors, no frameworks, no CDN.
 
@@ -92,7 +92,7 @@ Logic per event, in order:
 
 1. Parse; on failure log to stderr, continue.
 2. Author blacklisted → reject `"blocked: banned pubkey"`.
-3. `kind == 1984` and `pubkey == admin` → for every valid `p` tag (64-char lowercase hex, validate, skip malformed), add to blacklist with `banned_at = created_at`, `report_event_id = id`, `reason = content`; then accept. Do NOT verify the signature here — strfry has already verified it, and this is the hot path.
+3. `kind == 1984` and `pubkey == admin` → for every valid `p` tag (64-char lowercase hex, validate, skip malformed), add to blacklist with `banned_at = created_at`, `report_event_id = id`, `reason = content`, and `report_type` = the p tag's third element if present (NIP-56 type — jumble sends one of `nudity`, `malware`, `profanity`, `illegal`, `spam`, `impersonation`, `other`), else null; then accept. Do NOT verify the signature here — strfry has already verified it, and this is the hot path.
 4. Otherwise accept.
 
 On startup (and once per hour thereafter), plugin86 ensures `server86.py` is running: spawn `python3 /config/strfry86/server86.py` fully detached (`start_new_session=True`, stdin/stdout/stderr to devnull — the plugin's stdout is sacred). server86 enforces singleton by port-bind: if the bind fails with EADDRINUSE it exits 0 silently, so repeated spawns are harmless.
@@ -104,15 +104,16 @@ Use unbuffered/line-flushed stdout. Reload the blacklist on mtime change, checke
 stdlib `http.server` (ThreadingHTTPServer). Routes:
 
 - `GET /` → `admin.html`.
-- `GET /api/banned` → `{"admin": "<hex>", "banned": [{"pubkey", "npub", "banned_at", "reason"}]}`. Public read is fine.
+- `GET /api/banned` → `{"admin": "<hex>", "banned": [{"pubkey", "npub", "banned_at", "reason", "report_type"}]}`. Public read is fine.
 - `POST /api/unban` → body `{"auth": <signed nostr event>, "pubkeys": ["<hex>", ...]}` → removes each, returns `{"ok": true, "removed": [...]}`.
+- `POST /api/ban` → body `{"auth": <signed nostr event>, "entries": [{"pubkey": "<npub or 64-hex>", "reason": "<optional>"}, ...]}` → for each entry: decode npub via `lib86/bech32.py` if needed, validate, skip malformed; add to blacklist with `banned_at = now`, `reason` (empty string if omitted), `report_type = "manual"`, no `report_event_id`. Admin pubkey is silently skipped (per the hard constraint). Returns `{"ok": true, "added": [...], "skipped": [...]}`.
 
-NIP-98 auth checks for `/api/unban` — ALL must pass, else 401 JSON error:
+NIP-98 auth checks for `/api/unban` and `/api/ban` — ALL must pass, else 401 JSON error:
 
 1. Signature valid per BIP-340 over the NIP-01 serialized event id (use `lib86/bip340.py`; recompute the event id and check it matches `auth.id` before verifying the sig).
 2. `auth.pubkey == admin_pubkey_hex`.
 3. `auth.kind == 27235`.
-4. `method` tag is `POST`; `u` tag's path is `/api/unban` (lenient on host/origin — reverse proxies change it).
+4. `method` tag is `POST`; `u` tag's path matches the endpoint being called (`/api/unban` or `/api/ban`; lenient on host/origin — reverse proxies change it).
 5. `abs(created_at - now) <= 60`.
 
 No sessions, cookies, or tokens.
@@ -132,9 +133,14 @@ The `padding: 0 1em` is REQUIRED — without it, content sits flush against the 
 Content and behavior:
 
 - `<h1>strfry-86</h1>`.
-- Ban list loads for everyone on page load from `/api/banned`: one `<li>` per ban with a checkbox, the npub as a raw `<a href="https://njump.me/<npub>" target="_blank">` link, ban date, and reason. Insert all user-influenced strings via `textContent` (report reasons are attacker-influenced).
-- "Login with extension" button → `window.nostr.getPublicKey()`. Match admin → enable unban controls; mismatch → plain text "this key is not the admin"; no `window.nostr` → plain text "a NIP-07 extension is required".
-- "Unban selected" button (disabled until admin login) → build kind-27235 event with `u` + `method` tags, `window.nostr.signEvent`, POST, re-fetch, re-render.
+- Above the list, plain text: "These npubs are banned from this relay." — visible to everyone.
+- Ban list loads for everyone on page load from `/api/banned`: one `<li>` per ban with the display name (see below) if known, the npub as a raw `<a href="https://njump.me/<npub>" target="_blank">` link, ban date, report type, and reason. Insert all user-influenced strings via `textContent` (report reasons AND profile names are attacker-influenced).
+- **Timestamps**: render `banned_at` as `YYYY-MM-DD HH:MM UTC` (derive from `toISOString()`, drop seconds/milliseconds and the `Z`, append " UTC"). `created_at` is unix time, so these are inherently UTC.
+- **Display names**: keep a localStorage cache mapping pubkey hex → `{name, checked_at}`. After rendering the list, collect pubkeys with no cache entry (or cached misses older than 24h), open ONE WebSocket to `wss://purplepag.es` and send a single batched REQ `{"kinds":[0],"authors":[<all uncached hex>]}`; on failure to connect, retry once against `wss://relay.damus.io`. For each kind-0 received, parse `content` JSON and take `display_name || name`; close the socket on EOSE or a 5s timeout. Cache every queried pubkey — including misses (`name: null`) — so each npub is queried at most once (misses re-checked at most daily). Successful lookups are cached permanently. Fill names into the already-rendered list via `textContent`; entries without a name show the npub only. This is display sugar — the page must work fully with the socket blocked.
+- **Logged-out state (default)**: checkboxes, the "Unban selected" button, and the manual-ban form are all hidden (not merely disabled). Only the heading, the explanatory line, the ban list, and the "Login with extension" button are visible.
+- "Login with extension" button → `window.nostr.getPublicKey()`. Match admin → reveal checkboxes, "Unban selected", and the manual-ban form; mismatch → plain text "this key is not the admin"; no `window.nostr` → plain text "a NIP-07 extension is required".
+- "Unban selected" button → build kind-27235 event with `u` + `method` tags, `window.nostr.signEvent`, POST `/api/unban`, re-fetch, re-render.
+- **Manual ban form** (admin only): a text input for one or more npubs (whitespace- or comma-separated; hex also accepted), an optional reason text input, and a "Ban" button → build kind-27235 event with `u` tag for `/api/ban` + `method` tag, `window.nostr.signEvent`, POST `/api/ban`, clear the inputs, re-fetch, re-render.
 
 ## README.md
 
