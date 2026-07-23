@@ -10,6 +10,7 @@ Routes:
   GET  /api/banned  -> public read of the ban list
   POST /api/unban   -> NIP-98 authenticated unban
   POST /api/ban     -> NIP-98 authenticated manual ban
+  GET  /api/audit   -> public read of the audit report (notices + activity)
 """
 
 import errno
@@ -18,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -26,7 +28,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from lib86 import bech32, bip340, blacklist  # noqa: E402
+from lib86 import audit, bech32, bip340, blacklist  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ADMIN_HTML_PATH = os.path.join(SCRIPT_DIR, "admin.html")
@@ -40,10 +42,18 @@ STRFRY_SCAN_TIMEOUT = 5
 
 _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 
-CONTACT_APPEAL_CHECK_INTERVAL = 1.0
-_contact_appeal_cache = ""
-_contact_appeal_mtime = None
-_contact_appeal_last_checked = 0.0
+CONFIG_CHECK_INTERVAL = 1.0
+_dynamic_config_cache = {"contact_appeal": "", "relay_url": ""}
+_dynamic_config_mtime = None
+_dynamic_config_last_checked = 0.0
+
+AUDIT_CACHE_TTL = 10 * 60
+AUDIT_SYNC_TIMEOUT = 5
+ACTIVITY_WINDOW_DAYS = 28
+
+_audit_lock = threading.Lock()
+_audit_cache = None  # None until first successful/attempted compute
+_audit_computing = False
 
 
 def log(msg):
@@ -60,31 +70,35 @@ def load_config():
     }
 
 
-def get_contact_appeal():
-    """Return the current contact_appeal string, re-reading config.json when
+def get_dynamic_config():
+    """Return {"contact_appeal", "relay_url"}, re-reading config.json when
     its mtime changes (checked at most once per second). Never raises —
     a hand-edited or briefly-invalid config.json just keeps the last good
-    value."""
-    global _contact_appeal_cache, _contact_appeal_mtime, _contact_appeal_last_checked
+    values."""
+    global _dynamic_config_cache, _dynamic_config_mtime, _dynamic_config_last_checked
     now = time.monotonic()
-    if (now - _contact_appeal_last_checked) < CONTACT_APPEAL_CHECK_INTERVAL:
-        return _contact_appeal_cache
-    _contact_appeal_last_checked = now
+    if (now - _dynamic_config_last_checked) < CONFIG_CHECK_INTERVAL:
+        return _dynamic_config_cache
+    _dynamic_config_last_checked = now
     try:
         mtime = os.stat(CONFIG_PATH).st_mtime
     except OSError:
-        return _contact_appeal_cache
-    if mtime == _contact_appeal_mtime:
-        return _contact_appeal_cache
-    _contact_appeal_mtime = mtime
+        return _dynamic_config_cache
+    if mtime == _dynamic_config_mtime:
+        return _dynamic_config_cache
+    _dynamic_config_mtime = mtime
     try:
         with open(CONFIG_PATH, "r") as f:
             cfg = json.load(f)
-        value = cfg.get("contact_appeal")
-        _contact_appeal_cache = value if isinstance(value, str) else ""
+        contact_appeal = cfg.get("contact_appeal")
+        relay_url = cfg.get("relay_url")
+        _dynamic_config_cache = {
+            "contact_appeal": contact_appeal if isinstance(contact_appeal, str) else "",
+            "relay_url": relay_url if isinstance(relay_url, str) else "",
+        }
     except (OSError, ValueError):
         pass
-    return _contact_appeal_cache
+    return _dynamic_config_cache
 
 
 def compute_event_id(pubkey, created_at, kind, tags, content):
@@ -158,6 +172,133 @@ def resolve_names(pubkeys):
                     _name_cache[pk] = (None, now)
 
     return {pk: _name_cache[pk][0] for pk in pubkeys}
+
+
+def run_strfry_scan(filter_obj):
+    """Run `strfry scan <filter>` and return a list of parsed event dicts.
+    Raises on any failure (bad binary, non-zero exit, timeout) so callers can
+    treat a broken scan environment as a single reportable failure rather
+    than silently returning an empty result set."""
+    filter_json = json.dumps(filter_obj)
+    result = subprocess.run(
+        [STRFRY_BIN, "--config", STRFRY_CONF_PATH, "scan", filter_json],
+        capture_output=True,
+        timeout=STRFRY_SCAN_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"strfry scan exited {result.returncode}: "
+            f"{result.stderr.decode('utf-8', errors='replace')[:200]}"
+        )
+    events = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def empty_audit_skeleton(relay_url, warning):
+    return {
+        "generated_at": int(time.time()),
+        "relay_url": relay_url,
+        "warning": warning,
+        "notices": [],
+        "activity": [],
+    }
+
+
+def compute_audit_report(admin_pubkey_hex):
+    dyn = get_dynamic_config()
+    relay_url = dyn["relay_url"]
+    banned = set(blacklist.load().keys())
+
+    relay_list_events = run_strfry_scan({"kinds": [10002, 10050]})
+
+    authors = sorted({
+        ev.get("pubkey") for ev in relay_list_events
+        if isinstance(ev, dict)
+        and isinstance(ev.get("pubkey"), str)
+        and ev.get("pubkey") != admin_pubkey_hex
+        and ev.get("pubkey") not in banned
+    })
+    footprint_events = run_strfry_scan({"authors": authors}) if authors else []
+
+    since = int(time.time()) - ACTIVITY_WINDOW_DAYS * 86400
+    activity_events = run_strfry_scan({"since": since})
+
+    banned_list = sorted(banned)
+    banned_events = run_strfry_scan({"authors": banned_list}) if banned_list else []
+
+    report = audit.build_report(
+        relay_list_events, footprint_events, activity_events, banned_events,
+        banned, admin_pubkey_hex, relay_url,
+    )
+    return {
+        "generated_at": int(time.time()),
+        "relay_url": relay_url,
+        "warning": None,
+        "notices": report["notices"],
+        "activity": report["activity"],
+    }
+
+
+def _recompute_audit(admin_pubkey_hex):
+    global _audit_cache, _audit_computing
+    try:
+        report = compute_audit_report(admin_pubkey_hex)
+    except Exception as e:
+        log(f"server86: audit recompute failed: {e}")
+        with _audit_lock:
+            if _audit_cache is None:
+                _audit_cache = empty_audit_skeleton(
+                    get_dynamic_config()["relay_url"], "audit scan failed"
+                )
+            _audit_computing = False
+        return
+    with _audit_lock:
+        _audit_cache = report
+        _audit_computing = False
+
+
+def get_audit_report(admin_pubkey_hex):
+    """Serve the cached audit report, kicking off a background recompute
+    (single-flight) when the cache is stale or missing. Never blocks beyond
+    AUDIT_SYNC_TIMEOUT, and never raises."""
+    global _audit_computing
+    with _audit_lock:
+        cache = _audit_cache
+        fresh = cache is not None and (time.time() - cache["generated_at"]) < AUDIT_CACHE_TTL
+        should_kickoff = not fresh and not _audit_computing
+        if should_kickoff:
+            _audit_computing = True
+
+    if fresh:
+        return cache
+
+    if should_kickoff:
+        if cache is None:
+            t = threading.Thread(target=_recompute_audit, args=(admin_pubkey_hex,), daemon=True)
+            t.start()
+            t.join(AUDIT_SYNC_TIMEOUT)
+            with _audit_lock:
+                if _audit_cache is not None:
+                    return _audit_cache
+            return empty_audit_skeleton(
+                get_dynamic_config()["relay_url"], "audit still computing — try again shortly"
+            )
+        else:
+            threading.Thread(target=_recompute_audit, args=(admin_pubkey_hex,), daemon=True).start()
+
+    if cache is not None:
+        return cache
+    return empty_audit_skeleton(
+        get_dynamic_config()["relay_url"], "audit still computing — try again shortly"
+    )
 
 
 def verify_nip98(auth, admin_pubkey_hex, expected_path):
@@ -276,9 +417,15 @@ class Handler(BaseHTTPRequestHandler):
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
             self._send_json(200, {
                 "admin": cfg["admin_pubkey_hex"],
-                "contact_appeal": get_contact_appeal(),
+                "contact_appeal": get_dynamic_config()["contact_appeal"],
                 "banned": banned,
             })
+            return
+
+        if path == "/api/audit":
+            cfg = self.server.strfry86_config
+            report = get_audit_report(cfg["admin_pubkey_hex"])
+            self._send_json(200, report)
             return
 
         self._send_json(404, {"error": "not found"})

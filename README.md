@@ -44,13 +44,17 @@ docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
 docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
 ```
 
-Only the `docker cp` and `docker exec` steps matter — get the file(s) onto the host however is convenient. Applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/` and kept, not deleted, so you can always see what was installed and when.
+Only the `docker cp` and `docker exec` steps matter — get the file(s) onto the host however is convenient. Applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/`; only the most recent one is kept, older ones are pruned automatically after each successful run (see [Retention](#retention) below).
 
 ## First run
 
 On first run the updater needs your admin pubkey — the one and only key allowed to ban (via a NIP-56 report, kind `1984`, or manually from the admin page) or unban (via NIP-98). It tries to read `relay.info.pubkey` from your `strfry.conf` first and, if found, asks you to confirm before using it; otherwise it prompts you to paste an `npub` or 64-char hex pubkey. It is never adopted silently. The result is stored as a public key only in `/config/strfry86/config.json` — your `nsec` never leaves your extension, and never touches this server.
 
-Right after the admin pubkey, it also asks once for an optional `contact_appeal` — free text (email, npub, URL, whatever) shown publicly on the admin page, to everyone including logged-out visitors, so a banned user knows where to appeal. Blank is a valid answer. If this key is ever missing entirely from `config.json` (e.g. upgrading from an older install), a later update run asks for it once and adds it in — it's otherwise never re-asked. You can edit or blank it by hand in `config.json` at any time; the admin page picks up the change on its next load, no restart needed.
+Right after the admin pubkey, it also asks once for an optional `contact_appeal` — free text (email, npub, URL, whatever) shown publicly on the admin page, to everyone including logged-out visitors, so a banned user knows where to appeal. Blank is a valid answer. Right after that it asks once for an optional `relay_url` — the relay's public websocket URL (e.g. `wss://relay.example.com`), used to sharpen the audit's "ghost" detection (see below); blank skips that refinement, everything else about the audit still works. If either key is ever missing entirely from `config.json` (e.g. upgrading from an older install), a later update run asks for the missing one(s) once and adds them in — never re-asked once present, even if blank. You can edit or blank either by hand in `config.json` at any time; the admin page picks up the change on its next load, no restart needed.
+
+## The audit
+
+After logging in, the admin page shows an **audit**: plain-language notices about suspicious patterns in stored events, the flagship case being swarms of pubkeys that plant this relay in their kind-10002 relay lists without ever posting anything else. Each notice expands to a pre-ticked list of pubkeys you can ban in one click. Detection is purely local counting over what's already in the strfry database — no network calls, no AI, nothing that needs tuning. `relay_url` in `config.json` sharpens the flagship "ghost" notice but is optional. `GET /api/audit` is a stable, public JSON endpoint — external tooling (scripts, AI review, anything) can consume it and propose bans through the existing `POST /api/ban`.
 
 ## Expose the admin page
 
@@ -87,7 +91,11 @@ Logged in as admin, the admin page also shows a ban form: paste one or more npub
 
 ## strfry.conf backups
 
-Every updater run that touches `/config/strfry.conf` backs it up first, next to the original, as `strfry.conf.bak-<unix-timestamp>`.
+A backup is only written when the updater is actually about to change `/config/strfry.conf` — a run that finds the plugin line already correct (the steady state, i.e. almost every update) touches nothing and leaves no backup. When a change is about to be made, the original is copied first, next to itself, as `strfry.conf.bak-<unix-timestamp>`.
+
+## Retention
+
+The updater keeps the **3 newest** `strfry.conf.bak-*` files and the **1 newest** applied bundle (`strfry86-bundle.tar.gz.applied-*`), pruning older ones after each successful run — the exact counts pruned are printed in the run summary. Pruning is skipped entirely on a run that hit a foreign `writePolicy.plugin` (needs manual resolution) or a self-update hash mismatch, so the fallback files always survive while anything is in question. Files you renamed by hand are never touched — only exact `strfry.conf.bak-<digits>` / `strfry86-bundle.tar.gz.applied-<digits>` matches are ever candidates for deletion.
 
 ## Trust model
 

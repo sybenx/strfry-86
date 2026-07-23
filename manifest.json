@@ -1,10 +1,11 @@
 {
-  "admin.html": "def0e4e6c803071a57aa64bb68978293fdc194a02f41c633e8e9e66ab1f2ca26",
+  "admin.html": "1ae79223ac7ee75c6bfa71c2fddae1578a3f1a7c255a4d80713fe5e3d81964d2",
   "lib86/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "lib86/audit.py": "4f4cbcfe937122bcbb4ac6365cd3186e1afdad63c5c68fc2dce38166c3e303bf",
   "lib86/bech32.py": "b151bbeb3937dea151278f830050a31ded16f39a663d4a2092cf8f5807fc0d17",
   "lib86/bip340.py": "c9c6eef55fddc912e2eaec93dcbd69a2f983a407764a0c7b19e49d9ce2bcb66d",
   "lib86/blacklist.py": "8f4a5978d8dff2b05f57ba98ba191810ff7f344f7cd2da57826631176fcd4533",
   "plugin86.py": "f92f258e301aad15798e3554204a21903132823f5a4dfb5164ce1a101828fbb6",
-  "server86.py": "5febb7e16b23f8cf06b49ac17de7bf5cecf547c2a6e1b0bd1154a761b4ff9a83",
-  "strfry-86-updater.py": "a143af6ff1ab90047c862c63275bbbf5cf1eefa7b134bbe3105dba28e40eb917"
+  "server86.py": "bc2944f5de08e494d5a6766a52263af032bc5dc258aff5346f75dca732240d13",
+  "strfry-86-updater.py": "2ccddaea7b37976fec6fbd1ad2490f80739f668af0adc9861bf6873e31f73e81"
 }

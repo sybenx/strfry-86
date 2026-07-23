@@ -42,6 +42,12 @@ DEFAULT_BIND = "0.0.0.0"
 # Files never managed by the manifest / never overwritten by updates.
 OPERATOR_OWNED = {"config.json", "blacklist.json"}
 
+# Retention: housekeeping constants, not prompts or config keys.
+KEEP_CONF_BACKUPS = 3
+KEEP_APPLIED_BUNDLES = 1
+CONF_BACKUP_RE = re.compile(r'^strfry\.conf\.bak-(\d+)$')
+APPLIED_BUNDLE_RE = re.compile(r'^strfry86-bundle\.tar\.gz\.applied-(\d+)$')
+
 
 # --------------------------------------------------------------------------
 # Minimal inline bech32 (BIP-173), duplicated from lib86/bech32.py because
@@ -332,20 +338,25 @@ def sync_files(manifest, fetch_bytes, source_label):
 
 
 def self_update(manifest, fetch_bytes, source_label):
-    """Fetch strfry-86-updater.py last, if changed. Returns True if updated."""
+    """Fetch strfry-86-updater.py last, if changed.
+
+    Returns (updated, hit_mismatch): updated is True if the file was
+    replaced; hit_mismatch is True if a fetch or sha256 verification failed,
+    which the caller treats the same as any other hash-mismatch — nothing
+    gets pruned this run."""
     rel_path = "strfry-86-updater.py"
     if rel_path not in manifest:
-        return False
+        return False, False
     expected_sha = manifest[rel_path]
     local_path = os.path.abspath(__file__)
     if os.path.exists(local_path) and sha256_file(local_path) == expected_sha:
-        return False
+        return False, False
 
     try:
         raw = fetch_bytes(rel_path)
     except Exception as e:
         print(f"ERROR: failed to read updated {rel_path} from {source_label}: {e}")
-        return False
+        return False, True
 
     actual_sha = hashlib.sha256(raw).hexdigest()
     if actual_sha != expected_sha:
@@ -353,13 +364,13 @@ def self_update(manifest, fetch_bytes, source_label):
             f"ERROR: sha256 mismatch for {rel_path} "
             f"(expected {expected_sha}, got {actual_sha}) — not self-updating."
         )
-        return False
+        return False, True
 
     tmp_path = local_path + ".tmp"
     with open(tmp_path, "wb") as f:
         f.write(raw)
     os.replace(tmp_path, local_path)
-    return True
+    return True, False
 
 
 # --------------------------------------------------------------------------
@@ -405,6 +416,22 @@ def prompt_contact_appeal():
     ).strip()
 
 
+def prompt_relay_url():
+    return input(
+        "Relay URL as clients dial it (e.g. wss://relay.example.com), used "
+        "by the audit page — blank to skip: "
+    ).strip()
+
+
+# Optional config keys prompted for once on first run (in this order) and
+# topped up on any later run where an existing config.json lacks the key
+# entirely. Present-but-empty is an answered question and is never re-asked.
+OPTIONAL_CONFIG_PROMPTS = [
+    ("contact_appeal", prompt_contact_appeal),
+    ("relay_url", prompt_relay_url),
+]
+
+
 def ensure_config():
     if not os.path.exists(CONFIG_JSON_PATH):
         admin_pubkey = None
@@ -433,14 +460,15 @@ def ensure_config():
             except ValueError as e:
                 print(f"  invalid: {e}")
 
-        contact_appeal = prompt_contact_appeal() if sys.stdin.isatty() else ""
-
+        is_tty = sys.stdin.isatty()
         cfg = {
             "admin_pubkey_hex": admin_pubkey,
             "port": DEFAULT_PORT,
             "bind": DEFAULT_BIND,
-            "contact_appeal": contact_appeal,
         }
+        for key, prompt_fn in OPTIONAL_CONFIG_PROMPTS:
+            cfg[key] = prompt_fn() if is_tty else ""
+
         os.makedirs(INSTALL_DIR, exist_ok=True)
         tmp_path = CONFIG_JSON_PATH + ".tmp"
         with open(tmp_path, "w") as f:
@@ -450,8 +478,9 @@ def ensure_config():
         print(f"config.json written with admin {npub_encode(admin_pubkey)}")
         return "created"
 
-    # config.json already exists — the only thing we may do is top up a
-    # missing contact_appeal key. Every other key/value is left untouched.
+    # config.json already exists — the only thing we may do is top up any
+    # optional keys missing entirely. Every other key/value is left
+    # untouched.
     try:
         with open(CONFIG_JSON_PATH) as f:
             cfg = json.load(f)
@@ -459,19 +488,25 @@ def ensure_config():
         print(f"WARNING: failed to read existing config.json ({e}) — leaving it untouched.")
         return "unchanged"
 
-    if "contact_appeal" in cfg:
+    missing = [key for key, _ in OPTIONAL_CONFIG_PROMPTS if key not in cfg]
+    if not missing:
         return "unchanged"
 
     if not sys.stdin.isatty():
         return "unchanged"
 
-    cfg["contact_appeal"] = prompt_contact_appeal()
+    added = []
+    for key, prompt_fn in OPTIONAL_CONFIG_PROMPTS:
+        if key in missing:
+            cfg[key] = prompt_fn()
+            added.append(key)
+
     tmp_path = CONFIG_JSON_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp_path, CONFIG_JSON_PATH)
-    return "contact_appeal added"
+    return ", ".join(added) + " added"
 
 
 # --------------------------------------------------------------------------
@@ -528,10 +563,6 @@ def edit_strfry_conf():
     newline = "\r\n" if "\r\n" in original else "\n"
     lines = original.splitlines(keepends=True)
 
-    backup_path = f"{STRFRY_CONF_PATH}.bak-{int(time.time())}"
-    shutil.copy2(STRFRY_CONF_PATH, backup_path)
-    print(f"strfry.conf backed up to {backup_path}")
-
     block_start, block_end = find_write_policy_block(lines)
     plugin_idx, plugin_value = find_plugin_line(lines, block_start, block_end)
 
@@ -549,22 +580,36 @@ def edit_strfry_conf():
 
     new_line = f'    plugin = "{PLUGIN_PATH}"{newline}'
 
+    new_lines = list(lines)
+    appended_block = False
     if plugin_idx is not None:
-        lines[plugin_idx] = new_line
+        new_lines[plugin_idx] = new_line
     elif block_start is not None:
-        lines.insert(block_end, new_line)
+        new_lines.insert(block_end, new_line)
     else:
-        if lines and not lines[-1].endswith(("\n", "\r\n")):
-            lines[-1] = lines[-1] + newline
-        lines.append(newline)
-        lines.append(f"writePolicy {{{newline}")
-        lines.append(new_line)
-        lines.append(f"}}{newline}")
-        print("strfry.conf: no writePolicy block found — appended a new one.")
+        if new_lines and not new_lines[-1].endswith(("\n", "\r\n")):
+            new_lines[-1] = new_lines[-1] + newline
+        new_lines.append(newline)
+        new_lines.append(f"writePolicy {{{newline}")
+        new_lines.append(new_line)
+        new_lines.append(f"}}{newline}")
+        appended_block = True
+
+    new_content = "".join(new_lines)
+    if new_content == original:
+        # Nothing actually changes byte-for-byte — no backup, no write.
+        print("strfry.conf: writePolicy.plugin already set to strfry-86 — no changes made.")
+        return "already configured"
+
+    backup_path = f"{STRFRY_CONF_PATH}.bak-{int(time.time())}"
+    shutil.copy2(STRFRY_CONF_PATH, backup_path)
+    print(f"strfry.conf backed up to {backup_path}")
 
     with open(STRFRY_CONF_PATH, "w") as f:
-        f.write("".join(lines))
+        f.write(new_content)
 
+    if appended_block:
+        print("strfry.conf: no writePolicy block found — appended a new one.")
     print(f"strfry.conf: writePolicy.plugin set to {PLUGIN_PATH}")
     return "set"
 
@@ -601,6 +646,46 @@ def kill_server86():
             except OSError:
                 pass
     return killed
+
+
+# --------------------------------------------------------------------------
+# retention
+# --------------------------------------------------------------------------
+
+def prune_old_files(directory, pattern, keep):
+    """Delete all but the `keep` newest files in `directory` whose basename
+    fully matches `pattern` (which must capture the sortable integer in
+    group 1). No recursion, no globbing, no following symlinks — anything
+    hand-renamed or otherwise not an exact match is left alone. Ordered by
+    the integer parsed from the filename, not mtime (docker cp / volume
+    restores rewrite mtimes). Deletion failures are logged to stderr and
+    otherwise non-fatal. Returns the count actually removed."""
+    try:
+        entries = os.listdir(directory)
+    except OSError as e:
+        print(f"WARNING: failed to list {directory} for pruning: {e}", file=sys.stderr)
+        return 0
+
+    matches = []
+    for name in entries:
+        m = pattern.match(name)
+        if not m:
+            continue
+        path = os.path.join(directory, name)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        matches.append((int(m.group(1)), path))
+
+    matches.sort(key=lambda t: t[0], reverse=True)
+
+    removed = 0
+    for _, path in matches[keep:]:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError as e:
+            print(f"WARNING: failed to prune {path}: {e}", file=sys.stderr)
+    return removed
 
 
 # --------------------------------------------------------------------------
@@ -656,14 +741,15 @@ def main():
     if killed:
         print(f"stopped {killed} running server86.py process(es); will respawn with fresh code.")
 
+    self_update_mismatch = False
     if mode == "offline":
         applied_path = f"{BUNDLE_PATH}.applied-{int(time.time())}"
         os.rename(BUNDLE_PATH, applied_path)
         print(f"bundle applied — renamed to {os.path.basename(applied_path)}")
-        updater_self_updated = self_update(manifest, fetch_bytes, source_label)
+        updater_self_updated, self_update_mismatch = self_update(manifest, fetch_bytes, source_label)
         self_update_msg = "updater updated — effective next run."
     elif mode == "network":
-        updater_self_updated = self_update(manifest, fetch_bytes, source_label)
+        updater_self_updated, self_update_mismatch = self_update(manifest, fetch_bytes, source_label)
         self_update_msg = "updater updated — already effective next run."
     else:
         updater_self_updated = False
@@ -674,6 +760,18 @@ def main():
 
     save_local_manifest(manifest)
 
+    # Prune only at the very end of a fully successful run: a foreign
+    # writePolicy plugin or a self-update hash mismatch leaves the current
+    # state in question, so nothing gets pruned this run (the fallback
+    # files must survive to the next attempt).
+    pruned_conf = 0
+    pruned_bundles = 0
+    safe_to_prune = conf_status != "existing plugin left untouched" and not self_update_mismatch
+    if safe_to_prune:
+        conf_dir = os.path.dirname(STRFRY_CONF_PATH) or "."
+        pruned_conf = prune_old_files(conf_dir, CONF_BACKUP_RE, KEEP_CONF_BACKUPS)
+        pruned_bundles = prune_old_files(INSTALL_DIR, APPLIED_BUNDLE_RE, KEEP_APPLIED_BUNDLES)
+
     print()
     print("=== strfry-86 update summary ===")
     print(f"mode: {mode}")
@@ -682,6 +780,10 @@ def main():
     print(f"strfry.conf: {conf_status}")
     if updater_self_updated:
         print(self_update_msg)
+    if safe_to_prune:
+        print(f"pruned {pruned_conf} old conf backups, {pruned_bundles} old applied bundles")
+    else:
+        print("pruning skipped this run (state in question)")
     print("if in doubt: docker restart <container>")
 
 

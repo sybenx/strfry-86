@@ -82,6 +82,122 @@ else
 fi
 rm -f "$CHECK_BUNDLE_SCRIPT"
 
+# --- lib86/audit.py pure-function tests --------------------------------------
+
+AUDIT_TEST_SCRIPT="$(mktemp)"
+cat > "$AUDIT_TEST_SCRIPT" <<PYEOF
+import sys
+sys.path.insert(0, "$REPO_ROOT")
+from lib86 import audit
+
+failures = 0
+
+
+def check(name, cond):
+    global failures
+    if cond:
+        print(f"PASS: {name}")
+    else:
+        print(f"FAIL: {name}")
+        failures += 1
+
+
+ADMIN = "a" * 64
+BANNED = "b" * 64
+GHOST = "c" * 64
+NORMAL = "d" * 64
+NOW = 1700000000
+
+# a pubkey with only a 10002 classifies as ghost; one with a 10002 plus a
+# kind 1 does not.
+relay_list_events = [
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": NORMAL, "kind": 10002, "created_at": NOW, "tags": []},
+]
+footprint_events = [
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": NORMAL, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": NORMAL, "kind": 1, "created_at": NOW, "tags": []},
+]
+notice = audit.build_ghosts_notice(relay_list_events, footprint_events, set(), ADMIN, "")
+check(
+    "pubkey with only a 10002 classifies as ghost",
+    notice is not None and GHOST in notice["pubkeys"],
+)
+check(
+    "pubkey with a 10002 plus a kind 1 does not classify as ghost",
+    notice is not None and NORMAL not in notice["pubkeys"],
+)
+
+# admin and already-banned pubkeys are excluded from ghosts.
+relay_list_events2 = [
+    {"pubkey": ADMIN, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": BANNED, "kind": 10002, "created_at": NOW, "tags": []},
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW, "tags": []},
+]
+notice2 = audit.build_ghosts_notice(relay_list_events2, relay_list_events2, {BANNED}, ADMIN, "")
+check("admin pubkey is excluded from ghosts", notice2 is not None and ADMIN not in notice2["pubkeys"])
+check("already-banned pubkey is excluded from ghosts", notice2 is not None and BANNED not in notice2["pubkeys"])
+check("non-admin non-banned ghost is still included", notice2 is not None and GHOST in notice2["pubkeys"])
+
+# normalize_relay_url collides wss://X.Y/, wss://x.y, and wss://x.y//.
+check(
+    "normalize_relay_url collides wss://X.Y/, wss://x.y, wss://x.y//",
+    audit.normalize_relay_url("wss://X.Y/")
+    == audit.normalize_relay_url("wss://x.y")
+    == audit.normalize_relay_url("wss://x.y//")
+    == "wss://x.y",
+)
+
+# >=10 same-hour relay lists from distinct authors produce a burst notice.
+burst_events = [
+    {"pubkey": f"{i:064x}", "kind": 10002, "created_at": NOW + i, "tags": []}
+    for i in range(10)
+]
+burst_notices = audit.build_burst_notices(burst_events)
+check(
+    "10 same-hour relay lists from distinct authors produce a burst notice",
+    len(burst_notices) == 1 and len(burst_notices[0]["pubkeys"]) == 10,
+)
+
+# 5 identical sorted r-tag sets produce a fingerprint notice.
+fp_tags = [["r", "wss://a.example"], ["r", "wss://b.example"]]
+fp_events = [
+    {"pubkey": f"{i:064x}", "kind": 10002, "created_at": NOW, "tags": fp_tags}
+    for i in range(5)
+]
+fp_notices = audit.build_fingerprint_notices(fp_events)
+check(
+    "5 identical sorted r-tag sets produce a fingerprint notice",
+    len(fp_notices) == 1 and len(fp_notices[0]["pubkeys"]) == 5,
+)
+
+# malformed events (missing tags, tags not a list) are skipped without raising.
+malformed = [
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW},
+    {"pubkey": GHOST, "kind": 10002, "created_at": NOW, "tags": "not-a-list"},
+    "not-a-dict",
+    {"pubkey": GHOST, "created_at": NOW, "tags": []},
+]
+try:
+    audit.build_ghosts_notice(malformed, malformed, set(), ADMIN, "")
+    audit.build_burst_notices(malformed)
+    audit.build_fingerprint_notices(malformed)
+    audit.build_purge_pending_notice(malformed)
+    audit.build_activity(malformed, now_ts=NOW)
+    check("malformed events are skipped without raising", True)
+except Exception as e:
+    check(f"malformed events are skipped without raising (raised {e!r})", False)
+
+sys.exit(1 if failures else 0)
+PYEOF
+
+AUDIT_TEST_OUTPUT="$(python3 "$AUDIT_TEST_SCRIPT")"
+echo "$AUDIT_TEST_OUTPUT"
+AUDIT_FAIL_COUNT="$(echo "$AUDIT_TEST_OUTPUT" | grep -c '^FAIL:')"
+FAILURES=$((FAILURES + AUDIT_FAIL_COUNT))
+rm -f "$AUDIT_TEST_SCRIPT"
+
 # --- plugin86.py sandbox ----------------------------------------------------
 
 TESTDIR="$(mktemp -d)"
