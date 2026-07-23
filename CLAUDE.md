@@ -66,7 +66,7 @@ Single file, self-contained (may not import lib86 — it must run before lib86 e
 Offline-mode specifics:
 - Open with stdlib `tarfile`. Before extracting ANYTHING, validate every member name: reject absolute paths, `..` components, and links; abort loudly on violation.
 - Extract each needed file to `<name>.tmp`, verify sha256 against the bundle's manifest, then `os.replace` into place — same atomicity as network mode. Only extract files that are missing or hash-differ locally (same diffing).
-- After a fully successful run, rename the bundle to `strfry86-bundle.tar.gz.applied-<unixtime>` so a re-run without a fresh bundle cleanly no-ops (it falls back to comparing local files against the local `manifest.json` and reports "unchanged"). Never delete applied bundles.
+- After a fully successful run, rename the bundle to `strfry86-bundle.tar.gz.applied-<unixtime>` so a re-run without a fresh bundle cleanly no-ops (it falls back to comparing local files against the local `manifest.json` and reports "unchanged"). Older applied bundles are removed by the end-of-run prune (see Retention), never here.
 - Self-update in offline mode: if the bundle contains a changed updater, extract it LAST (after the rename step is queued), replace atomically, print "updater updated — effective next run."
 
 Network-mode flow:
@@ -82,7 +82,7 @@ Network-mode flow:
    **`relay_url`**: the relay's public websocket URL, used by the audit to recognize kind-10002 `r` tags that point at *this* relay. Prompted for once on first run, right after `contact_appeal` — "Relay URL as clients dial it (e.g. wss://relay.example.com), used by the audit page — blank to skip:". Store exactly what was typed (comparison normalizes later; see lib86/audit.py). Empty is a valid answer and stores `""` — every audit feature except the `targets_relay` refinement still works without it. Same top-up rule as `contact_appeal`: on any run where `config.json` exists but lacks the key entirely, ask once and merge; present-but-empty is an answered question.
 
    If stdin is not a TTY, skip all prompts silently: write `""` on first run, and on top-up leave the existing file untouched rather than half-writing it.
-4. **strfry.conf edit**: locate `/config/strfry.conf` (constant, documented). Before any modification, copy to `strfry.conf.bak-<unixtime>`. Then:
+4. **strfry.conf edit**: locate `/config/strfry.conf` (constant, documented). Decide what the edit will be FIRST; only if a byte will actually change, copy to `strfry.conf.bak-<unixtime>` and then write. A run that determines the plugin line is already correct (the steady state, i.e. almost every update) must produce NO backup file at all. Then:
    - If `writePolicy.plugin` already points at `/config/strfry86/plugin86.py` → no-op.
    - If it is empty/unset → set it to `plugin = "/config/strfry86/plugin86.py"`.
    - If it points at some OTHER plugin → do NOT touch it; print a loud warning telling the operator to resolve manually.
@@ -91,7 +91,24 @@ Network-mode flow:
 5. **chmod +x** `plugin86.py` (it has a `#!/usr/bin/env python3` shebang; strfry executes it directly).
 6. **Restart the web server**: after any successful update, find and kill any running `server86.py` (match on cmdline via `/proc`, no pgrep dependency). The next event through the plugin respawns it with fresh code. Print what was done.
 7. **Self-update**: if the manifest shows the updater itself changed, download it LAST, replace atomically, and print "updater updated — already effective next run."
-8. Exit with a clear summary: installed/updated/unchanged file counts, config status, strfry.conf status, and the hint "if in doubt: docker restart <container>".
+8. **Prune** per the Retention rules below — this is the LAST action of the run, in both modes, after self-update, and only if everything above succeeded.
+9. Exit with a clear summary: installed/updated/unchanged file counts, config status, strfry.conf status, pruned-file count, and the hint "if in doubt: docker restart <container>".
+
+**Retention (applies to both artifact families the updater creates):**
+
+- `strfry.conf.bak-<unixtime>` in the strfry.conf directory → **keep the 3 newest, delete older**.
+- `strfry86-bundle.tar.gz.applied-<unixtime>` in `/config/strfry86/` → **keep the 1 newest, delete older**.
+
+Rules that make this safe:
+
+- Prune ONLY at the very end of a fully successful run. A run that aborted, warned about a foreign plugin, or hit a hash mismatch prunes nothing — never destroy the fallback while the current state is in question.
+- Match with a strict regex anchored to the exact patterns above (`^strfry\.conf\.bak-\d+$`, `^strfry86-bundle\.tar\.gz\.applied-\d+$`). Anything the operator renamed by hand, any non-matching neighbor, and any directory is invisible to the pruner. Never glob loosely, never recurse, never follow symlinks.
+- Order by the integer parsed from the filename, not mtime — `docker cp` and volume restores rewrite mtimes.
+- Deletion failures are non-fatal: log to stderr, continue, still exit 0.
+- Print exactly what was removed (`pruned 4 old conf backups, 2 old applied bundles`), so the operator sees it rather than discovering files vanished.
+- The counts are constants at the top of the file (`KEEP_CONF_BACKUPS = 3`, `KEEP_APPLIED_BUNDLES = 1`), not prompts or config keys — this is housekeeping, not policy.
+
+Combined with the conditional-backup rule in step 4, the steady state for an operator who updates weekly is: one applied bundle, and conf backups only from runs that genuinely rewrote the file.
 
 ## plugin86.py — strfry write policy
 
@@ -218,9 +235,9 @@ docker cp strfry86-bundle.tar.gz strfry:/config/strfry86/
 docker exec -it strfry python3 /config/strfry86/strfry-86-updater.py
 ```
 
-with a note that the curl lines can be replaced by downloading/dragging the files onto the host by any means — only the `docker cp` and `docker exec` steps matter, and applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/`.
+with a note that the curl lines can be replaced by downloading/dragging the files onto the host by any means — only the `docker cp` and `docker exec` steps matter, and applied bundles are renamed to `.applied-<timestamp>` inside `/config/strfry86/`, where only the most recent one is retained (older applied bundles and all but the 3 newest `strfry.conf.bak-*` files are pruned after each successful run).
 
-README must also cover, briefly: adjusting the container name if not `strfry`; that the admin key is asked for once on first run (defaulting to relay.info.pubkey from strfry.conf if set) and stored in `/config/strfry86/config.json`, public key only, nsec never leaves your extension; that `contact_appeal` in config.json is optional and asked for once (re-asked on a later update only if the key is missing entirely), is shown publicly on the admin page to everyone including logged-out visitors, and can be edited or blanked by hand at any time with effect on the next page load; the audit, in a couple of sentences: after login the page surfaces notices about suspicious patterns in stored events — the flagship case being swarms of pubkeys that plant this relay in their kind-10002 relay lists without ever posting — with one-click batch banning, that detection is purely local counting (no network, no AI), that `relay_url` in config.json sharpens it and is optional, and that `/api/audit` is a stable public JSON endpoint external tooling (scripts, AI review, anything) can consume to propose bans through `/api/ban`; the compose `ports:` line (`127.0.0.1:8686:8686`, with a note on tailnet/reverse-proxy exposure); adding the relay to your write relays in jumble.social so your reports actually reach it; that bans are forward-looking and existing events are purged with `strfry delete --filter '{"authors":["<hex>"]}'`; where the strfry.conf backups land; and the trust model in one honest sentence (the updater executes code from this repo's main branch — don't run someone else's fork blindly).
+README must also cover, briefly: adjusting the container name if not `strfry`; that the admin key is asked for once on first run (defaulting to relay.info.pubkey from strfry.conf if set) and stored in `/config/strfry86/config.json`, public key only, nsec never leaves your extension; that `contact_appeal` in config.json is optional and asked for once (re-asked on a later update only if the key is missing entirely), is shown publicly on the admin page to everyone including logged-out visitors, and can be edited or blanked by hand at any time with effect on the next page load; the audit, in a couple of sentences: after login the page surfaces notices about suspicious patterns in stored events — the flagship case being swarms of pubkeys that plant this relay in their kind-10002 relay lists without ever posting — with one-click batch banning, that detection is purely local counting (no network, no AI), that `relay_url` in config.json sharpens it and is optional, and that `/api/audit` is a stable public JSON endpoint external tooling (scripts, AI review, anything) can consume to propose bans through `/api/ban`; the compose `ports:` line (`127.0.0.1:8686:8686`, with a note on tailnet/reverse-proxy exposure); adding the relay to your write relays in jumble.social so your reports actually reach it; that bans are forward-looking and existing events are purged with `strfry delete --filter '{"authors":["<hex>"]}'`; where the strfry.conf backups land, that a backup is only written when the file is actually changed, and that the updater keeps the 3 newest conf backups and the 1 newest applied bundle, pruning older ones after a successful run (hand-renamed files are never touched); and the trust model in one honest sentence (the updater executes code from this repo's main branch — don't run someone else's fork blindly).
 
 ## Release discipline
 
