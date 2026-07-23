@@ -12,19 +12,19 @@ li { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>strfry-86</h1>
-<p>These npubs are banned from this relay.</p>
-<ul id="ban-list"></ul>
-<p id="status"></p>
 <button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
 <div id="admin-controls" style="display:none">
-  <button id="unban-btn" type="button">Unban selected</button>
   <h2>Ban a pubkey</h2>
   <form id="ban-form">
     <div><input id="ban-input" type="text" placeholder="npub or hex, one or more (comma/space separated)"></div>
     <div><input id="ban-reason" type="text" placeholder="reason (optional)"></div>
     <button type="submit">Ban</button>
   </form>
+  <button id="unban-btn" type="button">Unban selected</button>
 </div>
+<p>These npubs are banned from this relay.</p>
+<ul id="ban-list"></ul>
 <script>
 var NAME_CACHE_KEY = 'strfry86_name_cache';
 var NAME_TTL_MS = 24 * 60 * 60 * 1000;
@@ -69,7 +69,7 @@ function formatDate(bannedAt) {
     return 'unknown date';
   }
   var iso = new Date(bannedAt * 1000).toISOString();
-  return iso.slice(0, 10) + ' ' + iso.slice(11, 16) + ' UTC';
+  return iso.slice(0, 10) + '@' + iso.slice(11, 16) + ' UTC';
 }
 
 function renderBans(banned) {
@@ -89,7 +89,7 @@ function renderBans(banned) {
       li.appendChild(document.createTextNode(' '));
     }
 
-    var nameSpan = document.createElement('span');
+    var nameSpan = document.createElement('b');
     if (ban.name) {
       nameSpan.textContent = ban.name + ' ';
     }
@@ -105,7 +105,10 @@ function renderBans(banned) {
     link.textContent = ban.npub;
     li.appendChild(link);
 
-    li.appendChild(document.createTextNode(' — ' + formatDate(ban.banned_at)));
+    var dateEl = document.createElement('i');
+    dateEl.textContent = formatDate(ban.banned_at);
+    li.appendChild(document.createTextNode(' — '));
+    li.appendChild(dateEl);
 
     if (ban.report_type) {
       li.appendChild(document.createTextNode(' — '));
