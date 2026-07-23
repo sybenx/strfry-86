@@ -398,49 +398,80 @@ def find_relay_info_pubkey():
     return None
 
 
+def prompt_contact_appeal():
+    return input(
+        "Optional appeal contact, shown publicly on the admin page (email, "
+        "npub, URL, or any free text) — blank for none: "
+    ).strip()
+
+
 def ensure_config():
-    if os.path.exists(CONFIG_JSON_PATH):
+    if not os.path.exists(CONFIG_JSON_PATH):
+        admin_pubkey = None
+        found = find_relay_info_pubkey()
+        if found:
+            candidate_hex = None
+            try:
+                candidate_hex = parse_pubkey_input(found)
+            except ValueError:
+                candidate_hex = None
+            if candidate_hex:
+                try:
+                    npub = npub_encode(candidate_hex)
+                except ValueError:
+                    npub = candidate_hex
+                answer = input(
+                    f"Found relay.info.pubkey {npub} in strfry.conf — use as admin? [Y/n] "
+                ).strip().lower()
+                if answer in ("", "y", "yes"):
+                    admin_pubkey = candidate_hex
+
+        while admin_pubkey is None:
+            raw = input("Enter admin pubkey (npub or 64-char hex): ").strip()
+            try:
+                admin_pubkey = parse_pubkey_input(raw)
+            except ValueError as e:
+                print(f"  invalid: {e}")
+
+        contact_appeal = prompt_contact_appeal() if sys.stdin.isatty() else ""
+
+        cfg = {
+            "admin_pubkey_hex": admin_pubkey,
+            "port": DEFAULT_PORT,
+            "bind": DEFAULT_BIND,
+            "contact_appeal": contact_appeal,
+        }
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        tmp_path = CONFIG_JSON_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(cfg, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, CONFIG_JSON_PATH)
+        print(f"config.json written with admin {npub_encode(admin_pubkey)}")
+        return "created"
+
+    # config.json already exists — the only thing we may do is top up a
+    # missing contact_appeal key. Every other key/value is left untouched.
+    try:
+        with open(CONFIG_JSON_PATH) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"WARNING: failed to read existing config.json ({e}) — leaving it untouched.")
         return "unchanged"
 
-    admin_pubkey = None
-    found = find_relay_info_pubkey()
-    if found:
-        candidate_hex = None
-        try:
-            candidate_hex = parse_pubkey_input(found)
-        except ValueError:
-            candidate_hex = None
-        if candidate_hex:
-            try:
-                npub = npub_encode(candidate_hex)
-            except ValueError:
-                npub = candidate_hex
-            answer = input(
-                f"Found relay.info.pubkey {npub} in strfry.conf — use as admin? [Y/n] "
-            ).strip().lower()
-            if answer in ("", "y", "yes"):
-                admin_pubkey = candidate_hex
+    if "contact_appeal" in cfg:
+        return "unchanged"
 
-    while admin_pubkey is None:
-        raw = input("Enter admin pubkey (npub or 64-char hex): ").strip()
-        try:
-            admin_pubkey = parse_pubkey_input(raw)
-        except ValueError as e:
-            print(f"  invalid: {e}")
+    if not sys.stdin.isatty():
+        return "unchanged"
 
-    cfg = {
-        "admin_pubkey_hex": admin_pubkey,
-        "port": DEFAULT_PORT,
-        "bind": DEFAULT_BIND,
-    }
-    os.makedirs(INSTALL_DIR, exist_ok=True)
+    cfg["contact_appeal"] = prompt_contact_appeal()
     tmp_path = CONFIG_JSON_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp_path, CONFIG_JSON_PATH)
-    print(f"config.json written with admin {npub_encode(admin_pubkey)}")
-    return "created"
+    return "contact_appeal added"
 
 
 # --------------------------------------------------------------------------

@@ -23,6 +23,7 @@ li { overflow-wrap: anywhere; }
   </form>
 </div>
 <p>These npubs are banned from this relay.</p>
+<p id="appeal-line" style="display:none"></p>
 <button id="unban-btn" type="button" style="display:none">Unban selected</button>
 <ul id="ban-list"></ul>
 <script>
@@ -38,6 +39,7 @@ var nameSpans = {}; // pubkey -> array of span elements to fill
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
 var adminControls = document.getElementById('admin-controls');
+var appealEl = document.getElementById('appeal-line');
 var unbanBtn = document.getElementById('unban-btn');
 var banForm = document.getElementById('ban-form');
 var banInput = document.getElementById('ban-input');
@@ -254,11 +256,23 @@ function queryRelay(url, pubkeys, done) {
   });
 }
 
+function renderAppeal(contactAppeal) {
+  var trimmed = (contactAppeal || '').trim();
+  if (!trimmed) {
+    appealEl.textContent = '';
+    appealEl.style.display = 'none';
+    return;
+  }
+  appealEl.textContent = 'To appeal, contact: ' + trimmed;
+  appealEl.style.display = '';
+}
+
 function loadBans() {
   return fetch('/api/banned')
     .then(function (res) { return res.json(); })
     .then(function (data) {
       adminPubkey = data.admin;
+      renderAppeal(data.contact_appeal);
       renderBans(data.banned);
     })
     .catch(function () {

@@ -50,6 +50,8 @@ Only the `docker cp` and `docker exec` steps matter — get the file(s) onto the
 
 On first run the updater needs your admin pubkey — the one and only key allowed to ban (via a NIP-56 report, kind `1984`, or manually from the admin page) or unban (via NIP-98). It tries to read `relay.info.pubkey` from your `strfry.conf` first and, if found, asks you to confirm before using it; otherwise it prompts you to paste an `npub` or 64-char hex pubkey. It is never adopted silently. The result is stored as a public key only in `/config/strfry86/config.json` — your `nsec` never leaves your extension, and never touches this server.
 
+Right after the admin pubkey, it also asks once for an optional `contact_appeal` — free text (email, npub, URL, whatever) shown publicly on the admin page, to everyone including logged-out visitors, so a banned user knows where to appeal. Blank is a valid answer. If this key is ever missing entirely from `config.json` (e.g. upgrading from an older install), a later update run asks for it once and adds it in — it's otherwise never re-asked. You can edit or blank it by hand in `config.json` at any time; the admin page picks up the change on its next load, no restart needed.
+
 ## Expose the admin page
 
 The admin page listens on port 8686 inside the container by default. Add a `ports:` line to your compose file to expose it:

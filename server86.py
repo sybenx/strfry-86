@@ -40,6 +40,11 @@ STRFRY_SCAN_TIMEOUT = 5
 
 _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 
+CONTACT_APPEAL_CHECK_INTERVAL = 1.0
+_contact_appeal_cache = ""
+_contact_appeal_mtime = None
+_contact_appeal_last_checked = 0.0
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -53,6 +58,33 @@ def load_config():
         "port": int(cfg.get("port", 8686)),
         "bind": cfg.get("bind", "0.0.0.0"),
     }
+
+
+def get_contact_appeal():
+    """Return the current contact_appeal string, re-reading config.json when
+    its mtime changes (checked at most once per second). Never raises —
+    a hand-edited or briefly-invalid config.json just keeps the last good
+    value."""
+    global _contact_appeal_cache, _contact_appeal_mtime, _contact_appeal_last_checked
+    now = time.monotonic()
+    if (now - _contact_appeal_last_checked) < CONTACT_APPEAL_CHECK_INTERVAL:
+        return _contact_appeal_cache
+    _contact_appeal_last_checked = now
+    try:
+        mtime = os.stat(CONFIG_PATH).st_mtime
+    except OSError:
+        return _contact_appeal_cache
+    if mtime == _contact_appeal_mtime:
+        return _contact_appeal_cache
+    _contact_appeal_mtime = mtime
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        value = cfg.get("contact_appeal")
+        _contact_appeal_cache = value if isinstance(value, str) else ""
+    except (OSError, ValueError):
+        pass
+    return _contact_appeal_cache
 
 
 def compute_event_id(pubkey, created_at, kind, tags, content):
@@ -242,7 +274,11 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 )
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
-            self._send_json(200, {"admin": cfg["admin_pubkey_hex"], "banned": banned})
+            self._send_json(200, {
+                "admin": cfg["admin_pubkey_hex"],
+                "contact_appeal": get_contact_appeal(),
+                "banned": banned,
+            })
             return
 
         self._send_json(404, {"error": "not found"})
