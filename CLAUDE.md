@@ -135,8 +135,8 @@ Content and behavior — page order is fixed, top to bottom, with ALL non-list U
 1. `<h1>strfry-86</h1>`
 2. "Login with extension" button (plus its status text: "this key is not the admin" / "a NIP-07 extension is required")
 3. Manual ban form (admin only, hidden until login)
-4. "Unban selected" button (admin only, hidden until login) — yes, ABOVE the list it operates on; the admin scrolls down, ticks boxes, scrolls back up
-5. Plain text: "These npubs are banned from this relay." — visible to everyone
+4. Plain text: "These npubs are banned from this relay." — visible to everyone
+5. "Unban selected" button (admin only, hidden until login) — directly above the list it operates on; the admin scrolls down, ticks boxes, scrolls back up to this button rather than to the top of the page
 6. The ban list
 
 Behavior:

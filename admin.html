@@ -21,9 +21,9 @@ li { overflow-wrap: anywhere; }
     <div><input id="ban-reason" type="text" placeholder="reason (optional)"></div>
     <button type="submit">Ban</button>
   </form>
-  <button id="unban-btn" type="button">Unban selected</button>
 </div>
 <p>These npubs are banned from this relay.</p>
+<button id="unban-btn" type="button" style="display:none">Unban selected</button>
 <ul id="ban-list"></ul>
 <script>
 var NAME_CACHE_KEY = 'strfry86_name_cache';
@@ -281,6 +281,7 @@ loginBtn.addEventListener('click', function () {
       isAdmin = true;
       setStatus('logged in as admin');
       adminControls.style.display = '';
+      unbanBtn.style.display = '';
       renderBans(lastBanned);
     })
     .catch(function () {
