@@ -281,6 +281,10 @@ function loadBans() {
 }
 
 loginBtn.addEventListener('click', function () {
+  if (isAdmin) {
+    window.location.reload();
+    return;
+  }
   if (!window.nostr) {
     setStatus('a NIP-07 extension is required');
     return;
@@ -294,6 +298,7 @@ loginBtn.addEventListener('click', function () {
       loggedInPubkey = pk;
       isAdmin = true;
       setStatus('logged in as admin');
+      loginBtn.textContent = 'Logout';
       adminControls.style.display = '';
       unbanBtn.style.display = '';
       renderBans(lastBanned);
