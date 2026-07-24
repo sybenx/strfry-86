@@ -536,6 +536,7 @@ class Handler(BaseHTTPRequestHandler):
                         "banned_at": info.get("banned_at"),
                         "reason": info.get("reason", ""),
                         "report_type": info.get("report_type"),
+                        "report_event_id": info.get("report_event_id"),
                         "name": profile.get("name"),
                         "nip05": profile.get("nip05"),
                     }

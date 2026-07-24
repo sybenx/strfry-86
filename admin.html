@@ -32,12 +32,15 @@ li { overflow-wrap: anywhere; }
 <p id="appeal-line" style="display:none"></p>
 <p><input id="filter-input" type="search" placeholder="filter bans"></p>
 <label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select all</label>
-<button id="unban-btn" type="button" style="display:none">Unban selected</button>
+<button id="unban-btn" type="button" style="display:none">Unban selected</button> <b id="selected-count"></b>
 <ul id="ban-list"></ul>
 <script>
 var NAME_CACHE_KEY = 'strfry86_name_cache';
 var NAME_TTL_MS = 24 * 60 * 60 * 1000;
-var UNDO_TTL_MS = 5 * 60 * 1000;
+var RECORDS_KEY = 'strfry86_records';
+var DISMISSED_REPORTS_KEY = 'strfry86_dismissed_reports';
+var MAX_RECORDS = 200;
+var MAX_DISMISSED = 1000;
 
 var adminPubkey = null;
 var loggedInPubkey = null;
@@ -62,6 +65,7 @@ var filterInput = document.getElementById('filter-input');
 var selectAllLabel = document.getElementById('select-all-label');
 var selectAll = document.getElementById('select-all');
 var undoList = document.getElementById('undo-list');
+var selectedCount = document.getElementById('selected-count');
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -159,7 +163,14 @@ function renderBans(banned) {
   }
 
   applyFilter();
+  updateSelectedCount();
+  renderRecords();
   resolveFallbackNames(banned);
+}
+
+function updateSelectedCount() {
+  var n = listEl.querySelectorAll('.ban-checkbox:checked').length;
+  selectedCount.textContent = n > 0 ? n + ' selected' : '';
 }
 
 function applyFilter() {
@@ -469,62 +480,184 @@ selectAll.addEventListener('change', function () {
     }
     checkboxes[i].checked = selectAll.checked;
   }
+  updateSelectedCount();
 });
 
-function addUndoLine(pubkey) {
-  var ban = null;
+listEl.addEventListener('change', updateSelectedCount);
+
+// --- record lines -----------------------------------------------------------
+// Persistent admin action log: manual bans, unbans, and report-driven bans
+// each get a line with Undo and a ↩ dismiss. Ban/unban records live in
+// localStorage until dismissed; report records are derived from the ban list
+// (any entry carrying a report_event_id) minus a dismissed-id list.
+
+function findBan(pubkey) {
   for (var i = 0; i < lastBanned.length; i++) {
     if (lastBanned[i].pubkey === pubkey) {
-      ban = lastBanned[i];
-      break;
+      return lastBanned[i];
     }
   }
+  return null;
+}
 
+function loadStored(key) {
+  try {
+    var val = JSON.parse(localStorage.getItem(key));
+    return Array.isArray(val) ? val : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveStored(key, arr, max) {
+  try {
+    localStorage.setItem(key, JSON.stringify(arr.slice(-max)));
+  } catch (e) {
+    // ignore quota/availability errors — records degrade to session-local
+  }
+}
+
+function addRecord(record) {
+  record.id = Date.now() + '-' + Math.random().toString(36).slice(2);
+  var records = loadStored(RECORDS_KEY);
+  records.push(record);
+  saveStored(RECORDS_KEY, records, MAX_RECORDS);
+  renderRecords();
+}
+
+function removeRecord(id) {
+  var records = loadStored(RECORDS_KEY).filter(function (r) { return r.id !== id; });
+  saveStored(RECORDS_KEY, records, MAX_RECORDS);
+  renderRecords();
+}
+
+function dismissReport(id) {
+  var ids = loadStored(DISMISSED_REPORTS_KEY);
+  if (ids.indexOf(id) === -1) {
+    ids.push(id);
+  }
+  saveStored(DISMISSED_REPORTS_KEY, ids, MAX_DISMISSED);
+  renderRecords();
+}
+
+function buildRecordLine(labelText, onUndo, onDismiss) {
   var line = document.createElement('p');
   var label = document.createElement('span');
-  label.textContent = 'banned ' + (ban && ban.name ? ban.name + ' ' : '') + (ban ? ban.npub : pubkey) + ' ';
+  label.textContent = labelText + ' ';
   line.appendChild(label);
 
   var undoBtn = document.createElement('button');
   undoBtn.type = 'button';
   undoBtn.textContent = 'Undo';
+  undoBtn.addEventListener('click', function () { onUndo(undoBtn); });
   line.appendChild(undoBtn);
   line.appendChild(document.createTextNode(' '));
 
   var dismissBtn = document.createElement('button');
   dismissBtn.type = 'button';
-  dismissBtn.textContent = '×';
+  dismissBtn.textContent = '↩';
+  dismissBtn.addEventListener('click', onDismiss);
   line.appendChild(dismissBtn);
 
-  var timer = setTimeout(remove, UNDO_TTL_MS);
-  function remove() {
-    clearTimeout(timer);
-    if (line.parentNode) {
-      line.parentNode.removeChild(line);
-    }
+  return line;
+}
+
+function recordLabel(record) {
+  var verb = record.type === 'ban' ? 'banned' : 'unbanned';
+  if (record.entries.length === 1) {
+    var e = record.entries[0];
+    return verb + ' ' + (e.name ? e.name + ' ' : '') + (e.npub || e.pubkey);
+  }
+  return verb + ' ' + record.entries.length + ' pubkeys';
+}
+
+function undoRecord(record, btn) {
+  btn.disabled = true;
+  var req;
+  if (record.type === 'ban') {
+    req = signAndPost('/api/unban', {
+      pubkeys: record.entries.map(function (e) { return e.pubkey; })
+    });
+  } else {
+    req = signAndPost('/api/ban', {
+      entries: record.entries.map(function (e) {
+        return { pubkey: e.pubkey, reason: e.reason || '' };
+      })
+    });
+  }
+  req
+    .then(function (result) {
+      if (!result.ok) {
+        btn.disabled = false;
+        setStatus('undo failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
+        return;
+      }
+      removeRecord(record.id);
+      setStatus((record.type === 'ban' ? 'unbanned ' : 're-banned ') + record.entries.length + ' pubkey(s)');
+      return loadBans();
+    })
+    .catch(function () {
+      btn.disabled = false;
+      setStatus('undo failed');
+    });
+}
+
+function undoReportBan(pubkey, btn) {
+  btn.disabled = true;
+  signAndPost('/api/unban', { pubkeys: [pubkey] })
+    .then(function (result) {
+      if (!result.ok) {
+        btn.disabled = false;
+        setStatus('undo failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
+        return;
+      }
+      setStatus('unbanned 1 pubkey');
+      return loadBans();
+    })
+    .catch(function () {
+      btn.disabled = false;
+      setStatus('undo failed');
+    });
+}
+
+function renderRecords() {
+  undoList.textContent = '';
+  if (!isAdmin) {
+    return;
   }
 
-  dismissBtn.addEventListener('click', remove);
-  undoBtn.addEventListener('click', function () {
-    undoBtn.disabled = true;
-    signAndPost('/api/unban', { pubkeys: [pubkey] })
-      .then(function (result) {
-        if (!result.ok) {
-          undoBtn.disabled = false;
-          setStatus('undo failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
-          return;
-        }
-        remove();
-        setStatus('unbanned 1 pubkey');
-        return loadBans();
-      })
-      .catch(function () {
-        undoBtn.disabled = false;
-        setStatus('undo failed');
-      });
+  var records = loadStored(RECORDS_KEY);
+  records.forEach(function (record) {
+    if (!record || !Array.isArray(record.entries) || record.entries.length === 0) {
+      return;
+    }
+    var line = buildRecordLine(
+      recordLabel(record),
+      function (btn) { undoRecord(record, btn); },
+      function () { removeRecord(record.id); }
+    );
+    undoList.appendChild(line);
   });
 
-  undoList.appendChild(line);
+  var dismissed = loadStored(DISMISSED_REPORTS_KEY);
+  for (var i = 0; i < lastBanned.length; i++) {
+    var ban = lastBanned[i];
+    if (!ban.report_event_id) {
+      continue;
+    }
+    var id = ban.report_event_id + ':' + ban.pubkey;
+    if (dismissed.indexOf(id) !== -1) {
+      continue;
+    }
+    var labelText = 'reported ' + (ban.name ? ban.name + ' ' : '') + ban.npub
+      + (ban.report_type ? ' — ' + ban.report_type : '');
+    var line = buildRecordLine(
+      labelText,
+      (function (pk) { return function (btn) { undoReportBan(pk, btn); }; })(ban.pubkey),
+      (function (rid) { return function () { dismissReport(rid); }; })(id)
+    );
+    undoList.appendChild(line);
+  }
 }
 
 unbanBtn.addEventListener('click', function () {
@@ -541,13 +674,35 @@ unbanBtn.addEventListener('click', function () {
     return;
   }
 
+  // Capture entries now — after loadBans they are gone from lastBanned.
+  var entriesByPk = {};
+  for (var i = 0; i < selected.length; i++) {
+    var ban = findBan(selected[i]);
+    entriesByPk[selected[i]] = {
+      pubkey: selected[i],
+      npub: ban ? ban.npub : null,
+      name: ban ? ban.name : null,
+      reason: ban ? ban.reason : ''
+    };
+  }
+
   signAndPost('/api/unban', { pubkeys: selected })
     .then(function (result) {
       if (!result.ok) {
         setStatus('unban failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
         return;
       }
-      setStatus('unbanned ' + result.body.removed.length + ' pubkey(s)');
+      var removed = result.body.removed;
+      setStatus('unbanned ' + removed.length + ' pubkey(s)');
+      if (removed.length > 0) {
+        addRecord({
+          type: 'unban',
+          at: Date.now(),
+          entries: removed.map(function (pk) {
+            return entriesByPk[pk] || { pubkey: pk, npub: null, name: null, reason: '' };
+          })
+        });
+      }
       return loadBans();
     })
     .catch(function () {
@@ -581,9 +736,20 @@ banForm.addEventListener('submit', function (evt) {
       banInput.value = '';
       banReason.value = '';
       return loadBans().then(function () {
-        // After loadBans so lastBanned has each ban's npub/name for the line.
+        // After loadBans so lastBanned has each ban's npub/name for the record.
         for (var i = 0; i < result.body.added.length; i++) {
-          addUndoLine(result.body.added[i]);
+          var pk = result.body.added[i];
+          var ban = findBan(pk);
+          addRecord({
+            type: 'ban',
+            at: Date.now(),
+            entries: [{
+              pubkey: pk,
+              npub: ban ? ban.npub : null,
+              name: ban ? ban.name : null,
+              reason: reason
+            }]
+          });
         }
       });
     })

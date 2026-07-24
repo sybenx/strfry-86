@@ -79,7 +79,9 @@ strfry delete --filter '{"authors":["<hex-pubkey>"]}'
 
 ## Unbanning
 
-Open the admin page, click "Login with extension" (NIP-07), check the pubkeys you want to unban, click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies.
+Open the admin page, click "Login with extension" (NIP-07), check the pubkeys you want to unban (a live "n selected" count sits next to the button), click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies.
+
+Every admin action leaves a record line below the ban form — manual bans, unbans, and bans triggered by your kind-1984 reports — each with an "Undo" button and a "↩" dismiss button. Records persist in your browser (localStorage) across reloads until you dismiss them or undo the action; they are display-only and nothing about them is stored on the server.
 
 ## Manual bans
 
