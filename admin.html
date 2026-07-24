@@ -14,19 +14,11 @@ li { overflow-wrap: anywhere; }
 <h1>strfry-86</h1>
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
-
-<div id="notices-section" style="display:none">
-  <h2>Notices</h2>
-  <p id="notices-warning" style="display:none"></p>
-  <p id="notices-empty" style="display:none">No notices.</p>
-  <div id="notices-list"></div>
-</div>
-
 <div id="activity-section" style="display:none">
   <h2>Activity</h2>
+  <p id="activity-warning"></p>
   <div id="activity-list"></div>
 </div>
-
 <div id="admin-controls" style="display:none">
   <h2>Ban a pubkey</h2>
   <form id="ban-form">
@@ -35,7 +27,6 @@ li { overflow-wrap: anywhere; }
     <button type="submit">Ban</button>
   </form>
 </div>
-
 <p>These npubs are banned from this relay.</p>
 <p id="appeal-line" style="display:none"></p>
 <button id="unban-btn" type="button" style="display:none">Unban selected</button>
@@ -52,11 +43,8 @@ var nameSpans = {}; // pubkey -> array of span elements to fill
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
-var noticesSection = document.getElementById('notices-section');
-var noticesWarning = document.getElementById('notices-warning');
-var noticesEmpty = document.getElementById('notices-empty');
-var noticesList = document.getElementById('notices-list');
 var activitySection = document.getElementById('activity-section');
+var activityWarning = document.getElementById('activity-warning');
 var activityList = document.getElementById('activity-list');
 var adminControls = document.getElementById('admin-controls');
 var appealEl = document.getElementById('appeal-line');
@@ -69,95 +57,6 @@ var listEl = document.getElementById('ban-list');
 function setStatus(text) {
   statusEl.textContent = text;
 }
-
-// --- minimal inline bech32 (BIP-173), npub-encode only -----------------
-// /api/audit deals in hex pubkeys only; the ban list already gets npubs
-// from the server, but audit notices need to be encoded client-side.
-
-var BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
-
-function bech32Polymod(values) {
-  var GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
-  var chk = 1;
-  for (var p = 0; p < values.length; p++) {
-    var top = chk >>> 25;
-    chk = (((chk & 0x1ffffff) << 5) ^ values[p]) >>> 0;
-    for (var i = 0; i < 5; i++) {
-      if ((top >>> i) & 1) {
-        chk = (chk ^ GEN[i]) >>> 0;
-      }
-    }
-  }
-  return chk >>> 0;
-}
-
-function bech32HrpExpand(hrp) {
-  var ret = [];
-  for (var i = 0; i < hrp.length; i++) { ret.push(hrp.charCodeAt(i) >> 5); }
-  ret.push(0);
-  for (var i = 0; i < hrp.length; i++) { ret.push(hrp.charCodeAt(i) & 31); }
-  return ret;
-}
-
-function bech32CreateChecksum(hrp, data) {
-  var values = bech32HrpExpand(hrp).concat(data).concat([0, 0, 0, 0, 0, 0]);
-  var polymod = bech32Polymod(values) ^ 1;
-  var ret = [];
-  for (var i = 0; i < 6; i++) {
-    ret.push((polymod >>> (5 * (5 - i))) & 31);
-  }
-  return ret;
-}
-
-function bech32Encode(hrp, data) {
-  var combined = data.concat(bech32CreateChecksum(hrp, data));
-  var out = hrp + '1';
-  for (var i = 0; i < combined.length; i++) {
-    out += BECH32_CHARSET.charAt(combined[i]);
-  }
-  return out;
-}
-
-function convertBits8to5(bytes) {
-  var acc = 0, bits = 0, ret = [];
-  var maxv = 31;
-  for (var i = 0; i < bytes.length; i++) {
-    acc = ((acc << 8) | bytes[i]) >>> 0;
-    bits += 8;
-    while (bits >= 5) {
-      bits -= 5;
-      ret.push((acc >>> bits) & maxv);
-    }
-  }
-  if (bits > 0) {
-    ret.push((acc << (5 - bits)) & maxv);
-  }
-  return ret;
-}
-
-function hexToNpub(hex) {
-  var bytes = [];
-  for (var i = 0; i < hex.length; i += 2) {
-    bytes.push(parseInt(hex.substr(i, 2), 16));
-  }
-  return bech32Encode('npub', convertBits8to5(bytes));
-}
-
-function njumpLink(hex) {
-  var npub;
-  try {
-    npub = hexToNpub(hex);
-  } catch (e) {
-    npub = hex;
-  }
-  var link = document.createElement('a');
-  link.href = 'https://njump.me/' + npub;
-  link.target = '_blank';
-  link.textContent = npub;
-  return link;
-}
-
-// --- ban list ------------------------------------------------------------
 
 function loadNameCache() {
   try {
@@ -389,123 +288,13 @@ function loadBans() {
     });
 }
 
-// --- audit: notices --------------------------------------------------------
+// --- activity sparklines ----------------------------------------------------
+// Renders whatever the server sent; computes nothing itself.
 
-function renderNotices(auditData) {
-  if (auditData.warning) {
-    noticesWarning.textContent = auditData.warning;
-    noticesWarning.style.display = '';
-  } else {
-    noticesWarning.textContent = '';
-    noticesWarning.style.display = 'none';
-  }
-
-  noticesList.textContent = '';
-  var notices = auditData.notices || [];
-  if (notices.length === 0) {
-    noticesEmpty.style.display = '';
-  } else {
-    noticesEmpty.style.display = 'none';
-    for (var i = 0; i < notices.length; i++) {
-      noticesList.appendChild(buildNoticeDetails(notices[i]));
-    }
-  }
-}
-
-function buildNoticeDetails(notice) {
-  var details = document.createElement('details');
-  var summary = document.createElement('summary');
-  summary.textContent = notice.text;
-  details.appendChild(summary);
-
-  if (notice.type === 'purge_pending') {
-    details.appendChild(buildPurgePendingBody(notice));
-  } else {
-    details.appendChild(buildActionableBody(notice));
-  }
-  return details;
-}
-
-function buildPurgePendingBody(notice) {
-  var frag = document.createDocumentFragment();
-  var ul = document.createElement('ul');
-  var pubkeys = notice.pubkeys || [];
-  for (var i = 0; i < pubkeys.length; i++) {
-    var li = document.createElement('li');
-    li.appendChild(njumpLink(pubkeys[i]));
-    ul.appendChild(li);
-  }
-  frag.appendChild(ul);
-
-  var cmd = 'strfry delete --filter \'' + JSON.stringify({ authors: pubkeys }) + '\'';
-  var p = document.createElement('p');
-  var code = document.createElement('code');
-  code.textContent = cmd;
-  p.appendChild(code);
-  frag.appendChild(p);
-  return frag;
-}
-
-function buildActionableBody(notice) {
-  var frag = document.createDocumentFragment();
-  var banBtn = document.createElement('button');
-  banBtn.type = 'button';
-  banBtn.textContent = 'Ban selected';
-  frag.appendChild(banBtn);
-
-  var ul = document.createElement('ul');
-  var pubkeys = notice.pubkeys || [];
-  for (var i = 0; i < pubkeys.length; i++) {
-    var pk = pubkeys[i];
-    var li = document.createElement('li');
-    var checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = true;
-    checkbox.value = pk;
-    li.appendChild(checkbox);
-    li.appendChild(document.createTextNode(' '));
-    li.appendChild(njumpLink(pk));
-    ul.appendChild(li);
-  }
-  frag.appendChild(ul);
-
-  banBtn.addEventListener('click', function () {
-    if (!isAdmin) {
-      return;
-    }
-    var checked = ul.querySelectorAll('input[type=checkbox]:checked');
-    var selected = [];
-    for (var j = 0; j < checked.length; j++) {
-      selected.push(checked[j].value);
-    }
-    if (selected.length === 0) {
-      setStatus('nothing selected');
-      return;
-    }
-    var entries = selected.map(function (pk) {
-      return { pubkey: pk, reason: notice.suggested_reason || '', report_type: 'audit' };
-    });
-    signAndPost('/api/ban', { entries: entries })
-      .then(function (result) {
-        if (!result.ok) {
-          setStatus('ban failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
-          return;
-        }
-        setStatus('banned ' + result.body.added.length + ' pubkey(s)');
-        return Promise.all([loadBans(), loadAudit()]);
-      })
-      .catch(function () {
-        setStatus('ban failed');
-      });
-  });
-
-  return frag;
-}
-
-// --- audit: activity sparklines --------------------------------------------
-
-function renderActivity(activity) {
+function renderActivity(data) {
+  activityWarning.textContent = data.warning ? data.warning : '';
   activityList.textContent = '';
+  var activity = data.activity || [];
   for (var i = 0; i < activity.length; i++) {
     var entry = activity[i];
     var p = document.createElement('p');
@@ -553,19 +342,16 @@ function buildSparkline(days, total) {
   return svg;
 }
 
-function loadAudit() {
-  return fetch('/api/audit')
+function loadActivity() {
+  return fetch('/api/activity')
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      renderNotices(data);
-      renderActivity(data.activity || []);
+      renderActivity(data);
     })
     .catch(function () {
-      setStatus('failed to load audit');
+      setStatus('failed to load activity');
     });
 }
-
-// --- login / actions --------------------------------------------------------
 
 loginBtn.addEventListener('click', function () {
   if (isAdmin) {
@@ -586,12 +372,11 @@ loginBtn.addEventListener('click', function () {
       isAdmin = true;
       setStatus('logged in as admin');
       loginBtn.textContent = 'Logout';
-      noticesSection.style.display = '';
       activitySection.style.display = '';
       adminControls.style.display = '';
       unbanBtn.style.display = '';
       renderBans(lastBanned);
-      loadAudit();
+      loadActivity();
     })
     .catch(function () {
       setStatus('a NIP-07 extension is required');

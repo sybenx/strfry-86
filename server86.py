@@ -6,18 +6,17 @@ configured port is already taken, this process exits 0 silently, so repeated
 spawns from the plugin are harmless.
 
 Routes:
-  GET  /            -> admin.html
-  GET  /api/banned  -> public read of the ban list
-  POST /api/unban   -> NIP-98 authenticated unban
-  POST /api/ban     -> NIP-98 authenticated manual ban
-  GET  /api/audit   -> public read of the audit report (notices + activity)
+  GET  /              -> admin.html
+  GET  /api/banned    -> public read of the ban list
+  GET  /api/activity  -> public read of per-kind activity sparkline data
+  POST /api/unban     -> NIP-98 authenticated unban
+  POST /api/ban       -> NIP-98 authenticated manual ban
 """
 
 import errno
 import hashlib
 import json
 import os
-import selectors
 import shutil
 import subprocess
 import sys
@@ -30,7 +29,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from lib86 import audit, bech32, bip340, blacklist  # noqa: E402
+from lib86 import bech32, bip340, blacklist  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ADMIN_HTML_PATH = os.path.join(SCRIPT_DIR, "admin.html")
@@ -43,12 +42,19 @@ NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
 NAME_CACHE_TTL = 24 * 3600
 STRFRY_SCAN_TIMEOUT = 5
-# Hard safety net enforced by run_strfry_scan on every call (name lookup and
-# audit alike): kills the subprocess if stdout exceeds this regardless of
-# what filter produced it, so a future filter change that drops a `limit`
-# or authors bound can't reintroduce unbounded streaming.
-STRFRY_SCAN_MAX_STDOUT_BYTES = 16 * 1024 * 1024
-STRFRY_SCAN_READ_CHUNK = 65536
+
+ACTIVITY_WINDOW_DAYS = 28
+ACTIVITY_CACHE_TTL = 10 * 60
+ACTIVITY_MAX_KINDS = 12
+# Kind discovery samples this many events; the sample is the ONLY scan that
+# streams event bodies, and the limit bounds it. Every count below it is
+# `strfry scan --count`, which streams nothing.
+ACTIVITY_DISCOVERY_LIMIT = 500
+ACTIVITY_COUNT_TIMEOUT = 10
+ACTIVITY_SYNC_TIMEOUT = 5
+# Overall wall-clock budget for one recompute, checked between scans, so a
+# degraded strfry can't wedge the single-flight recompute for hours.
+ACTIVITY_COMPUTE_DEADLINE = 120
 
 _name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
 
@@ -58,52 +64,18 @@ _strfry_bin_checked = False
 _relay_cwd_pid = None
 _relay_cwd_path = None
 
-CONFIG_CHECK_INTERVAL = 1.0
-_dynamic_config_cache = {"contact_appeal": "", "relay_url": ""}
-_dynamic_config_mtime = None
-_dynamic_config_last_checked = 0.0
+_activity_lock = threading.Lock()
+_activity_cache = None
+_activity_computing = False
 
-AUDIT_CACHE_TTL = 10 * 60
-AUDIT_SYNC_TIMEOUT = 5
-AUDIT_SYNC_SCAN_TIMEOUT = 5
-AUDIT_BG_SCAN_TIMEOUT = 60
-ACTIVITY_WINDOW_DAYS = 28
-
-_audit_lock = threading.Lock()
-_audit_cache = None  # None until first successful/attempted compute
-_audit_computing = False
-
-SERVER_LOG_PATH = os.path.join(SCRIPT_DIR, "server86.log")
-SERVER_LOG_MAX_BYTES = 64 * 1024
-SERVER_LOG_TRIM_BYTES = 32 * 1024
+CONTACT_APPEAL_CHECK_INTERVAL = 1.0
+_contact_appeal_cache = ""
+_contact_appeal_mtime = None
+_contact_appeal_last_checked = 0.0
 
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
-    try:
-        with open(SERVER_LOG_PATH, "a") as f:
-            f.write(f"{int(time.time())} {msg}\n")
-        _trim_server_log()
-    except Exception:
-        pass
-
-
-def _trim_server_log():
-    try:
-        if os.path.getsize(SERVER_LOG_PATH) <= SERVER_LOG_MAX_BYTES:
-            return
-        with open(SERVER_LOG_PATH, "rb") as f:
-            data = f.read()
-        trimmed = data[-SERVER_LOG_TRIM_BYTES:]
-        nl = trimmed.find(b"\n")
-        if nl != -1:
-            trimmed = trimmed[nl + 1:]
-        tmp_path = SERVER_LOG_PATH + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(trimmed)
-        os.replace(tmp_path, SERVER_LOG_PATH)
-    except Exception:
-        pass
 
 
 def load_config():
@@ -116,35 +88,31 @@ def load_config():
     }
 
 
-def get_dynamic_config():
-    """Return {"contact_appeal", "relay_url"}, re-reading config.json when
+def get_contact_appeal():
+    """Return the current contact_appeal string, re-reading config.json when
     its mtime changes (checked at most once per second). Never raises —
     a hand-edited or briefly-invalid config.json just keeps the last good
-    values."""
-    global _dynamic_config_cache, _dynamic_config_mtime, _dynamic_config_last_checked
+    value."""
+    global _contact_appeal_cache, _contact_appeal_mtime, _contact_appeal_last_checked
     now = time.monotonic()
-    if (now - _dynamic_config_last_checked) < CONFIG_CHECK_INTERVAL:
-        return _dynamic_config_cache
-    _dynamic_config_last_checked = now
+    if (now - _contact_appeal_last_checked) < CONTACT_APPEAL_CHECK_INTERVAL:
+        return _contact_appeal_cache
+    _contact_appeal_last_checked = now
     try:
         mtime = os.stat(CONFIG_PATH).st_mtime
     except OSError:
-        return _dynamic_config_cache
-    if mtime == _dynamic_config_mtime:
-        return _dynamic_config_cache
-    _dynamic_config_mtime = mtime
+        return _contact_appeal_cache
+    if mtime == _contact_appeal_mtime:
+        return _contact_appeal_cache
+    _contact_appeal_mtime = mtime
     try:
         with open(CONFIG_PATH, "r") as f:
             cfg = json.load(f)
-        contact_appeal = cfg.get("contact_appeal")
-        relay_url = cfg.get("relay_url")
-        _dynamic_config_cache = {
-            "contact_appeal": contact_appeal if isinstance(contact_appeal, str) else "",
-            "relay_url": relay_url if isinstance(relay_url, str) else "",
-        }
+        value = cfg.get("contact_appeal")
+        _contact_appeal_cache = value if isinstance(value, str) else ""
     except (OSError, ValueError):
         pass
-    return _dynamic_config_cache
+    return _contact_appeal_cache
 
 
 def compute_event_id(pubkey, created_at, kind, tags, content):
@@ -172,7 +140,7 @@ def get_tag(tags, name):
 
 def get_strfry_bin():
     """Discover the strfry binary path once per process lifetime and cache
-    it for every subsequent scan (name lookup and audit alike): prefer
+    it for every subsequent scan (name lookup and activity alike): prefer
     PATH via shutil.which, else the first existing+executable fallback
     candidate. Returns None if nothing is found."""
     global _strfry_bin_path, _strfry_bin_checked
@@ -260,6 +228,50 @@ def stderr_tail(stderr_bytes):
     return text[-STDERR_TAIL_CHARS:]
 
 
+def _run_strfry(filter_obj, timeout, count=False):
+    """Run `strfry scan [--count] <filter>` and return raw stdout bytes.
+
+    The filter is passed as exactly ONE argv element of compact JSON with
+    shell=False — never a single command string, never .split(), never
+    quoted or backslash-escaped (escaped quotes reach strfry verbatim and it
+    exits 1). Raises on any failure (missing binary, timeout, non-zero exit)
+    so callers can report the cause instead of silently returning nothing."""
+    strfry_bin = require_strfry_bin()
+    filter_json = json.dumps(filter_obj, separators=(",", ":"))
+    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan"]
+    if count:
+        argv.append("--count")
+    argv.append(filter_json)
+    result = subprocess.run(argv, cwd=get_relay_cwd(), capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f"strfry scan exited {result.returncode}: {stderr_tail(result.stderr)}")
+    return result.stdout
+
+
+def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
+    """Run `strfry scan <filter>` and return a list of parsed event dicts."""
+    events = []
+    for line in _run_strfry(filter_obj, timeout).decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def run_strfry_count(filter_obj, timeout=ACTIVITY_COUNT_TIMEOUT):
+    """Run `strfry scan --count <filter>` and return the match count. Streams
+    no event data — the output is a single number read from the index."""
+    out = _run_strfry(filter_obj, timeout, count=True).decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError("strfry scan --count produced no output")
+    return int(lines[-1])
+
+
 def resolve_names(pubkeys):
     """Return {pubkey: name_or_None} for the given pubkeys, querying the local
     strfry database for uncached (or stale-miss) pubkeys in one batched scan."""
@@ -273,7 +285,7 @@ def resolve_names(pubkeys):
 
     if to_query:
         try:
-            events = run_strfry_scan({"kinds": [0], "authors": to_query}, timeout=STRFRY_SCAN_TIMEOUT)
+            events = run_strfry_scan({"kinds": [0], "authors": to_query})
             found = set()
             for ev in events:
                 try:
@@ -297,318 +309,108 @@ def resolve_names(pubkeys):
     return {pk: _name_cache[pk][0] for pk in pubkeys}
 
 
-class StdoutCapExceeded(RuntimeError):
-    def __init__(self, max_bytes):
-        super().__init__(f"stdout exceeded {max_bytes} byte cap")
+def empty_activity_skeleton(warning):
+    return {"generated_at": int(time.time()), "warning": warning, "activity": []}
 
 
-def _run_capped(argv, cwd, timeout, max_stdout_bytes):
-    """Run argv to completion, killing it early if stdout exceeds
-    max_stdout_bytes or timeout elapses. Reads via os.read() on the raw pipe
-    fds (not the buffered file objects' .read(), which loops trying to fill
-    the requested size and can block on a pipe) so the byte cap is checked
-    incrementally instead of after an unbounded buffer is already collected.
-    Returns (stdout_bytes, stderr_bytes, returncode). Raises
-    subprocess.TimeoutExpired or StdoutCapExceeded if either limit trips."""
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    sel = selectors.DefaultSelector()
-    sel.register(proc.stdout, selectors.EVENT_READ, "out")
-    sel.register(proc.stderr, selectors.EVENT_READ, "err")
-    out_chunks, err_chunks = [], []
-    out_len = 0
-    open_fds = 2
-    deadline = time.monotonic() + timeout
-    try:
-        while open_fds > 0:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                proc.wait()
-                raise subprocess.TimeoutExpired(argv, timeout)
-            for key, _ in sel.select(timeout=remaining):
-                data = os.read(key.fileobj.fileno(), STRFRY_SCAN_READ_CHUNK)
-                if not data:
-                    sel.unregister(key.fileobj)
-                    open_fds -= 1
-                    continue
-                if key.data == "out":
-                    out_len += len(data)
-                    if out_len > max_stdout_bytes:
-                        proc.kill()
-                        proc.wait()
-                        raise StdoutCapExceeded(max_stdout_bytes)
-                    out_chunks.append(data)
-                else:
-                    err_chunks.append(data)
-        proc.wait(timeout=max(0, deadline - time.monotonic()))
-    finally:
-        sel.close()
-        proc.stdout.close()
-        proc.stderr.close()
-    return b"".join(out_chunks), b"".join(err_chunks), proc.returncode
+def compute_activity():
+    """Count-only activity computation: per-kind, per-UTC-day event counts
+    for the last ACTIVITY_WINDOW_DAYS days.
 
+    Kinds are discovered from one bounded sample scan (`limit` caps its
+    output; a kind absent from the sample gets no sparkline — acceptable,
+    since a kind carrying meaningful traffic appears in a 500-event sample).
+    Everything else is `--count` scans against the index, so no event body
+    is ever streamed regardless of relay size."""
+    deadline = time.monotonic() + ACTIVITY_COMPUTE_DEADLINE
 
-def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT, max_stdout_bytes=STRFRY_SCAN_MAX_STDOUT_BYTES):
-    """Run `strfry scan <filter>` and return a list of parsed event dicts.
-    `filter_obj` may be a single filter dict or a list of filter dicts (each
-    with its own `limit` — strfry applies limit per FILTER, not per author,
-    so bounding output per-author requires one filter per author). Raises on
-    any failure (bad binary, non-zero exit, timeout, stdout cap) so callers
-    can treat a broken scan environment as a single reportable failure
-    rather than silently returning an empty result set."""
-    strfry_bin = require_strfry_bin()
-    filter_json = json.dumps(filter_obj, separators=(",", ":"))
-    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json]
-    stdout_bytes, stderr_bytes, returncode = _run_capped(argv, get_relay_cwd(), timeout, max_stdout_bytes)
-    if returncode != 0:
-        raise RuntimeError(f"strfry scan exited {returncode}: {stderr_tail(stderr_bytes)}")
-    events = []
-    for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except ValueError:
-            continue
-    return events
+    def check_deadline():
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"activity recompute exceeded {ACTIVITY_COMPUTE_DEADLINE}s budget")
 
+    now = int(time.time())
+    today_start = (now // 86400) * 86400
+    window_start = today_start - (ACTIVITY_WINDOW_DAYS - 1) * 86400
+    window_end = today_start + 86400 - 1  # `until` is inclusive per NIP-01
 
-class AuditScanError(Exception):
-    """Wraps a scan failure with which numbered/named scan raised it, so the
-    /api/audit warning can name it instead of reporting a bare generic
-    string."""
-
-    def __init__(self, step, name, original, batch_info=""):
-        message = (
-            f"audit scan {step} ({name}){batch_info} failed: "
-            f"{type(original).__name__}: {original}"
-        )
-        super().__init__(message[:600])
-
-
-AUTHOR_CHUNK_SIZE = 1000
-AUTHOR_HARD_CAP = 10000
-# Ghost-relevant kinds (0, 3, 10002, 10050) are all strfry-enforced
-# replaceable — at most one stored event per kind per author, ever,
-# regardless of how many times it was republished (verified against the
-# real binary: importing 3 kind-0 events for one pubkey leaves exactly 1
-# stored). So an author's ENTIRE ghost-kind footprint is capped at
-# len(GHOST_ALLOWED_KINDS) events. Requesting one more than that per author
-# means: if fewer come back, that IS their whole stored history (exact, not
-# sampled); if the full limit comes back, at least one of those events must
-# be a non-ghost kind by pigeonhole (only that many replaceable slots
-# exist) — so ghost/non-ghost classification is exact either way, with
-# output capped per author instead of streaming their whole history.
-FOOTPRINT_PER_AUTHOR_LIMIT = len(audit.GHOST_ALLOWED_KINDS) + 1
-# purge_pending only needs existence (>=1 stored event), not a real count.
-PURGE_PENDING_PER_AUTHOR_LIMIT = 1
-
-
-def apply_author_cap(authors, name):
-    """Truncate authors to AUTHOR_HARD_CAP, returning (kept, dropped,
-    sampled_note). dropped is the set of authors excluded by truncation
-    (never scanned at all) — callers that would otherwise treat "no
-    footprint events" as a positive signal (ghosts) must fold this into
-    their unknown/excluded set exactly like a failed scan batch, or a huge
-    relay would silently ghost-flag every truncated, never-scanned author."""
-    total = len(authors)
-    if total > AUTHOR_HARD_CAP:
-        kept = authors[:AUTHOR_HARD_CAP]
-        dropped = set(authors[AUTHOR_HARD_CAP:])
-        return kept, dropped, f"audit sampled first {AUTHOR_HARD_CAP} of {total} authors ({name})"
-    return authors, set(), None
-
-
-def scan_by_authors_bounded(step, name, authors, per_author_limit, timeout):
-    """Run a per-author-bounded `strfry scan` in chunks of <=AUTHOR_CHUNK_SIZE.
-
-    Each chunk is submitted as a JSON ARRAY of one filter per author
-    (`[{"authors":[pk],"limit":N}, ...]`) rather than a single
-    `{"authors":[...]}` filter: strfry applies `limit` per FILTER, so a
-    single combined filter's limit would cap the whole batch's output, not
-    each author's — an author with a huge posting history could still
-    starve the rest of the batch's output budget (and, before this
-    per-author bound existed, streamed their entire history un-limited,
-    which is what caused production timeouts on real accounts with
-    thousands of stored events). One filter per author bounds EVERY
-    author's contribution independently, regardless of relay contents.
-    A single argv element with 1000 such filters is ~90KB, safely under
-    Linux's 128KiB MAX_ARG_STRLEN per argv element (the very limit that
-    made chunking necessary in the first place, at ~1900 authors in the old
-    authors-list format).
-
-    Returns (events, unknown_authors): events is the deduped concatenation
-    of every successful batch; unknown_authors is the set of authors whose
-    batch failed (timeout, non-zero exit, or the stdout byte cap) — logged
-    to server86.log per batch, but a batch failure degrades only that
-    batch's authors to "unknown" rather than aborting the whole scan.
-    """
-    if not authors:
-        return [], set()
-
-    batches = [
-        authors[i:i + AUTHOR_CHUNK_SIZE]
-        for i in range(0, len(authors), AUTHOR_CHUNK_SIZE)
-    ]
-
-    seen_ids = set()
-    events = []
-    unknown_authors = set()
-    for idx, batch in enumerate(batches, start=1):
-        batch_info = f" batch {idx}/{len(batches)}" if len(batches) > 1 else ""
-        filters = [{"authors": [pk], "limit": per_author_limit} for pk in batch]
-        try:
-            batch_events = run_strfry_scan(filters, timeout=timeout)
-        except Exception as e:
-            log(f"server86: audit scan {step} ({name}){batch_info} failed: "
-                f"{type(e).__name__}: {e}")
-            unknown_authors.update(batch)
-            continue
-        for ev in batch_events:
-            eid = ev.get("id") if isinstance(ev, dict) else None
-            if eid is None or eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-            events.append(ev)
-
-    return events, unknown_authors
-
-
-def empty_audit_skeleton(relay_url, warning):
-    return {
-        "generated_at": int(time.time()),
-        "relay_url": relay_url,
-        "warning": warning,
-        "notices": [],
-        "activity": [],
-    }
-
-
-def compute_audit_report(admin_pubkey_hex, scan_timeout):
-    dyn = get_dynamic_config()
-    relay_url = dyn["relay_url"]
-    banned = set(blacklist.load().keys())
-
-    def scan(step, name, filter_obj):
-        try:
-            return run_strfry_scan(filter_obj, timeout=scan_timeout)
-        except Exception as e:
-            raise AuditScanError(step, name, e) from e
-
-    relay_list_events = scan(1, "relay_lists", {"kinds": [10002, 10050]})
-
-    authors = sorted({
-        ev.get("pubkey") for ev in relay_list_events
-        if isinstance(ev, dict)
-        and isinstance(ev.get("pubkey"), str)
-        and ev.get("pubkey") != admin_pubkey_hex
-        and ev.get("pubkey") not in banned
+    sample = run_strfry_scan(
+        {"since": window_start, "until": window_end, "limit": ACTIVITY_DISCOVERY_LIMIT},
+        timeout=ACTIVITY_COUNT_TIMEOUT,
+    )
+    kinds = sorted({
+        ev.get("kind") for ev in sample
+        if isinstance(ev, dict) and isinstance(ev.get("kind"), int)
     })
-    authors, dropped_footprint_authors, footprint_sampled = apply_author_cap(authors, "footprint")
-    footprint_events, unknown_footprint_authors = scan_by_authors_bounded(
-        2, "footprint", authors, FOOTPRINT_PER_AUTHOR_LIMIT, scan_timeout
-    )
-    unknown_footprint_authors |= dropped_footprint_authors
 
-    since = int(time.time()) - ACTIVITY_WINDOW_DAYS * 86400
-    activity_events = scan(3, "activity", {"since": since})
+    totals = []
+    for kind in kinds:
+        check_deadline()
+        total = run_strfry_count({"kinds": [kind], "since": window_start, "until": window_end})
+        if total > 0:
+            totals.append((total, kind))
+    totals.sort(reverse=True)
 
-    banned_list, _dropped_purge_authors, purge_sampled = apply_author_cap(sorted(banned), "purge_pending")
-    banned_events, unknown_purge_authors = scan_by_authors_bounded(
-        4, "purge_pending", banned_list, PURGE_PENDING_PER_AUTHOR_LIMIT, scan_timeout
-    )
+    activity = []
+    for _, kind in totals[:ACTIVITY_MAX_KINDS]:
+        days = []
+        for i in range(ACTIVITY_WINDOW_DAYS):
+            check_deadline()
+            day_start = window_start + i * 86400
+            days.append(run_strfry_count(
+                {"kinds": [kind], "since": day_start, "until": day_start + 86400 - 1}
+            ))
+        activity.append({"kind": kind, "days": days, "total": sum(days)})
+    activity.sort(key=lambda a: a["total"], reverse=True)
 
-    report = audit.build_report(
-        relay_list_events, footprint_events, activity_events, banned_events,
-        banned, admin_pubkey_hex, relay_url,
-        unknown_pubkeys=unknown_footprint_authors,
-    )
-
-    warning_parts = [n for n in (footprint_sampled, purge_sampled) if n]
-    if unknown_footprint_authors:
-        warning_parts.append(
-            f"audit scan 2 (footprint): {len(unknown_footprint_authors)} authors' footprint "
-            "could not be scanned and were excluded from ghost detection"
-        )
-    if unknown_purge_authors:
-        warning_parts.append(
-            f"audit scan 4 (purge_pending): {len(unknown_purge_authors)} banned authors' "
-            "event counts could not be scanned"
-        )
-    return {
-        "generated_at": int(time.time()),
-        "relay_url": relay_url,
-        "warning": "; ".join(warning_parts) if warning_parts else None,
-        "notices": report["notices"],
-        "activity": report["activity"],
-    }
+    return {"generated_at": int(time.time()), "warning": None, "activity": activity}
 
 
-def _recompute_audit(admin_pubkey_hex, scan_timeout):
-    global _audit_cache, _audit_computing
+def _recompute_activity():
+    global _activity_cache, _activity_computing
     try:
-        report = compute_audit_report(admin_pubkey_hex, scan_timeout)
+        report = compute_activity()
     except Exception as e:
-        if isinstance(e, AuditScanError):
-            warning = str(e)
-        else:
-            warning = f"audit recompute failed: {type(e).__name__}: {e}"[:600]
+        warning = f"activity recompute failed: {type(e).__name__}: {e}"[:600]
         log(f"server86: {warning}")
-        with _audit_lock:
-            if _audit_cache is None:
-                _audit_cache = empty_audit_skeleton(
-                    get_dynamic_config()["relay_url"], warning
-                )
-            _audit_computing = False
+        with _activity_lock:
+            if _activity_cache is None:
+                _activity_cache = empty_activity_skeleton(warning)
+            _activity_computing = False
         return
-    with _audit_lock:
-        _audit_cache = report
-        _audit_computing = False
+    with _activity_lock:
+        _activity_cache = report
+        _activity_computing = False
 
 
-def get_audit_report(admin_pubkey_hex):
-    """Serve the cached audit report, kicking off a background recompute
-    (single-flight) when the cache is stale or missing. Never blocks beyond
-    AUDIT_SYNC_TIMEOUT, and never raises."""
-    global _audit_computing
-    with _audit_lock:
-        cache = _audit_cache
-        fresh = cache is not None and (time.time() - cache["generated_at"]) < AUDIT_CACHE_TTL
-        should_kickoff = not fresh and not _audit_computing
+def get_activity_report():
+    """Serve the cached activity report, kicking off a background recompute
+    (single-flight) when the cache is stale or missing. The request path
+    never blocks beyond ACTIVITY_SYNC_TIMEOUT and never raises — a failed or
+    slow recompute degrades to the previous result or an empty skeleton."""
+    global _activity_computing
+    with _activity_lock:
+        cache = _activity_cache
+        fresh = cache is not None and (time.time() - cache["generated_at"]) < ACTIVITY_CACHE_TTL
+        should_kickoff = not fresh and not _activity_computing
         if should_kickoff:
-            _audit_computing = True
+            _activity_computing = True
 
     if fresh:
         return cache
 
     if should_kickoff:
+        t = threading.Thread(target=_recompute_activity, daemon=True)
+        t.start()
         if cache is None:
-            t = threading.Thread(
-                target=_recompute_audit,
-                args=(admin_pubkey_hex, AUDIT_SYNC_SCAN_TIMEOUT),
-                daemon=True,
-            )
-            t.start()
-            t.join(AUDIT_SYNC_TIMEOUT)
-            with _audit_lock:
-                if _audit_cache is not None:
-                    return _audit_cache
-            return empty_audit_skeleton(
-                get_dynamic_config()["relay_url"], "audit still computing — try again shortly"
-            )
-        else:
-            threading.Thread(
-                target=_recompute_audit,
-                args=(admin_pubkey_hex, AUDIT_BG_SCAN_TIMEOUT),
-                daemon=True,
-            ).start()
+            t.join(ACTIVITY_SYNC_TIMEOUT)
+            with _activity_lock:
+                if _activity_cache is not None:
+                    return _activity_cache
+            return empty_activity_skeleton("activity still computing — try again shortly")
 
     if cache is not None:
         return cache
-    return empty_audit_skeleton(
-        get_dynamic_config()["relay_url"], "audit still computing — try again shortly"
-    )
+    return empty_activity_skeleton("activity still computing — try again shortly")
 
 
 def verify_nip98(auth, admin_pubkey_hex, expected_path):
@@ -727,14 +529,17 @@ class Handler(BaseHTTPRequestHandler):
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
             self._send_json(200, {
                 "admin": cfg["admin_pubkey_hex"],
-                "contact_appeal": get_dynamic_config()["contact_appeal"],
+                "contact_appeal": get_contact_appeal(),
                 "banned": banned,
             })
             return
 
-        if path == "/api/audit":
-            cfg = self.server.strfry86_config
-            report = get_audit_report(cfg["admin_pubkey_hex"])
+        if path == "/api/activity":
+            try:
+                report = get_activity_report()
+            except Exception as e:
+                log(f"server86: activity report failed: {e}")
+                report = empty_activity_skeleton(f"activity report failed: {type(e).__name__}")
             self._send_json(200, report)
             return
 

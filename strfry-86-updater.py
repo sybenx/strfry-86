@@ -416,22 +416,6 @@ def prompt_contact_appeal():
     ).strip()
 
 
-def prompt_relay_url():
-    return input(
-        "Relay URL as clients dial it (e.g. wss://relay.example.com), used "
-        "by the audit page — blank to skip: "
-    ).strip()
-
-
-# Optional config keys prompted for once on first run (in this order) and
-# topped up on any later run where an existing config.json lacks the key
-# entirely. Present-but-empty is an answered question and is never re-asked.
-OPTIONAL_CONFIG_PROMPTS = [
-    ("contact_appeal", prompt_contact_appeal),
-    ("relay_url", prompt_relay_url),
-]
-
-
 def ensure_config():
     if not os.path.exists(CONFIG_JSON_PATH):
         admin_pubkey = None
@@ -460,15 +444,14 @@ def ensure_config():
             except ValueError as e:
                 print(f"  invalid: {e}")
 
-        is_tty = sys.stdin.isatty()
+        contact_appeal = prompt_contact_appeal() if sys.stdin.isatty() else ""
+
         cfg = {
             "admin_pubkey_hex": admin_pubkey,
             "port": DEFAULT_PORT,
             "bind": DEFAULT_BIND,
+            "contact_appeal": contact_appeal,
         }
-        for key, prompt_fn in OPTIONAL_CONFIG_PROMPTS:
-            cfg[key] = prompt_fn() if is_tty else ""
-
         os.makedirs(INSTALL_DIR, exist_ok=True)
         tmp_path = CONFIG_JSON_PATH + ".tmp"
         with open(tmp_path, "w") as f:
@@ -478,9 +461,8 @@ def ensure_config():
         print(f"config.json written with admin {npub_encode(admin_pubkey)}")
         return "created"
 
-    # config.json already exists — the only thing we may do is top up any
-    # optional keys missing entirely. Every other key/value is left
-    # untouched.
+    # config.json already exists — the only thing we may do is top up a
+    # missing contact_appeal key. Every other key/value is left untouched.
     try:
         with open(CONFIG_JSON_PATH) as f:
             cfg = json.load(f)
@@ -488,25 +470,19 @@ def ensure_config():
         print(f"WARNING: failed to read existing config.json ({e}) — leaving it untouched.")
         return "unchanged"
 
-    missing = [key for key, _ in OPTIONAL_CONFIG_PROMPTS if key not in cfg]
-    if not missing:
+    if "contact_appeal" in cfg:
         return "unchanged"
 
     if not sys.stdin.isatty():
         return "unchanged"
 
-    added = []
-    for key, prompt_fn in OPTIONAL_CONFIG_PROMPTS:
-        if key in missing:
-            cfg[key] = prompt_fn()
-            added.append(key)
-
+    cfg["contact_appeal"] = prompt_contact_appeal()
     tmp_path = CONFIG_JSON_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp_path, CONFIG_JSON_PATH)
-    return ", ".join(added) + " added"
+    return "contact_appeal added"
 
 
 # --------------------------------------------------------------------------

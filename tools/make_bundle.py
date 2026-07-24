@@ -34,7 +34,6 @@ DEPLOYABLE_FILES = [
     "lib86/bip340.py",
     "lib86/bech32.py",
     "lib86/blacklist.py",
-    "lib86/audit.py",
 ]
 
 
