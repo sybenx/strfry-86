@@ -26,20 +26,25 @@ li { overflow-wrap: anywhere; }
     <div><input id="ban-reason" type="text" placeholder="reason (optional)"></div>
     <button type="submit">Ban</button>
   </form>
+  <div id="undo-list"></div>
 </div>
 <p>These npubs are banned from this relay.</p>
 <p id="appeal-line" style="display:none"></p>
+<p><input id="filter-input" type="search" placeholder="filter bans"></p>
+<label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select all</label>
 <button id="unban-btn" type="button" style="display:none">Unban selected</button>
 <ul id="ban-list"></ul>
 <script>
 var NAME_CACHE_KEY = 'strfry86_name_cache';
 var NAME_TTL_MS = 24 * 60 * 60 * 1000;
+var UNDO_TTL_MS = 5 * 60 * 1000;
 
 var adminPubkey = null;
 var loggedInPubkey = null;
 var isAdmin = false;
 var lastBanned = [];
 var nameSpans = {}; // pubkey -> array of span elements to fill
+var nip05Spans = {}; // pubkey -> array of span elements to fill
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
@@ -53,6 +58,10 @@ var banForm = document.getElementById('ban-form');
 var banInput = document.getElementById('ban-input');
 var banReason = document.getElementById('ban-reason');
 var listEl = document.getElementById('ban-list');
+var filterInput = document.getElementById('filter-input');
+var selectAllLabel = document.getElementById('select-all-label');
+var selectAll = document.getElementById('select-all');
+var undoList = document.getElementById('undo-list');
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -85,6 +94,8 @@ function formatDate(bannedAt) {
 function renderBans(banned) {
   lastBanned = banned;
   nameSpans = {};
+  nip05Spans = {};
+  selectAll.checked = false;
   listEl.textContent = '';
   for (var i = 0; i < banned.length; i++) {
     var ban = banned[i];
@@ -108,6 +119,16 @@ function renderBans(banned) {
       nameSpans[ban.pubkey] = [];
     }
     nameSpans[ban.pubkey].push(nameSpan);
+
+    var nip05Span = document.createElement('span');
+    if (ban.nip05) {
+      nip05Span.textContent = ban.nip05 + ' ';
+    }
+    li.appendChild(nip05Span);
+    if (!nip05Spans[ban.pubkey]) {
+      nip05Spans[ban.pubkey] = [];
+    }
+    nip05Spans[ban.pubkey].push(nip05Span);
 
     var link = document.createElement('a');
     link.href = 'https://njump.me/' + ban.npub;
@@ -137,7 +158,17 @@ function renderBans(banned) {
     listEl.appendChild(li);
   }
 
+  applyFilter();
   resolveFallbackNames(banned);
+}
+
+function applyFilter() {
+  var query = filterInput.value.trim().toLowerCase();
+  var items = listEl.children;
+  for (var i = 0; i < items.length; i++) {
+    var match = !query || items[i].textContent.toLowerCase().indexOf(query) !== -1;
+    items[i].style.display = match ? '' : 'none';
+  }
 }
 
 function resolveFallbackNames(banned) {
@@ -147,13 +178,16 @@ function resolveFallbackNames(banned) {
 
   for (var i = 0; i < banned.length; i++) {
     var ban = banned[i];
-    if (ban.name) {
+    if (ban.name || ban.nip05) {
       continue;
     }
     var cached = cache[ban.pubkey];
-    if (cached && (cached.name || (now - cached.checked_at) < NAME_TTL_MS)) {
+    if (cached && (cached.name || cached.nip05 || (now - cached.checked_at) < NAME_TTL_MS)) {
       if (cached.name) {
         fillName(ban.pubkey, cached.name);
+      }
+      if (cached.nip05) {
+        fillNip05(ban.pubkey, cached.nip05);
       }
       continue;
     }
@@ -183,6 +217,16 @@ function fillName(pubkey, name) {
   }
 }
 
+function fillNip05(pubkey, nip05) {
+  var spans = nip05Spans[pubkey];
+  if (!spans) {
+    return;
+  }
+  for (var i = 0; i < spans.length; i++) {
+    spans[i].textContent = nip05 + ' ';
+  }
+}
+
 function queryRelay(url, pubkeys, done) {
   var cache = loadNameCache();
   var now = Date.now();
@@ -198,6 +242,7 @@ function queryRelay(url, pubkeys, done) {
     try {
       ws.close();
     } catch (e) {}
+    applyFilter();
     done(ok);
   }
 
@@ -237,14 +282,18 @@ function queryRelay(url, pubkeys, done) {
         content = {};
       }
       var name = content.display_name || content.name || null;
-      cache[ev.pubkey] = { name: name, checked_at: now };
+      var nip05 = (typeof content.nip05 === 'string' && content.nip05) ? content.nip05 : null;
+      cache[ev.pubkey] = { name: name, nip05: nip05, checked_at: now };
       if (name) {
         fillName(ev.pubkey, name);
+      }
+      if (nip05) {
+        fillNip05(ev.pubkey, nip05);
       }
     } else if (msg[0] === 'EOSE') {
       for (var i = 0; i < pubkeys.length; i++) {
         if (!cache[pubkeys[i]]) {
-          cache[pubkeys[i]] = { name: null, checked_at: now };
+          cache[pubkeys[i]] = { name: null, nip05: null, checked_at: now };
         }
       }
       clearTimeout(timeout);
@@ -374,6 +423,7 @@ loginBtn.addEventListener('click', function () {
       loginBtn.textContent = 'Logout';
       activitySection.style.display = '';
       adminControls.style.display = '';
+      selectAllLabel.style.display = '';
       unbanBtn.style.display = '';
       renderBans(lastBanned);
       loadActivity();
@@ -406,6 +456,75 @@ function signAndPost(endpoint, extraBody) {
         return { ok: res.ok, body: body };
       });
     });
+}
+
+filterInput.addEventListener('input', applyFilter);
+
+selectAll.addEventListener('change', function () {
+  // Selects only the entries the filter currently shows.
+  var checkboxes = listEl.querySelectorAll('.ban-checkbox');
+  for (var i = 0; i < checkboxes.length; i++) {
+    if (checkboxes[i].parentNode.style.display === 'none') {
+      continue;
+    }
+    checkboxes[i].checked = selectAll.checked;
+  }
+});
+
+function addUndoLine(pubkey) {
+  var ban = null;
+  for (var i = 0; i < lastBanned.length; i++) {
+    if (lastBanned[i].pubkey === pubkey) {
+      ban = lastBanned[i];
+      break;
+    }
+  }
+
+  var line = document.createElement('p');
+  var label = document.createElement('span');
+  label.textContent = 'banned ' + (ban && ban.name ? ban.name + ' ' : '') + (ban ? ban.npub : pubkey) + ' ';
+  line.appendChild(label);
+
+  var undoBtn = document.createElement('button');
+  undoBtn.type = 'button';
+  undoBtn.textContent = 'Undo';
+  line.appendChild(undoBtn);
+  line.appendChild(document.createTextNode(' '));
+
+  var dismissBtn = document.createElement('button');
+  dismissBtn.type = 'button';
+  dismissBtn.textContent = '×';
+  line.appendChild(dismissBtn);
+
+  var timer = setTimeout(remove, UNDO_TTL_MS);
+  function remove() {
+    clearTimeout(timer);
+    if (line.parentNode) {
+      line.parentNode.removeChild(line);
+    }
+  }
+
+  dismissBtn.addEventListener('click', remove);
+  undoBtn.addEventListener('click', function () {
+    undoBtn.disabled = true;
+    signAndPost('/api/unban', { pubkeys: [pubkey] })
+      .then(function (result) {
+        if (!result.ok) {
+          undoBtn.disabled = false;
+          setStatus('undo failed: ' + (result.body && result.body.error ? result.body.error : 'unknown error'));
+          return;
+        }
+        remove();
+        setStatus('unbanned 1 pubkey');
+        return loadBans();
+      })
+      .catch(function () {
+        undoBtn.disabled = false;
+        setStatus('undo failed');
+      });
+  });
+
+  undoList.appendChild(line);
 }
 
 unbanBtn.addEventListener('click', function () {
@@ -461,7 +580,12 @@ banForm.addEventListener('submit', function (evt) {
         + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
       banInput.value = '';
       banReason.value = '';
-      return loadBans();
+      return loadBans().then(function () {
+        // After loadBans so lastBanned has each ban's npub/name for the line.
+        for (var i = 0; i < result.body.added.length; i++) {
+          addUndoLine(result.body.added[i]);
+        }
+      });
     })
     .catch(function () {
       setStatus('ban failed');

@@ -56,7 +56,7 @@ ACTIVITY_SYNC_TIMEOUT = 5
 # degraded strfry can't wedge the single-flight recompute for hours.
 ACTIVITY_COMPUTE_DEADLINE = 120
 
-_name_cache = {}  # pubkey_hex -> (name_or_None, checked_at)
+_name_cache = {}  # pubkey_hex -> ({"name": str_or_None, "nip05": str_or_None}, checked_at)
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
@@ -272,14 +272,22 @@ def run_strfry_count(filter_obj, timeout=ACTIVITY_COUNT_TIMEOUT):
     return int(lines[-1])
 
 
-def resolve_names(pubkeys):
-    """Return {pubkey: name_or_None} for the given pubkeys, querying the local
-    strfry database for uncached (or stale-miss) pubkeys in one batched scan."""
+def _clean_profile_field(value):
+    return value if isinstance(value, str) and value else None
+
+
+def resolve_profiles(pubkeys):
+    """Return {pubkey: {"name": ..., "nip05": ...}} for the given pubkeys,
+    querying the local strfry database for uncached (or stale-miss) pubkeys
+    in one batched scan. Both fields come from the same kind-0 event; the
+    nip05 string is displayed as-is, never verified (verification would need
+    outbound HTTP to arbitrary domains)."""
     now = time.time()
+    miss = {"name": None, "nip05": None}
     to_query = [
         pk for pk in pubkeys
         if pk not in _name_cache or (
-            _name_cache[pk][0] is None and now - _name_cache[pk][1] >= NAME_CACHE_TTL
+            _name_cache[pk][0] == miss and now - _name_cache[pk][1] >= NAME_CACHE_TTL
         )
     ]
 
@@ -291,20 +299,24 @@ def resolve_names(pubkeys):
                 try:
                     content = json.loads(ev.get("content", "{}"))
                     name = content.get("display_name") or content.get("name")
+                    nip05 = content.get("nip05")
                     pk = ev.get("pubkey")
                 except Exception:
                     continue
                 if pk in to_query:
-                    _name_cache[pk] = (name if isinstance(name, str) and name else None, now)
+                    _name_cache[pk] = (
+                        {"name": _clean_profile_field(name), "nip05": _clean_profile_field(nip05)},
+                        now,
+                    )
                     found.add(pk)
             for pk in to_query:
                 if pk not in found:
-                    _name_cache[pk] = (None, now)
+                    _name_cache[pk] = (dict(miss), now)
         except Exception as e:
             log(f"server86: strfry scan failed: {e}")
             for pk in to_query:
                 if pk not in _name_cache:
-                    _name_cache[pk] = (None, now)
+                    _name_cache[pk] = (dict(miss), now)
 
     return {pk: _name_cache[pk][0] for pk in pubkeys}
 
@@ -506,16 +518,17 @@ class Handler(BaseHTTPRequestHandler):
             data = blacklist.load()
             pubkeys = list(data.keys())
             try:
-                names = resolve_names(pubkeys)
+                profiles = resolve_profiles(pubkeys)
             except Exception as e:
                 log(f"server86: name resolution failed: {e}")
-                names = {}
+                profiles = {}
             banned = []
             for pubkey, info in data.items():
                 try:
                     npub = bech32.npub_encode(pubkey)
                 except (ValueError, TypeError):
                     continue
+                profile = profiles.get(pubkey) or {}
                 banned.append(
                     {
                         "pubkey": pubkey,
@@ -523,7 +536,8 @@ class Handler(BaseHTTPRequestHandler):
                         "banned_at": info.get("banned_at"),
                         "reason": info.get("reason", ""),
                         "report_type": info.get("report_type"),
-                        "name": names.get(pubkey),
+                        "name": profile.get("name"),
+                        "nip05": profile.get("nip05"),
                     }
                 )
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
