@@ -234,6 +234,197 @@ LINE="$(mkevent e8 "$ADMIN_HEX" 1984 "[[\"e\",\"someeventid\",\"malware\"],[\"p\
 OUT="$(run_plugin "$LINE")"
 if check_report_type "$TARGET_HEX" "malware"; then pass "admin 1984 note report falls back to e tag's report_type"; else fail "report_type should fall back to the e tag's type ('malware') for a bare p tag"; fi
 
+# --- crypto tests (non-negotiable — this is the whole authorization system) -
+#
+# lib86/bip340.py has exactly one caller: NIP-98 signature verification in
+# server86.py. There are no sessions, cookies, or tokens, so that one
+# function is the only thing between a stranger and /api/unban, /api/ban,
+# and /api/authors/scan. A verifier that wrongly returns True breaks nothing
+# visible — it just opens the admin API to the internet — so unlike every
+# other test above, this one covers a failure you would NOT notice by using
+# the thing. See tests/README.md for fixture provenance.
+
+CRYPTO_TEST_SCRIPT="$(mktemp)"
+cat > "$CRYPTO_TEST_SCRIPT" <<'PYEOF'
+import csv
+import json
+import os
+import secrets
+import sys
+
+REPO_ROOT = sys.argv[1]
+sys.path.insert(0, REPO_ROOT)
+
+from lib86 import bech32, bip340  # noqa: E402
+import server86  # noqa: E402
+
+results = []  # (ok, name, detail)
+
+
+def check(ok, name, detail=None):
+    results.append((ok, name, detail))
+
+
+# --- BIP-340 reference vectors (tests/bip340-vectors.csv, vendored verbatim)
+
+vectors_path = os.path.join(REPO_ROOT, "tests", "bip340-vectors.csv")
+applicable = 0
+skipped = 0
+mismatches = []
+with open(vectors_path, newline="") as f:
+    for row in csv.DictReader(f):
+        msg_hex = row["message"]
+        msg = bytes.fromhex(msg_hex) if msg_hex else b""
+        if len(msg) != 32:
+            # lib86/bip340.py verifies only fixed 32-byte messages (a Nostr
+            # event id is always a sha256 hash) — these upstream vectors
+            # (added 2022-12) test variable-length messages, a mode this
+            # project deliberately does not implement. See tests/README.md.
+            skipped += 1
+            continue
+        applicable += 1
+        pubkey = bytes.fromhex(row["public key"])
+        sig = bytes.fromhex(row["signature"])
+        expected = row["verification result"].strip().upper() == "TRUE"
+        try:
+            actual = bip340.schnorr_verify(msg, pubkey, sig)
+        except Exception as e:
+            actual = f"raised {type(e).__name__}"
+        if actual != expected:
+            mismatches.append(
+                f"vector {row['index']} ({row.get('comment', '')}): expected {expected}, got {actual}"
+            )
+
+if mismatches:
+    check(False, "bip340 test vectors", f"{len(mismatches)} mismatch(es): " + "; ".join(mismatches))
+else:
+    check(True, f"bip340 test vectors ({applicable} applicable rows, {skipped} skipped: variable-length message)")
+
+
+# --- NIP-98 fixture + mutations (tests/nip98-fixture.json) ------------------
+
+with open(os.path.join(REPO_ROOT, "tests", "nip98-fixture.json")) as f:
+    fixtures = json.load(f)
+
+valid = fixtures["valid"]
+admin = valid["pubkey"]
+path = "/api/unban"
+now = valid["created_at"]
+
+
+def flip_hex_byte(hexstr, index=0):
+    b = bytearray(bytes.fromhex(hexstr))
+    b[index] ^= 0xFF
+    return b.hex()
+
+
+def with_field(event, **overrides):
+    ev = dict(event)
+    ev.update(overrides)
+    return ev
+
+
+ok, err = server86.verify_nip98(valid, admin, path, now=now)
+check(ok, "nip98 fixture accepted unmodified", err)
+
+reject_cases = [
+    ("flipped sig byte", with_field(valid, sig=flip_hex_byte(valid["sig"])), admin, path, now),
+    ("flipped id byte", with_field(valid, id=flip_hex_byte(valid["id"])), admin, path, now),
+    ("wrong admin pubkey", valid, flip_hex_byte(admin), path, now),
+    ("wrong kind", fixtures["wrong_kind"], admin, path, now),
+    ("wrong method tag", fixtures["wrong_method"], admin, path, now),
+    ("wrong u path", fixtures["wrong_path"], admin, path, now),
+    ("now 120s before created_at (event from the future)", valid, admin, path, now - 120),
+    ("now 120s after created_at (stale event)", valid, admin, path, now + 120),
+]
+for name, ev, adm, p, n in reject_cases:
+    ok, err = server86.verify_nip98(ev, adm, p, now=n)
+    check(not ok, f"nip98 rejects: {name}", None if not ok else "was wrongly accepted")
+
+
+# --- kind-0 fixture + mutations (tests/kind0-fixture.json) ------------------
+# bip340.py's second and last caller: verifying the raw kind-0 events a
+# browser POSTs to /api/names after querying a third-party relay.
+
+with open(os.path.join(REPO_ROOT, "tests", "kind0-fixture.json")) as f:
+    kind0_fixtures = json.load(f)
+
+k0_valid = kind0_fixtures["valid"]
+k0_pubkey = k0_valid["pubkey"]
+
+verified = server86.verify_kind0_event(k0_valid, {k0_pubkey}, {k0_pubkey})
+check(verified is not None, "kind0 fixture accepted unmodified",
+      None if verified is not None else "was wrongly rejected")
+
+k0_reject_cases = [
+    ("flipped sig byte", with_field(k0_valid, sig=flip_hex_byte(k0_valid["sig"])), {k0_pubkey}, {k0_pubkey}),
+    ("flipped id byte", with_field(k0_valid, id=flip_hex_byte(k0_valid["id"])), {k0_pubkey}, {k0_pubkey}),
+    ("tampered content", with_field(k0_valid, content=k0_valid["content"] + "x"), {k0_pubkey}, {k0_pubkey}),
+    ("wrong kind", kind0_fixtures["wrong_kind"], {k0_pubkey}, {k0_pubkey}),
+    ("pubkey not in queried", k0_valid, set(), {k0_pubkey}),
+    ("pubkey not currently banned", k0_valid, {k0_pubkey}, set()),
+]
+for name, ev, queried, banned_pubkeys in k0_reject_cases:
+    result = server86.verify_kind0_event(ev, queried, banned_pubkeys)
+    check(result is None, f"kind0 rejects: {name}", None if result is None else "was wrongly accepted")
+
+
+# --- bech32 round-trip / corruption (npub_encode / npub_decode) ------------
+
+pairs_detail = []
+for _ in range(5):
+    hexkey = secrets.token_hex(32)
+    npub = bech32.npub_encode(hexkey)
+    back = bech32.npub_decode(npub)
+    if back != hexkey:
+        pairs_detail.append(f"{hexkey} -> {npub} -> {back}")
+check(not pairs_detail, "bech32 round-trip (5 random pubkeys)", "; ".join(pairs_detail) or None)
+
+
+def raises_value_error(fn, *a):
+    try:
+        fn(*a)
+        return False
+    except ValueError:
+        return True
+    except Exception as e:
+        return f"raised {type(e).__name__} instead of ValueError"
+
+
+sample_hex = secrets.token_hex(32)
+sample_npub = bech32.npub_encode(sample_hex)
+
+corrupted = sample_npub[:-1] + ("q" if sample_npub[-1] != "q" else "p")
+result = raises_value_error(bech32.npub_decode, corrupted)
+check(result is True, "bech32 rejects corrupted checksum", None if result is True else result)
+
+wrong_hrp = bech32.bech32_encode("nsec", bech32.convertbits(list(bytes.fromhex(sample_hex)), 8, 5, True))
+result = raises_value_error(bech32.npub_decode, wrong_hrp)
+check(result is True, "bech32 rejects wrong HRP (nsec)", None if result is True else result)
+
+truncated = sample_npub[:-4]
+result = raises_value_error(bech32.npub_decode, truncated)
+check(result is True, "bech32 rejects truncated npub", None if result is True else result)
+
+
+# --- report ------------------------------------------------------------
+
+for ok, name, detail in results:
+    if ok:
+        print(f"PASS: {name}")
+    else:
+        line = f"FAIL: {name}"
+        if detail:
+            line += f" ({detail})"
+        print(line)
+PYEOF
+
+CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT")"
+echo "$CRYPTO_OUTPUT"
+CRYPTO_FAIL_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^FAIL: ')"
+FAILURES=$((FAILURES + CRYPTO_FAIL_COUNT))
+rm -f "$CRYPTO_TEST_SCRIPT"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "ALL TESTS PASSED"

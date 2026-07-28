@@ -1,0 +1,21 @@
+{
+  "valid": {
+    "content": "{\"name\":\"testuser\",\"display_name\":\"Test User\",\"nip05\":\"test@example.com\"}",
+    "created_at": 1700000000,
+    "id": "25602fcc0780c21219508c855146bff59af18b16686e92232cfce5b51e03cfcd",
+    "kind": 0,
+    "pubkey": "223a6eafde8ae76d8b0e0b86b13ec566d44d34be104955cdb59cf4e3ab49dd95",
+    "sig": "ebd24d8efb52ac6129a66c6ba3d2cb81c3451c121e22dd8dcddd8cd4c3d1786a93bf77f7cdcae266e2b240ebf77eb78405cb5cef5e12a9f8cc00874efa21064a",
+    "tags": []
+  },
+  "wrong_kind": {
+    "content": "{\"name\":\"testuser\",\"display_name\":\"Test User\",\"nip05\":\"test@example.com\"}",
+    "created_at": 1700000000,
+    "id": "bc88c91f9367ea8e3a274b6d9637226c23b82c90936d15f72d523bc72be92e6a",
+    "kind": 1,
+    "pubkey": "223a6eafde8ae76d8b0e0b86b13ec566d44d34be104955cdb59cf4e3ab49dd95",
+    "sig": "873a4b101d620c2ce6cad36f6d19108fdce32ca95831c6039fa9475291ff92067a5b68013817040946aaf10d57a14c9005af0194fdb411add2cfc3926b3d0535",
+    "tags": []
+  }
+}
+

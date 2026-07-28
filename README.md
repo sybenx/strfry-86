@@ -79,17 +79,23 @@ strfry delete --filter '{"authors":["<hex-pubkey>"]}'
 
 ## Unbanning
 
-Open the admin page, click "Login with extension" (NIP-07), check the pubkeys you want to unban (a live "n selected" count sits next to the button), click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies.
+Open the ban list page (`/`), click "Login with extension" (NIP-07), check the pubkeys you want to unban (a live "n selected" count sits next to the button), click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies. Logging in is remembered in this browser (localStorage) so you aren't re-prompted by your extension moving between the ban list and the active-authors page — that changes nothing about the security model, every write is still individually NIP-98 signed and checked server-side; hand-editing that stored value just gets you a page full of buttons that fail.
 
-Every admin action leaves a record line below the ban form — manual bans, unbans, and bans triggered by your kind-1984 reports — each with an "Undo" button and a "↩" dismiss button. Records persist in your browser (localStorage) across reloads until you dismiss them or undo the action; they are display-only and nothing about them is stored on the server.
+Every admin action leaves a record line — manual bans, unbans, and bans triggered by your kind-1984 reports — each with an "Undo" button and a "↩" dismiss button. Records persist in your browser (localStorage) across reloads until you dismiss them or undo the action; they are display-only and nothing about them is stored on the server. At most the 20 newest are ever shown.
+
+Names are resolved first from the local relay database. For a banned user whose events (including their kind 0) have already been purged, the ban list page automatically queries `wss://purplepag.es` (falling back to `wss://relay.damus.io`) from your logged-in browser — the server itself never opens an outbound connection. Each pubkey is queried externally at most once, ever: both hits and misses are verified and persisted in `blacklist.json` (never trusted client-side extraction — the server independently checks the event's signature before storing anything), so the result is shared across every browser you log in from and never re-fetched. If you want a pubkey re-checked, hand-delete its `name_checked_at` field in `blacklist.json`.
 
 ## Manual bans
 
-Logged in as admin, the admin page also shows a ban form: paste one or more npubs or hex pubkeys (space or comma separated), an optional reason, and click "Ban". This is the same trust root as reporting — authorized per-request with NIP-98, no sessions.
+Logged in as admin, the ban list page also shows a ban form: paste one or more npubs or hex pubkeys (space or comma separated), an optional reason, and click "Ban". This is the same trust root as reporting — authorized per-request with NIP-98, no sessions.
 
-## Activity sparklines
+## Finding active authors
 
-After logging in, the admin page shows per-kind event counts for the last 28 days as small inline sparklines — a quick "what changed since I last looked". Everything is computed locally from the relay's own database using count-only scans: no network calls, no history streaming.
+The `/authors` page (linked from the ban list) is admin-only. Click "scan recent activity" to read the relay's most recent 20,000 events and see who's posting the most — sorted by count, with each author's most recent event time. Check the ones you want, optionally add a reason, and "Ban selected" bans them the same way the manual ban form does. It's one bounded scan per press: nothing scans on page load or on a timer, and reloading the page just re-shows the last scan's result without re-scanning.
+
+## No charts or statistics
+
+strfry-86 deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead as copyable `strfry` commands in a "terminal commands" block on both pages, for you to read and run yourself.
 
 ## strfry.conf backups
 

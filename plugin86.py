@@ -98,6 +98,10 @@ def process_event(event, admin_pubkey):
                         report_type = tag[2]
                     else:
                         report_type = fallback_type
+                    # name/nip05 start null: strfry blocks its whole write
+                    # pipeline on this plugin's reply, so a name lookup in
+                    # this hot path would stall the relay. Resolution
+                    # happens later, from the admin's browser.
                     blacklist.add(
                         tag[1],
                         banned_at=created_at,

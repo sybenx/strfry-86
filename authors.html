@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strfry-86 — active authors</title>
+<style>
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li { overflow-wrap: anywhere; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+</style>
+</head>
+<body>
+<h1>strfry-86 — active authors</h1>
+<p><a href="/">← ban list</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <div id="command-block-container"></div>
+  <div id="records-list"></div>
+  <p>
+    <button id="scan-btn" type="button">scan recent activity (reads the most recent 20000 events)</button>
+  </p>
+  <p id="provenance-line"></p>
+  <p><input id="filter-input" type="search" placeholder="filter authors"></p>
+  <label id="select-all-label"><input id="select-all" type="checkbox"> Select all</label>
+  <button id="ban-btn" type="button">Ban selected</button>
+  <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
+  <input id="ban-reason" type="text" placeholder="reason (optional)">
+  <b id="selected-count"></b>
+  <pre id="purge-pre" style="display:none"></pre>
+  <ul id="author-list"></ul>
+</div>
+<script src="/common86.js"></script>
+<script>
+var adminPubkey = null;
+var isAdmin = false;
+var lastAuthors = [];
+var lastBanned = [];
+var bannedPubkeys = {};
+
+var statusEl = document.getElementById('status');
+var loginBtn = document.getElementById('login-btn');
+var adminSection = document.getElementById('admin-section');
+var commandBlockContainer = document.getElementById('command-block-container');
+var recordsList = document.getElementById('records-list');
+var scanBtn = document.getElementById('scan-btn');
+var provenanceLine = document.getElementById('provenance-line');
+var filterInput = document.getElementById('filter-input');
+var selectAll = document.getElementById('select-all');
+var banBtn = document.getElementById('ban-btn');
+var copyPurgeBtn = document.getElementById('copy-purge-btn');
+var banReason = document.getElementById('ban-reason');
+var selectedCount = document.getElementById('selected-count');
+var purgePre = document.getElementById('purge-pre');
+var listEl = document.getElementById('author-list');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function renderProvenance(data) {
+  if (!data || data.scanned_at === null || data.scanned_at === undefined) {
+    provenanceLine.textContent = '';
+    return;
+  }
+  provenanceLine.textContent = data.events_read + ' events, '
+    + s86FormatDate(data.span_start) + ' → ' + s86FormatDate(data.span_end) + ', '
+    + data.authors.length + ' authors — scanned ' + s86FormatDate(data.scanned_at);
+  if (data.warning) {
+    provenanceLine.textContent += ' (' + data.warning + ')';
+  }
+}
+
+function renderAuthors(authors) {
+  lastAuthors = authors;
+  selectAll.checked = false;
+  listEl.textContent = '';
+  for (var i = 0; i < authors.length; i++) {
+    var a = authors[i];
+    var li = document.createElement('li');
+
+    var alreadyBanned = !!bannedPubkeys[a.pubkey];
+    var isSelf = a.pubkey === adminPubkey;
+    if (alreadyBanned) {
+      li.appendChild(document.createTextNode('(banned) '));
+    } else if (!isSelf) {
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = a.pubkey;
+      checkbox.className = 'author-checkbox';
+      li.appendChild(checkbox);
+      li.appendChild(document.createTextNode(' '));
+    }
+
+    var nameSpan = document.createElement('b');
+    if (a.name) {
+      nameSpan.textContent = a.name + ' ';
+    }
+    li.appendChild(nameSpan);
+
+    if (a.nip05) {
+      li.appendChild(s86El('span', a.nip05 + ' '));
+    }
+
+    li.appendChild(s86NpubLink(a.npub));
+    li.appendChild(document.createTextNode(' — ' + a.count + ' events — '));
+
+    var lastSeenEl = document.createElement('i');
+    lastSeenEl.textContent = s86FormatDate(a.last_seen);
+    li.appendChild(lastSeenEl);
+
+    listEl.appendChild(li);
+  }
+
+  s86ApplyFilter(filterInput, listEl);
+  s86UpdateSelectedCount(listEl, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+}
+
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () {
+      loadBanned().then(function () {
+        renderRecords();
+        renderAuthors(lastAuthors);
+      });
+    },
+    onError: setStatus
+  });
+}
+
+function loadAuthorsCache() {
+  return fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      renderProvenance(data);
+      renderAuthors(data.authors || []);
+    })
+    .catch(function () {
+      setStatus('failed to load author list');
+    });
+}
+
+function loadBanned() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      lastBanned = data.banned;
+      bannedPubkeys = {};
+      lastBanned.forEach(function (b) { bannedPubkeys[b.pubkey] = true; });
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  renderRecords();
+  loadAuthorsCache();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+
+commandBlockContainer.appendChild(s86BuildCommandBlock());
+
+s86WireFilter(filterInput, listEl);
+s86WireSelectAll(selectAll, listEl, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+s86WireCopyPurge(copyPurgeBtn, purgePre, listEl, 'author-checkbox');
+
+scanBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  scanBtn.disabled = true;
+  setStatus('scanning…');
+  s86SignAndPost('/api/authors/scan', {})
+    .then(function (result) {
+      scanBtn.disabled = false;
+      if (!result.ok) {
+        setStatus('scan failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('');
+      renderProvenance(result.body);
+      renderAuthors(result.body.authors || []);
+    })
+    .catch(function () {
+      scanBtn.disabled = false;
+      setStatus('scan failed');
+    });
+});
+
+banBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  var checkboxes = listEl.querySelectorAll('.author-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  if (selected.length === 0) {
+    setStatus('nothing selected');
+    return;
+  }
+  var reason = banReason.value;
+  var entries = selected.map(function (pk) { return { pubkey: pk, reason: reason }; });
+
+  s86SignAndPost('/api/ban', { entries: entries })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('ban failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('banned ' + result.body.added.length + ' pubkey(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      for (var i = 0; i < result.body.added.length; i++) {
+        var pk = result.body.added[i];
+        var a = lastAuthors.find(function (x) { return x.pubkey === pk; });
+        s86AddRecord({
+          type: 'ban',
+          at: Date.now(),
+          entries: [{ pubkey: pk, npub: a ? a.npub : null, name: a ? a.name : null, reason: reason }]
+        });
+      }
+      return loadBanned().then(function () {
+        renderRecords();
+        renderAuthors(lastAuthors);
+      });
+    })
+    .catch(function () {
+      setStatus('ban failed');
+    });
+});
+
+loadBanned();
+</script>
+</body>
+</html>

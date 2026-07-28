@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tarfile
 import time
@@ -34,6 +35,13 @@ BUNDLE_PATH = os.path.join(SCRIPT_DIR, BUNDLE_FILENAME)
 INSTALL_DIR = "/config/strfry86"
 STRFRY_CONF_PATH = "/config/strfry.conf"
 PLUGIN_PATH = "/config/strfry86/plugin86.py"
+SERVER_SCRIPT = "/config/strfry86/server86.py"
+# How long to wait for a killed server86.py to actually exit before spawning
+# its replacement (it enforces singleton by port bind, so a replacement
+# started too early just dies silently on EADDRINUSE), and how long to poll
+# for the new one to come up before giving up and warning.
+SERVER_KILL_WAIT = 5.0
+SERVER_VERIFY_WAIT = 3.0
 CONFIG_JSON_PATH = os.path.join(INSTALL_DIR, "config.json")
 LOCAL_MANIFEST_PATH = os.path.join(INSTALL_DIR, "manifest.json")
 DEFAULT_PORT = 8686
@@ -600,15 +608,14 @@ def chmod_plugin():
         os.chmod(PLUGIN_PATH, st.st_mode | 0o111)
 
 
-def kill_server86():
-    killed = 0
+def find_server86_pids():
     proc_dir = "/proc"
     if not os.path.isdir(proc_dir):
-        return killed
+        return []
+    pids = []
     for entry in os.listdir(proc_dir):
         if not entry.isdigit():
             continue
-        pid = int(entry)
         cmdline_path = os.path.join(proc_dir, entry, "cmdline")
         try:
             with open(cmdline_path, "rb") as f:
@@ -616,12 +623,65 @@ def kill_server86():
         except OSError:
             continue
         if "server86.py" in cmdline:
+            pids.append(int(entry))
+    return pids
+
+
+def restart_server86():
+    """Kill any running server86.py and unconditionally spawn its
+    replacement, verifying it comes back up. Delegating the respawn to
+    plugin86 (which only checks once per hour, or on the next event) could
+    leave the admin page down indefinitely on a quiet relay after every
+    update — and on a brand new install, nothing has ever spawned it at
+    all until the relay's first event — so this does it here, synchronously,
+    with a visible outcome every run.
+
+    Returns "restarted" or a failure description."""
+    pids = find_server86_pids()
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    if pids:
+        # server86 enforces singleton by port bind and exits 0 silently on
+        # EADDRINUSE, so a replacement spawned before the old process
+        # actually releases the port just dies without a word — wait for
+        # it to be gone.
+        deadline = time.monotonic() + SERVER_KILL_WAIT
+        remaining = [pid for pid in pids if os.path.isdir(f"/proc/{pid}")]
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.2)
+            remaining = [pid for pid in remaining if os.path.isdir(f"/proc/{pid}")]
+
+        for pid in remaining:
             try:
-                os.kill(pid, signal.SIGTERM)
-                killed += 1
+                os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-    return killed
+        if remaining:
+            time.sleep(0.5)
+
+    try:
+        subprocess.Popen(
+            ["python3", SERVER_SCRIPT],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=INSTALL_DIR,
+        )
+    except Exception as e:
+        return f"did NOT come back up — check stderr (failed to spawn: {e})"
+
+    verify_deadline = time.monotonic() + SERVER_VERIFY_WAIT
+    while time.monotonic() < verify_deadline:
+        if find_server86_pids():
+            return "restarted"
+        time.sleep(0.2)
+    return "did NOT come back up — check stderr"
 
 
 # --------------------------------------------------------------------------
@@ -713,9 +773,11 @@ def main():
 
     chmod_plugin()
 
-    killed = kill_server86()
-    if killed:
-        print(f"stopped {killed} running server86.py process(es); will respawn with fresh code.")
+    restart_status = restart_server86()
+    if restart_status == "restarted":
+        print("admin page restarted")
+    else:
+        print(f"WARNING: admin page {restart_status}")
 
     self_update_mismatch = False
     if mode == "offline":

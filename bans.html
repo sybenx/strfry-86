@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strfry-86</title>
+<style>
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li { overflow-wrap: anywhere; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+</style>
+</head>
+<body>
+<h1>strfry-86</h1>
+<p><a href="/authors">active authors →</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
+<p id="name-status-line" style="display:none"></p>
+<div id="command-block-container" style="display:none"></div>
+<div id="admin-controls" style="display:none">
+  <h2>Ban a pubkey</h2>
+  <form id="ban-form">
+    <div><input id="ban-input" type="text" placeholder="npub or hex, one or more (comma/space separated)"></div>
+    <div><input id="ban-reason" type="text" placeholder="reason (optional)"></div>
+    <button type="submit">Ban</button>
+  </form>
+</div>
+<div id="records-list"></div>
+<p>These npubs are banned from this relay.</p>
+<p id="appeal-line" style="display:none"></p>
+<p><input id="filter-input" type="search" placeholder="filter bans"></p>
+<label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select all</label>
+<button id="unban-btn" type="button" style="display:none">Unban selected</button>
+<button id="copy-purge-btn" type="button" style="display:none" disabled>Copy purge command</button>
+<b id="selected-count"></b>
+<pre id="purge-pre" style="display:none"></pre>
+<ul id="ban-list"></ul>
+<script src="/common86.js"></script>
+<script>
+var adminPubkey = null;
+var isAdmin = false;
+var lastBanned = [];
+var nameResolutionInFlight = false;
+var attemptedThisSession = new Set();
+
+var statusEl = document.getElementById('status');
+var loginBtn = document.getElementById('login-btn');
+var nameStatusEl = document.getElementById('name-status-line');
+var commandBlockContainer = document.getElementById('command-block-container');
+var adminControls = document.getElementById('admin-controls');
+var appealEl = document.getElementById('appeal-line');
+var unbanBtn = document.getElementById('unban-btn');
+var copyPurgeBtn = document.getElementById('copy-purge-btn');
+var purgePre = document.getElementById('purge-pre');
+var banForm = document.getElementById('ban-form');
+var banInput = document.getElementById('ban-input');
+var banReason = document.getElementById('ban-reason');
+var listEl = document.getElementById('ban-list');
+var filterInput = document.getElementById('filter-input');
+var selectAllLabel = document.getElementById('select-all-label');
+var selectAll = document.getElementById('select-all');
+var recordsList = document.getElementById('records-list');
+var selectedCount = document.getElementById('selected-count');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function renderBans(banned) {
+  lastBanned = banned;
+  selectAll.checked = false;
+  listEl.textContent = '';
+  for (var i = 0; i < banned.length; i++) {
+    var ban = banned[i];
+    var li = document.createElement('li');
+
+    if (isAdmin) {
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = ban.pubkey;
+      checkbox.className = 'ban-checkbox';
+      li.appendChild(checkbox);
+      li.appendChild(document.createTextNode(' '));
+    }
+
+    var nameSpan = document.createElement('b');
+    if (ban.name) {
+      nameSpan.textContent = ban.name + ' ';
+    }
+    li.appendChild(nameSpan);
+
+    var nip05Span = document.createElement('span');
+    if (ban.nip05) {
+      nip05Span.textContent = ban.nip05 + ' ';
+    }
+    li.appendChild(nip05Span);
+
+    li.appendChild(s86NpubLink(ban.npub));
+
+    var dateEl = document.createElement('i');
+    dateEl.textContent = s86FormatDate(ban.banned_at);
+    li.appendChild(document.createTextNode(' — '));
+    li.appendChild(dateEl);
+
+    if (ban.report_type) {
+      li.appendChild(document.createTextNode(' — '));
+      li.appendChild(s86El('span', ban.report_type));
+    }
+
+    if (ban.reason) {
+      li.appendChild(document.createTextNode(' — '));
+      li.appendChild(s86El('span', ban.reason));
+    }
+
+    listEl.appendChild(li);
+  }
+
+  s86ApplyFilter(filterInput, listEl);
+  s86UpdateSelectedCount(listEl, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
+  renderRecords();
+  maybeResolveNamesExternally();
+}
+
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () { loadBans(); },
+    onError: setStatus
+  });
+}
+
+function renderAppeal(contactAppeal) {
+  var trimmed = (contactAppeal || '').trim();
+  if (!trimmed) {
+    appealEl.textContent = '';
+    appealEl.style.display = 'none';
+    return;
+  }
+  appealEl.textContent = 'To appeal, contact: ' + trimmed;
+  appealEl.style.display = '';
+}
+
+function loadBans() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      renderAppeal(data.contact_appeal);
+      renderBans(data.banned);
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+// --- automatic external name resolution -------------------------------
+//
+// The ONLY path by which strfry-86 ever contacts a machine the operator
+// does not run — and it runs in the admin's browser, never in server86.
+// It fires automatically after /api/banned renders for a logged-in admin,
+// because the set it acts on is self-extinguishing: every pubkey is
+// queried externally at most once, ever (hits AND misses persist in
+// blacklist.json via POST /api/names), so in steady state there is
+// nothing to do here. A pubkey already attempted this page load is never
+// retried even if a connection failure left it unresolved — the next
+// admin page load tries again.
+
+function unresolvedPubkeys(banned) {
+  var out = [];
+  for (var i = 0; i < banned.length; i++) {
+    var ban = banned[i];
+    if (!ban.name && !ban.nip05 && !ban.name_checked_at && !attemptedThisSession.has(ban.pubkey)) {
+      out.push(ban.pubkey);
+    }
+  }
+  return out;
+}
+
+function maybeResolveNamesExternally() {
+  if (!isAdmin || nameResolutionInFlight) {
+    return;
+  }
+  var pubkeys = unresolvedPubkeys(lastBanned);
+  if (pubkeys.length === 0) {
+    return;
+  }
+  nameResolutionInFlight = true;
+  pubkeys.forEach(function (pk) { attemptedThisSession.add(pk); });
+
+  function finish(events, connected) {
+    if (!connected) {
+      // Neither relay could be reached — POST nothing, stamp nothing.
+      // The next admin page load simply tries again.
+      nameResolutionInFlight = false;
+      return;
+    }
+    s86SignAndPost('/api/names', { queried: pubkeys, events: events })
+      .then(function () {
+        return loadBans();
+      })
+      .then(function () {
+        renderNameStatusLine();
+        nameResolutionInFlight = false;
+      })
+      .catch(function () {
+        nameResolutionInFlight = false;
+      });
+  }
+
+  queryRelayForNames('wss://purplepag.es', pubkeys, function (events, connected) {
+    if (connected) {
+      finish(events, true);
+      return;
+    }
+    queryRelayForNames('wss://relay.damus.io', pubkeys, finish);
+  });
+}
+
+function renderNameStatusLine() {
+  var n = 0, m = 0, k = 0;
+  lastBanned.forEach(function (ban) {
+    var hasName = !!(ban.name || ban.nip05);
+    if (hasName && !ban.name_checked_at) {
+      n++;
+    } else if (hasName && ban.name_checked_at) {
+      m++;
+    } else {
+      k++;
+    }
+  });
+  nameStatusEl.textContent = 'resolved ' + n + ' locally, ' + m + ' via purplepag.es, ' + k + ' unresolved';
+  nameStatusEl.style.display = '';
+}
+
+// Collects raw, unparsed EVENT payloads for the caller to verify
+// server-side — this page never trusts or parses profile content itself.
+// `connected` distinguishes "relay reachable, query completed" (EOSE or
+// the 5s timeout) from "never connected" — only the latter triggers the
+// damus.io fallback, per spec.
+function queryRelayForNames(url, pubkeys, done) {
+  var settled = false;
+  var connected = false;
+  var events = [];
+  var ws;
+
+  function finish(ok) {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    try { ws.close(); } catch (e) {}
+    done(events, ok);
+  }
+
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    finish(false);
+    return;
+  }
+
+  var timeout = setTimeout(function () { finish(connected); }, 5000);
+
+  ws.addEventListener('open', function () {
+    connected = true;
+    ws.send(JSON.stringify(['REQ', 'strfry86names', { kinds: [0], authors: pubkeys }]));
+  });
+
+  ws.addEventListener('message', function (evt) {
+    var msg;
+    try { msg = JSON.parse(evt.data); } catch (e) { return; }
+    if (!Array.isArray(msg)) {
+      return;
+    }
+    if (msg[0] === 'EVENT' && msg[2]) {
+      events.push(msg[2]);
+    } else if (msg[0] === 'EOSE') {
+      clearTimeout(timeout);
+      finish(true);
+    }
+  });
+
+  ws.addEventListener('error', function () { clearTimeout(timeout); finish(connected); });
+  ws.addEventListener('close', function () { clearTimeout(timeout); finish(connected); });
+}
+
+// --- login ---------------------------------------------------------------
+
+function onLogin() {
+  isAdmin = true;
+  commandBlockContainer.style.display = '';
+  adminControls.style.display = '';
+  selectAllLabel.style.display = '';
+  unbanBtn.style.display = '';
+  copyPurgeBtn.style.display = '';
+  renderBans(lastBanned);
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+
+commandBlockContainer.appendChild(s86BuildCommandBlock());
+
+s86WireFilter(filterInput, listEl);
+s86WireSelectAll(selectAll, listEl, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
+s86WireCopyPurge(copyPurgeBtn, purgePre, listEl, 'ban-checkbox');
+
+unbanBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  var checkboxes = listEl.querySelectorAll('.ban-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  if (selected.length === 0) {
+    setStatus('nothing selected');
+    return;
+  }
+
+  var entriesByPk = {};
+  for (var i = 0; i < selected.length; i++) {
+    var ban = lastBanned.find(function (b) { return b.pubkey === selected[i]; });
+    entriesByPk[selected[i]] = {
+      pubkey: selected[i],
+      npub: ban ? ban.npub : null,
+      name: ban ? ban.name : null,
+      reason: ban ? ban.reason : ''
+    };
+  }
+
+  s86SignAndPost('/api/unban', { pubkeys: selected })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('unban failed: ' + s86ErrMsg(result));
+        return;
+      }
+      var removed = result.body.removed;
+      setStatus('unbanned ' + removed.length + ' pubkey(s)');
+      if (removed.length > 0) {
+        s86AddRecord({
+          type: 'unban',
+          at: Date.now(),
+          entries: removed.map(function (pk) {
+            return entriesByPk[pk] || { pubkey: pk, npub: null, name: null, reason: '' };
+          })
+        });
+      }
+      return loadBans();
+    })
+    .catch(function () {
+      setStatus('unban failed');
+    });
+});
+
+banForm.addEventListener('submit', function (evt) {
+  evt.preventDefault();
+  if (!isAdmin) {
+    return;
+  }
+  var raw = banInput.value.split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  if (raw.length === 0) {
+    setStatus('nothing to ban');
+    return;
+  }
+  var reason = banReason.value;
+  var entries = raw.map(function (pk) { return { pubkey: pk, reason: reason }; });
+
+  s86SignAndPost('/api/ban', { entries: entries })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('ban failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('banned ' + result.body.added.length + ' pubkey(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      banInput.value = '';
+      banReason.value = '';
+      return loadBans().then(function () {
+        for (var i = 0; i < result.body.added.length; i++) {
+          var pk = result.body.added[i];
+          var ban = lastBanned.find(function (b) { return b.pubkey === pk; });
+          s86AddRecord({
+            type: 'ban',
+            at: Date.now(),
+            entries: [{ pubkey: pk, npub: ban ? ban.npub : null, name: ban ? ban.name : null, reason: reason }]
+          });
+        }
+        renderRecords();
+      });
+    })
+    .catch(function () {
+      setStatus('ban failed');
+    });
+});
+
+loadBans();
+</script>
+</body>
+</html>

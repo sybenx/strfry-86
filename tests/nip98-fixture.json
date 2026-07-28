@@ -1,0 +1,75 @@
+{
+  "valid": {
+    "content": "",
+    "created_at": 1700000000,
+    "id": "7212bdd27c5f3ff438adb237534308dcd7869733c3f8500ebb247e33a713a085",
+    "kind": 27235,
+    "pubkey": "dde49c56276e7b2f3a92fc6c6d3d65d6c481aa62f280b79e18ee491c2d386fc6",
+    "sig": "60d53802254de3998f6e335b2925957b5fadc1821d04b8e8673c4cf1e8b2b356631fe3f4fce53ba1877ec6684ac5fb2cdeaf4ac610b1bda19956de67f4e799ac",
+    "tags": [
+      [
+        "u",
+        "https://relay.example/api/unban"
+      ],
+      [
+        "method",
+        "POST"
+      ]
+    ]
+  },
+  "wrong_kind": {
+    "content": "",
+    "created_at": 1700000000,
+    "id": "c6c47d014253bdafc8d0be3d7584483c013dea8235fcdaee52bb5d3659c66cba",
+    "kind": 1,
+    "pubkey": "dde49c56276e7b2f3a92fc6c6d3d65d6c481aa62f280b79e18ee491c2d386fc6",
+    "sig": "a101f974faffc17be849a27bd4a810c7dcad6b1dc56a3c4f0a49d80de3f7cca167aa9f8fe2410a601daf6bb9ad186c6f67498a8b905cf2a7b708c4599296fcc1",
+    "tags": [
+      [
+        "u",
+        "https://relay.example/api/unban"
+      ],
+      [
+        "method",
+        "POST"
+      ]
+    ]
+  },
+  "wrong_method": {
+    "content": "",
+    "created_at": 1700000000,
+    "id": "f03e9c16612a745d302a2fbcb517dfe6b7203e8a33b95e5eb52cf48af78e4868",
+    "kind": 27235,
+    "pubkey": "dde49c56276e7b2f3a92fc6c6d3d65d6c481aa62f280b79e18ee491c2d386fc6",
+    "sig": "691e2ba963fac2b1e2f2c65baef8f15c468a8a0371195e69a8bc0d8a32dba63e4fcf62e6b699c06c39e1837d8ef56bd33b6608b556ee03569ae225b0a2c3136f",
+    "tags": [
+      [
+        "u",
+        "https://relay.example/api/unban"
+      ],
+      [
+        "method",
+        "GET"
+      ]
+    ]
+  },
+  "wrong_path": {
+    "content": "",
+    "created_at": 1700000000,
+    "id": "f30b0cb6b271970dd53aad51ef0dcb10e5819e169c4c4ddcd85520fbf37b8567",
+    "kind": 27235,
+    "pubkey": "dde49c56276e7b2f3a92fc6c6d3d65d6c481aa62f280b79e18ee491c2d386fc6",
+    "sig": "eb6c50e2081911ffe64b0a655f888a5e458195542fa264cf41cc6e787637d9a4203a128528815475746388c40b208c8a56be1517bb99583ae1aec5e57dbfe0a6",
+    "tags": [
+      [
+        "u",
+        "https://relay.example/api/ban"
+      ],
+      [
+        "method",
+        "POST"
+      ]
+    ]
+  }
+}
+
