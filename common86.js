@@ -873,11 +873,23 @@ function s86BuildCommandGenerator(options) {
   return container;
 }
 
-// --- external name resolution (wss://purplepag.es -> POST /api/names) ---
+// --- external name resolution (fallback relay chain -> POST /api/names) --
 // Shared by bans.html (automatic, self-extinguishing set) and authors.html
 // (button-triggered, bounded to visible rows) — see each page for when it
 // fires. Moved here the moment a second page needed it, per the rule that
 // duplicated client code is how a fix lands in one page and not the other.
+
+// Tried in order; only a CONNECT failure advances to the next one (a
+// completed query — EOSE or the 5s timeout — with zero results is not a
+// failure and does not fall through).
+var S86_NAME_RELAYS = [
+  'wss://purplepag.es',
+  'wss://indexer.coracle.social',
+  'wss://user.kindpag.es',
+  'wss://relay.nos.social',
+  'wss://relay.ditto.pub',
+  'wss://relay.noswhere.com'
+];
 
 // Collects raw, unparsed EVENT payloads for the caller to verify
 // server-side — no page trusts or parses profile content itself.
@@ -931,11 +943,12 @@ function s86QueryRelayForNames(url, pubkeys, done) {
   ws.addEventListener('close', function () { clearTimeout(timeout); finish(connected); });
 }
 
-// Query purplepag.es, falling back to relay.damus.io on a CONNECT failure
-// only, then POST whatever came back (even nothing) to /api/names.
-// callbacks: {onDone(ok), onError(msg)}. `onDone(false)` means neither
-// relay could be reached — the caller should stamp nothing client-side
-// either and just let the pubkeys stay eligible for the next attempt.
+// Query S86_NAME_RELAYS in order, falling through to the next one on a
+// CONNECT failure only, then POST whatever came back (even nothing) to
+// /api/names. callbacks: {onDone(ok), onError(msg)}. `onDone(false)` means
+// none of the relays could be reached — the caller should stamp nothing
+// client-side either and just let the pubkeys stay eligible for the next
+// attempt.
 function s86ResolveNamesExternally(pubkeys, callbacks) {
   function post(events) {
     s86SignAndPost('/api/names', { queried: pubkeys, events: events })
@@ -953,19 +966,21 @@ function s86ResolveNamesExternally(pubkeys, callbacks) {
       });
   }
 
-  s86QueryRelayForNames('wss://purplepag.es', pubkeys, function (events, connected) {
-    if (connected) {
-      post(events);
+  function tryRelay(i) {
+    if (i >= S86_NAME_RELAYS.length) {
+      if (callbacks.onDone) callbacks.onDone(false);
       return;
     }
-    s86QueryRelayForNames('wss://relay.damus.io', pubkeys, function (events2, connected2) {
-      if (connected2) {
-        post(events2);
-      } else if (callbacks.onDone) {
-        callbacks.onDone(false);
+    s86QueryRelayForNames(S86_NAME_RELAYS[i], pubkeys, function (events, connected) {
+      if (connected) {
+        post(events);
+        return;
       }
+      tryRelay(i + 1);
     });
-  });
+  }
+
+  tryRelay(0);
 }
 
 // --- record lines -------------------------------------------------------
