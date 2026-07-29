@@ -1130,10 +1130,15 @@ function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
   input.placeholder = 'reason — shown publicly';
   input.maxLength = 500;
 
+  // A row that started prefilled (profile.html's ban-status editor) is
+  // changing a reason already on file; a blank-start row (every record-line
+  // caller) is setting one for the first time — the button says which.
+  var wasPrefilled = !!(currentReason && currentReason.trim().length > 0);
+  var verb = wasPrefilled ? 'Change reason' : 'Set reason';
   var btn = document.createElement('button');
   btn.type = 'button';
-  btn.textContent = 'Set reason';
-  var label = 'set reason on ' + (pubkeys.length === 1 ? 'this ban' : pubkeys.length + ' bans');
+  btn.textContent = verb;
+  var label = verb.toLowerCase() + ' on ' + (pubkeys.length === 1 ? 'this ban' : pubkeys.length + ' bans');
   btn.title = label;
   btn.setAttribute('aria-label', label);
   btn.disabled = input.value.trim().length === 0;
