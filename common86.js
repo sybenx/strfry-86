@@ -50,9 +50,13 @@ function s86FormatDate(unixSeconds) {
   return iso.slice(0, 10) + '@' + iso.slice(11, 16) + ' UTC';
 }
 
-function s86NpubLink(npub) {
+// npub is always the display text. When isAdmin and hex is known, the link
+// goes to this relay's own profile page instead of njump — the admin has
+// a strictly more useful place to look. Logged out (or hex unavailable),
+// njump remains the only place to look, exactly as before.
+function s86NpubLink(npub, hex, isAdmin) {
   var a = document.createElement('a');
-  a.href = 'https://njump.me/' + npub;
+  a.href = (isAdmin && hex) ? ('/profile?hex=' + hex) : ('https://njump.me/' + npub);
   a.target = '_blank';
   a.textContent = npub;
   return a;

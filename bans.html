@@ -12,7 +12,7 @@ li { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>strfry-86</h1>
-<p><a href="/authors">active authors →</a></p>
+<p id="authors-nav-link" style="display:none"><a href="/authors">active authors →</a></p>
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
 <p id="name-status-line" style="display:none"></p>
@@ -51,6 +51,7 @@ var attemptedThisSession = new Set();
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
+var authorsNavLink = document.getElementById('authors-nav-link');
 var nameStatusEl = document.getElementById('name-status-line');
 var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
@@ -117,7 +118,7 @@ function renderBans(banned) {
     }
     li.appendChild(nip05Span);
 
-    li.appendChild(s86NpubLink(ban.npub));
+    li.appendChild(s86NpubLink(ban.npub, ban.pubkey, isAdmin));
 
     var dateEl = document.createElement('i');
     dateEl.textContent = s86FormatDate(ban.banned_at);
@@ -252,6 +253,7 @@ function renderNameStatusLine() {
 
 function onLogin() {
   isAdmin = true;
+  authorsNavLink.style.display = '';
   profileEntryContainer.style.display = '';
   commandBlockContainer.style.display = '';
   adminControls.style.display = '';
