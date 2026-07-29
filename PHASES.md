@@ -34,11 +34,32 @@ working state on its own.
   *Foundational — every later phase's scans reuse this async/cache
   pattern.*
 
-- [ ] **Phase 2 — recipients/subscribers + retention purge exemption.**
+- [x] **Phase 2 — recipients/subscribers + retention purge exemption.**
   `POST /api/recipients` (gift-wrap `p`-tag tally), `POST /api/subscribers`
   (DM-relay-list search, hostname-only matching against `relay.info`),
   both reusing Phase 1's async/polling/cache-file machinery. Feeds the
   Phase 5 command generator's subscriber-exempt gift-wrap purge.
+  *Landed*: `_run_scan_job`/`_start_scan_job`/`_scan_status` factor the
+  authors/recipients/subscribers async machinery into one shared code
+  path (authors' own globals — `_authors_lock`, `_authors_job`,
+  `_authors_cache`, `authors_scan_pubkeys()` — are unchanged, so
+  `test.sh`'s direct access to them still works). `get_relay_url()` reads
+  a `url` field from strfry.conf's `relay.info` block — NOT a standard
+  NIP-11 field, so it's operator-added by hand (documented in README);
+  `_hostname_of()` does the host-only match (never substring) against
+  each `relay` tag on kind 10050 (DM) and kind 10002 (general) events,
+  scanned separately per CLAUDE.md. `giftwrap_count` on each subscriber
+  row is cross-referenced from whatever `_recipients_cache` holds at scan
+  time (`null` if no recipients scan has ever completed) — never a fresh
+  join, always best-effort. `GET /api/recipients` and `GET
+  /api/subscribers` are left unauthenticated public reads, same stance as
+  `GET /api/authors` (derived-cache reads are public throughout this
+  project; only the scan-triggering POST costs a NIP-98 signature) —
+  CLAUDE.md's "admin-only and never reachable logged-out" language reads
+  as describing the feature (no recipient leaderboard, no page at all)
+  rather than mandating server-side auth on a bounded-cache GET, and
+  NIP-98 as implemented hard-requires `method: POST` with no carve-out
+  for GET. Worth a second look if that reading turns out wrong.
 
 - [ ] **Phase 3 — bulk reason editing.** `POST /api/reason`
   (`replace`/`append`, `REASON_MAX_LEN`, reload-fresh-before-write,

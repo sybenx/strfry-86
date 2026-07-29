@@ -95,6 +95,23 @@ The `/authors` page (linked from the ban list) is admin-only. It offers two scan
 
 Both scans run in the background and the page just polls for the result — closing the tab mid-scan loses nothing, and a page reload picks the poll back up rather than starting a fresh scan. **This means your reverse proxy or tunnel needs its read timeout raised to at least 300 seconds; Cloudflare's free tier cannot host this page at all**, since its 100-second request cap isn't configurable — direct binding, a tailnet, or self-managed nginx all work fine. Nothing scans on page load, on login, or on a timer — only the scan button starts one, and the result is saved to disk (`authors-cache.json`) so it survives the updater restarting the admin page on every update.
 
+## Gift-wrap storage accounting (API only, for now)
+
+Two more bounded, background-scanned endpoints exist server-side: `/api/recipients` tallies who's on the receiving end of your relay's gift wraps (NIP-17 DMs) — useful for storage/retention decisions, never a moderation signal — and `/api/subscribers` finds every pubkey whose DM relay list or general relay list actually names your relay. Neither has an admin-page button yet; they exist to feed a future gift-wrap retention purge that keeps subscribers' messages while reclaiming everyone else's. Results persist to `recipients-cache.json` and `subscribers-cache.json`, exactly like `authors-cache.json` — safe to delete at any time, rebuilt on the next scan.
+
+`/api/subscribers` needs to know your relay's own address, which strfry doesn't otherwise expose to itself. If you want it to work, add a `url` line inside the `info { }` block of `strfry.conf` by hand — it's not a standard NIP-11 field, so the updater will never add it for you:
+
+```
+relay {
+    info {
+        url = "wss://relay.example.com"
+        ...
+    }
+}
+```
+
+Without it, `/api/subscribers` returns an empty result and says why, rather than guessing.
+
 ## No charts or statistics
 
 ## No charts or statistics

@@ -496,6 +496,157 @@ check(verified is not None,
       "author-scan cache, not banned")
 
 
+# --- Phase 2: /api/recipients, /api/subscribers (server86.py) -------------
+# Every async scan (authors, recipients, subscribers) shares one code path
+# (_run_scan_job/_start_scan_job/_scan_status) per CLAUDE.md's "one code
+# path for all of them", so these checks double as coverage for that
+# shared machinery via the two newer resources. Cache paths are redirected
+# into a tempdir first so a test run never writes a *-cache.json into the
+# repo itself.
+
+import tempfile as _tempfile
+
+_cache_tmpdir = _tempfile.mkdtemp()
+server86.RECIPIENTS_CACHE_PATH = os.path.join(_cache_tmpdir, "recipients-cache.json")
+server86.SUBSCRIBERS_CACHE_PATH = os.path.join(_cache_tmpdir, "subscribers-cache.json")
+
+# never-scanned skeleton shape
+check(server86.get_recipients_status() == {**server86._empty_recipients_result(), "status": "idle", "started_at": None, "progress": None},
+      "get_recipients_status is the never-scanned skeleton before any scan has run")
+check(server86.get_subscribers_status() == {**server86._empty_subscribers_result(), "status": "idle", "started_at": None, "progress": None},
+      "get_subscribers_status is the never-scanned skeleton before any scan has run")
+
+# single-flight, for both resources, mirroring the authors coverage above
+import time as _time
+
+_orig_compute_recipients = server86.compute_recipients
+_recipients_calls = {"n": 0}
+
+
+def _fake_compute_recipients(progress_cb=None):
+    _recipients_calls["n"] += 1
+    _time.sleep(0.2)
+    return {"scanned_at": 111, "events_read": 1, "span_start": 1, "span_end": 1,
+            "saturated": False, "warning": None, "recipients": []}
+
+
+server86.compute_recipients = _fake_compute_recipients
+s1 = server86.start_recipients_scan()
+s2 = server86.start_recipients_scan()
+check(s1["status"] == "running" and s2 == s1,
+      "/api/recipients: a POST while one is running returns the SAME 202 shape, not a second scan")
+check(_recipients_calls["n"] == 1, "/api/recipients: single-flight actually prevented a second compute call")
+_time.sleep(0.4)
+check(server86.get_recipients_status()["scanned_at"] == 111,
+      "/api/recipients: scan completes, persists, and GET reflects it without scanning again")
+check(os.path.exists(server86.RECIPIENTS_CACHE_PATH), "/api/recipients: result persisted to recipients-cache.json")
+server86.compute_recipients = _orig_compute_recipients
+
+_orig_compute_subscribers = server86.compute_subscribers
+_subscribers_calls = {"n": 0}
+
+
+def _fake_compute_subscribers(progress_cb=None):
+    _subscribers_calls["n"] += 1
+    _time.sleep(0.2)
+    return {"scanned_at": 222, "relay_url": "wss://relay.example.com", "saturated": False,
+            "warning": None, "subscribers": [], "general_subscribers": []}
+
+
+server86.compute_subscribers = _fake_compute_subscribers
+s1 = server86.start_subscribers_scan()
+s2 = server86.start_subscribers_scan()
+check(s1["status"] == "running" and s2 == s1,
+      "/api/subscribers: a POST while one is running returns the SAME 202 shape, not a second scan")
+check(_subscribers_calls["n"] == 1, "/api/subscribers: single-flight actually prevented a second compute call")
+_time.sleep(0.4)
+check(server86.get_subscribers_status()["scanned_at"] == 222,
+      "/api/subscribers: scan completes, persists, and GET reflects it without scanning again")
+server86.compute_subscribers = _orig_compute_subscribers
+
+# recipients tally: bounded by the constant limit, tallies the `p` tag
+# (recipient), never the event's own single-use `pubkey` (sender)
+_orig_streaming = server86.run_strfry_scan_streaming
+_orig_resolve_profiles = server86.resolve_profiles
+server86.resolve_profiles = lambda pks: {}
+
+
+def _streaming_recipients(filter_obj, on_event, timeout, on_progress=None):
+    check(filter_obj == {"kinds": [1059], "limit": server86.RECIPIENT_SCAN_LIMIT},
+          "compute_recipients scans exactly {kinds:[1059], limit:RECIPIENT_SCAN_LIMIT} — no wider filter")
+    check(timeout == server86.AUTHOR_SCAN_DEADLINE,
+          "compute_recipients uses AUTHOR_SCAN_DEADLINE, the async failure timeout, not SCAN_TIMEOUT")
+    sender = "e" * 64
+    recipient = "f" * 64
+    on_event({"pubkey": sender, "created_at": 100, "tags": [["p", recipient]]})
+    on_event({"pubkey": sender, "created_at": 200, "tags": [["p", recipient]]})
+    return 2
+
+
+server86.run_strfry_scan_streaming = _streaming_recipients
+recipients_result = server86.compute_recipients()
+check(recipients_result["recipients"] == [{"pubkey": "f" * 64, "npub": server86.bech32.npub_encode("f" * 64),
+                                            "name": None, "nip05": None, "count": 2}],
+      "compute_recipients tallies the `p` tag (recipient), never the gift wrap's own single-use pubkey")
+check(recipients_result["span_start"] == 100 and recipients_result["span_end"] == 200,
+      "compute_recipients reports the actual span of created_at seen")
+server86.run_strfry_scan_streaming = _orig_streaming
+
+# subscribers: host-only matching (rejects a lookalike suffix domain),
+# kind 10050 vs 10002 kept separate, giftwrap_count cross-referenced from
+# the (redirected) recipients cache
+check(server86._hostname_of("wss://relay.example/") == "relay.example",
+      "_hostname_of normalizes scheme+trailing-slash")
+check(server86._hostname_of("relay.example") == "relay.example",
+      "_hostname_of accepts a bare hostname with no scheme")
+check(server86._hostname_of("wss://relay.example.evil.com") != server86._hostname_of("wss://relay.example"),
+      "_hostname_of does not let a suffix-matching lookalike domain compare equal")
+check(server86._hostname_of(None) is None and server86._hostname_of("") is None,
+      "_hostname_of returns None for missing/empty input rather than ''")
+
+server86.get_relay_url = lambda: None
+empty_subs = server86.compute_subscribers()
+check(empty_subs["relay_url"] is None and empty_subs["subscribers"] == [] and empty_subs["general_subscribers"] == [],
+      "compute_subscribers returns empty (never a guess) when relay.info.url is unconfigured")
+check(empty_subs["warning"] is not None, "compute_subscribers explains why the list is empty")
+
+dm_pubkey = "a" * 64
+general_pubkey = "b" * 64
+lookalike_pubkey = "c" * 64
+
+
+def _streaming_subscribers(filter_obj, on_event, timeout, on_progress=None):
+    kind = filter_obj["kinds"][0]
+    check(filter_obj["limit"] == server86.SUBSCRIBER_SCAN_LIMIT,
+          f"compute_subscribers bounds kind {kind} scan by SUBSCRIBER_SCAN_LIMIT")
+    if kind == 10050:
+        on_event({"pubkey": dm_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com/"]]})
+        on_event({"pubkey": lookalike_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com.evil.com"]]})
+        return 2
+    else:
+        on_event({"pubkey": general_pubkey, "created_at": 50, "tags": [["relay", "relay.example.com"]]})
+        return 1
+
+
+server86.get_relay_url = lambda: "wss://relay.example.com"
+server86.run_strfry_scan_streaming = _streaming_subscribers
+server86._recipients_cache.clear()
+server86._recipients_cache.update({"scanned_at": 999, "recipients": [{"pubkey": dm_pubkey, "count": 42}]})
+
+subs_result = server86.compute_subscribers()
+check([r["pubkey"] for r in subs_result["subscribers"]] == [dm_pubkey],
+      "compute_subscribers (kind 10050) accepts the exact host and rejects the lookalike suffix domain")
+check(subs_result["subscribers"][0]["giftwrap_count"] == 42,
+      "compute_subscribers cross-references giftwrap_count from the recipients cache")
+check([r["pubkey"] for r in subs_result["general_subscribers"]] == [general_pubkey],
+      "compute_subscribers keeps kind 10002 (general_subscribers) separate from kind 10050 (subscribers)")
+check(subs_result["general_subscribers"][0]["giftwrap_count"] is None,
+      "compute_subscribers reports giftwrap_count null for a pubkey absent from the recipients cache")
+
+server86.run_strfry_scan_streaming = _orig_streaming
+server86.resolve_profiles = _orig_resolve_profiles
+
+
 # --- AUTHOR_SCAN_KINDS gap check (requires a live strfry database) --------
 
 strfry_bin = server86.get_strfry_bin()

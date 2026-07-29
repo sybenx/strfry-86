@@ -12,6 +12,10 @@ Routes:
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
   POST /api/authors/scan  -> NIP-98 authenticated: run exactly one bounded scan
+  GET  /api/recipients    -> public read of the last gift-wrap recipient tally (never scans)
+  POST /api/recipients    -> NIP-98 authenticated: run exactly one bounded scan
+  GET  /api/subscribers   -> public read of the last DM/general relay-list search (never scans)
+  POST /api/subscribers   -> NIP-98 authenticated: run exactly one bounded scan
   POST /api/unban         -> NIP-98 authenticated unban
   POST /api/ban           -> NIP-98 authenticated manual ban
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
@@ -21,6 +25,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +43,8 @@ from lib86 import bech32, bip340, blacklist, namecache  # noqa: E402
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 STRFRY_CONF_PATH = "/config/strfry.conf"
 AUTHORS_CACHE_PATH = os.path.join(SCRIPT_DIR, "authors-cache.json")
+RECIPIENTS_CACHE_PATH = os.path.join(SCRIPT_DIR, "recipients-cache.json")
+SUBSCRIBERS_CACHE_PATH = os.path.join(SCRIPT_DIR, "subscribers-cache.json")
 # dockurr/strfry ships the binary at /app/strfry, which is NOT on PATH for a
 # detached process; the official image installs to /usr/local/bin.
 STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry")
@@ -105,7 +112,7 @@ _relay_cwd_path = None
 # scan, which then runs in a background thread so the request never blocks.
 _authors_lock = threading.Lock()
 _authors_job = {"status": "idle", "mode": None, "started_at": None, "progress": None}
-# _authors_cache is initialized after _load_authors_cache() is defined below.
+# _authors_cache is initialized after _load_cache_or()/_empty_authors_result() are defined below.
 
 CONTACT_APPEAL_CHECK_INTERVAL = 1.0
 _contact_appeal_cache = ""
@@ -466,6 +473,103 @@ def _resolve_profiles_locally(pubkeys):
     return {pk: ({"name": cached[pk]["name"], "nip05": cached[pk]["nip05"]} if pk in cached else miss) for pk in pubkeys}
 
 
+# --- generic async scan job machinery -------------------------------------
+# Shared by every asynchronous scan (author list, gift-wrap recipients,
+# DM/general-relay-list subscribers): validate auth, start ONE bounded scan
+# in a background thread, return 202 immediately, and let the page poll the
+# matching GET until status returns to idle. One code path for all three —
+# not a fast one and a slow one that behave differently under failure.
+#
+# Each resource still owns its own lock/job/cache module globals (so a
+# stalled recipients scan can never block an author-scan poll, and so
+# direct access like `server86._authors_lock` / `server86._authors_cache`
+# keeps working), but every one of them runs through the three functions
+# below. `job` and `cache` are mutated IN PLACE rather than rebound to a
+# new dict, so the caller's module-level dict object — the thing readers
+# actually hold a reference to — is always what gets updated.
+
+def _save_cache_atomic(path, result):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _load_cache_or(path, empty_result):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return dict(empty_result)
+
+
+def _run_scan_job(name, lock, job, cache, cache_path, compute_fn):
+    """Background-thread body for one async scan. `compute_fn(progress_cb)`
+    returns the result dict on success. On failure the previous cache is
+    preserved (mutated with a `warning` attached) and NEVER replaced with
+    a partial result — a scan that hit its deadline is an error, not a
+    smaller answer."""
+    def progress_cb(count):
+        with lock:
+            job["progress"] = count
+
+    try:
+        result = compute_fn(progress_cb)
+    except Exception as e:
+        warning = f"{name} scan failed: {type(e).__name__}: {e}"[:600]
+        log(f"server86: {warning}")
+        with lock:
+            cache["warning"] = warning
+            job["status"] = "idle"
+            job["progress"] = None
+        return
+
+    try:
+        _save_cache_atomic(cache_path, result)
+    except OSError as e:
+        log(f"server86: failed to persist {os.path.basename(cache_path)}: {e}")
+
+    with lock:
+        cache.clear()
+        cache.update(result)
+        job["status"] = "idle"
+        job["progress"] = None
+
+
+def _start_scan_job(lock, job, run_target, extra_job_fields=None):
+    """Single-flight: a POST while one is already running does NOT start a
+    second scan and does NOT 409 — it returns the SAME 202 shape the
+    original POST returned, so a POST-then-GET from one client never
+    observes a state its own POST couldn't have produced."""
+    with lock:
+        if job["status"] == "running":
+            return dict(job)
+        job.clear()
+        job.update({"status": "running", "started_at": int(time.time()), "progress": 0})
+        if extra_job_fields:
+            job.update(extra_job_fields)
+        status = dict(job)
+
+    threading.Thread(target=run_target, daemon=True).start()
+    return status
+
+
+def _scan_status(lock, job, cache):
+    """GET handler body: never scans, never starts one. Merges the live
+    job status over the last persisted result, so status/progress always
+    reflect what's happening now and every other field reflects the last
+    completed scan (or the never-scanned skeleton)."""
+    with lock:
+        status = dict(job)
+        cached = dict(cache)
+    cached.update(status)
+    return cached
+
+
 def compute_authors(mode, progress_cb=None):
     """One bounded scan of AUTHOR_SCAN_MODES[mode], tallied per author and
     per kind while streaming — no list of event bodies is ever held in
@@ -608,94 +712,23 @@ def _empty_authors_result():
     }
 
 
-def _load_authors_cache():
-    try:
-        with open(AUTHORS_CACHE_PATH, "r") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (OSError, ValueError):
-        pass
-    return _empty_authors_result()
-
-
-def _save_authors_cache(result):
-    """authors-cache.json is a DERIVED cache — never in the manifest, never
-    operator-owned, safe to delete at any time, rewritten wholesale. It
-    exists because the updater kills and respawns server86 on every
-    update, and an in-memory-only ~2-minute scan result would otherwise
-    vanish on a schedule the operator doesn't control."""
-    tmp_path = AUTHORS_CACHE_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp_path, AUTHORS_CACHE_PATH)
-
-
-_authors_cache = _load_authors_cache()
-
-
-def _run_authors_scan_job(mode):
-    global _authors_cache
-
-    def progress_cb(count):
-        with _authors_lock:
-            _authors_job["progress"] = count
-
-    try:
-        result = compute_authors(mode, progress_cb=progress_cb)
-    except Exception as e:
-        warning = f"author scan failed: {type(e).__name__}: {e}"[:600]
-        log(f"server86: {warning}")
-        with _authors_lock:
-            stale = dict(_authors_cache)
-            stale["warning"] = warning
-            _authors_cache = stale
-            _authors_job["status"] = "idle"
-            _authors_job["progress"] = None
-        return
-
-    try:
-        _save_authors_cache(result)
-    except OSError as e:
-        log(f"server86: failed to persist authors-cache.json: {e}")
-
-    with _authors_lock:
-        _authors_cache = result
-        _authors_job["status"] = "idle"
-        _authors_job["progress"] = None
+_authors_cache = _load_cache_or(AUTHORS_CACHE_PATH, _empty_authors_result())
 
 
 def start_authors_scan(mode):
     """Start one bounded author scan in a background thread if none is
-    already running — never blocks the request. A POST while one is
-    already running returns the SAME status shape the original POST
-    returned rather than a 409, so POST-then-GET from the same client
-    never observes a state its own POST couldn't have produced."""
-    with _authors_lock:
-        if _authors_job["status"] == "running":
-            return dict(_authors_job)
-        _authors_job["status"] = "running"
-        _authors_job["mode"] = mode
-        _authors_job["started_at"] = int(time.time())
-        _authors_job["progress"] = 0
-        status = dict(_authors_job)
-
-    thread = threading.Thread(target=_run_authors_scan_job, args=(mode,), daemon=True)
-    thread.start()
-    return status
+    already running — never blocks the request."""
+    def run():
+        _run_scan_job(
+            "author", _authors_lock, _authors_job, _authors_cache, AUTHORS_CACHE_PATH,
+            lambda progress_cb: compute_authors(mode, progress_cb=progress_cb),
+        )
+    return _start_scan_job(_authors_lock, _authors_job, run, extra_job_fields={"mode": mode})
 
 
 def get_authors_status():
-    """GET /api/authors: never scans, never starts one. Merges the live
-    job status over the last persisted result, so `status`/`progress`
-    always reflect what's happening now and every other field reflects
-    the last completed scan (or the never-scanned skeleton)."""
-    with _authors_lock:
-        status = dict(_authors_job)
-        cached = dict(_authors_cache)
-    cached.update(status)
-    return cached
+    """GET /api/authors: never scans, never starts one."""
+    return _scan_status(_authors_lock, _authors_job, _authors_cache)
 
 
 def authors_scan_pubkeys():
@@ -705,6 +738,299 @@ def authors_scan_pubkeys():
     with _authors_lock:
         cached = _authors_cache
     return {a["pubkey"] for a in cached.get("authors", [])}
+
+
+# --- gift-wrap recipient tally ---------------------------------------------
+# Storage accounting, not moderation: kind 1059 (gift wraps) is the bulk of
+# a DM-carrying relay's disk, and the unencrypted `p` tag says who each one
+# is addressed to. GET /api/recipients is left as an unauthenticated public
+# read, exactly like GET /api/authors / GET /api/banned — the "admin-only"
+# framing in CLAUDE.md describes the feature (no recipient leaderboard, no
+# UI on any logged-out page — there is no recipients.html at all), not a
+# server-side auth requirement on a read of an already-bounded cache. Only
+# the scan-triggering POST costs a NIP-98 signature.
+
+def _empty_recipients_result():
+    return {
+        "scanned_at": None, "events_read": 0, "span_start": None, "span_end": None,
+        "saturated": False, "warning": None, "recipients": [],
+    }
+
+
+def compute_recipients(progress_cb=None):
+    """One bounded scan of the newest RECIPIENT_SCAN_LIMIT gift-wrap
+    events, tallying the `p` tag — the wrapped message's recipient, never
+    the event's `pubkey`, which is a fresh single-use sender key — while
+    streaming, so no event body is ever held in full. Gift-wrap CONTENT is
+    encrypted and senders are unlinkable; nothing here reveals who is
+    talking to whom, and recipient counts are for retention/capacity
+    decisions only, never a moderation signal."""
+    tally = {}
+    span = {"start": None, "end": None}
+
+    def on_event(ev):
+        if not isinstance(ev, dict):
+            return
+        created_at = ev.get("created_at")
+        tags = ev.get("tags")
+        if not isinstance(created_at, int) or not isinstance(tags, list):
+            return
+        recipient = get_tag(tags, "p")
+        if isinstance(recipient, str) and is_hex64(recipient):
+            tally[recipient] = tally.get(recipient, 0) + 1
+        if span["start"] is None or created_at < span["start"]:
+            span["start"] = created_at
+        if span["end"] is None or created_at > span["end"]:
+            span["end"] = created_at
+
+    events_read = run_strfry_scan_streaming(
+        {"kinds": [1059], "limit": RECIPIENT_SCAN_LIMIT}, on_event,
+        timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb,
+    )
+    saturated = events_read >= RECIPIENT_SCAN_LIMIT
+
+    rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
+    to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
+    try:
+        profiles = resolve_profiles(to_resolve)
+    except Exception as e:
+        log(f"server86: recipient name resolution failed: {e}")
+        profiles = {}
+
+    recipients = []
+    for pk, count in rows:
+        try:
+            npub = bech32.npub_encode(pk)
+        except (ValueError, TypeError):
+            continue
+        profile = profiles.get(pk) or {}
+        recipients.append({
+            "pubkey": pk, "npub": npub,
+            "name": profile.get("name"), "nip05": profile.get("nip05"),
+            "count": count,
+        })
+
+    return {
+        "scanned_at": int(time.time()),
+        "events_read": events_read,
+        "span_start": span["start"],
+        "span_end": span["end"],
+        "saturated": saturated,
+        "warning": None,
+        "recipients": recipients,
+    }
+
+
+_recipients_lock = threading.Lock()
+_recipients_job = {"status": "idle", "started_at": None, "progress": None}
+_recipients_cache = _load_cache_or(RECIPIENTS_CACHE_PATH, _empty_recipients_result())
+
+
+def start_recipients_scan():
+    def run():
+        _run_scan_job(
+            "recipients", _recipients_lock, _recipients_job, _recipients_cache,
+            RECIPIENTS_CACHE_PATH, compute_recipients,
+        )
+    return _start_scan_job(_recipients_lock, _recipients_job, run)
+
+
+def get_recipients_status():
+    return _scan_status(_recipients_lock, _recipients_job, _recipients_cache)
+
+
+# --- DM / general relay-list subscriber search -----------------------------
+# Who lists THIS relay in a NIP-17 DM relay list (kind 10050) or a general
+# relay list (kind 10002) — the retention-purge exemption (Phase 5) reads
+# this to avoid deleting the gift wraps of people who explicitly asked this
+# relay to hold them. Kept separate from recipients: a subscriber published
+# a signed event announcing this relay is their inbox, which is itself
+# public data and discloses nothing new.
+
+def _empty_subscribers_result():
+    return {
+        "scanned_at": None, "relay_url": None, "saturated": False, "warning": None,
+        "subscribers": [], "general_subscribers": [],
+    }
+
+
+def _hostname_of(value):
+    """Host-only parse, tolerant of a missing scheme (a bare 'relay.example'
+    is valid for both the config value and a kind-10050/10002 'relay' tag).
+    Returns None on anything unparseable or empty so a missing relay_url
+    and a malformed tag never accidentally compare equal via two empty
+    strings. Substring matching on the raw tag was rejected deliberately —
+    it would match 'relay.example.evil.com' against 'relay.example'."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = "//" + value
+    host = urlparse(value).hostname
+    return host.lower() if host else None
+
+
+_relay_url_cache = None
+_relay_url_mtime = None
+_relay_url_last_checked = None
+
+
+def get_relay_url():
+    """Best-effort read of a `url` field inside strfry.conf's `relay.info`
+    block. This is NOT a standard NIP-11 field — strfry ships only
+    name/description/pubkey/contact/icon/nips there — so it is absent
+    unless the operator adds it by hand (documented in README); callers
+    treat None as 'unconfigured' and return empty rather than guessing.
+    Re-read on strfry.conf mtime change, checked at most once per second,
+    same shape as get_contact_appeal()."""
+    global _relay_url_cache, _relay_url_mtime, _relay_url_last_checked
+    now = time.monotonic()
+    if _relay_url_last_checked is not None and (now - _relay_url_last_checked) < CONTACT_APPEAL_CHECK_INTERVAL:
+        return _relay_url_cache
+    _relay_url_last_checked = now
+    try:
+        mtime = os.stat(STRFRY_CONF_PATH).st_mtime
+    except OSError:
+        return _relay_url_cache
+    if mtime == _relay_url_mtime:
+        return _relay_url_cache
+    _relay_url_mtime = mtime
+    try:
+        with open(STRFRY_CONF_PATH, "r") as f:
+            lines = f.readlines()
+    except OSError:
+        return _relay_url_cache
+
+    in_info = False
+    depth = 0
+    url = None
+    for line in lines:
+        if line.strip().startswith("#"):
+            continue
+        if not in_info:
+            if re.match(r'^\s*info\s*\{', line):
+                in_info = True
+                depth = line.count("{") - line.count("}")
+            continue
+        depth += line.count("{") - line.count("}")
+        m = re.search(r'\burl\s*=\s*"([^"]*)"', line)
+        if m and m.group(1).strip():
+            url = m.group(1).strip()
+            break
+        if depth <= 0:
+            in_info = False
+    _relay_url_cache = url
+    return url
+
+
+def compute_subscribers(progress_cb=None):
+    """Two bounded scans, kept separate: kind 10050 (NIP-17 DM relay lists)
+    and kind 10002 (general relay lists) — a pubkey listing this relay for
+    general use is a different relationship from one listing it for DMs.
+    Each is capped at SUBSCRIBER_SCAN_LIMIT and matched host-only against
+    get_relay_url(). If that is unconfigured, returns empty rather than
+    guessing: this result feeds a destructive retention-purge exemption
+    (Phase 5), so a silently-empty subscriber list must never be mistaken
+    for 'nobody subscribes'."""
+    relay_url = get_relay_url()
+    relay_host = _hostname_of(relay_url)
+    if relay_host is None:
+        return {
+            "scanned_at": int(time.time()),
+            "relay_url": None,
+            "saturated": False,
+            "warning": "relay.info.url is not set in strfry.conf — cannot match subscriber relay lists",
+            "subscribers": [],
+            "general_subscribers": [],
+        }
+
+    def scan_kind(kind):
+        tally = {}  # pubkey -> latest created_at among matching events
+
+        def on_event(ev):
+            if not isinstance(ev, dict):
+                return
+            pk = ev.get("pubkey")
+            created_at = ev.get("created_at")
+            tags = ev.get("tags")
+            if not is_hex64(pk) or not isinstance(created_at, int) or not isinstance(tags, list):
+                return
+            matched = any(
+                isinstance(tag, list) and len(tag) >= 2 and tag[0] == "relay"
+                and _hostname_of(tag[1]) == relay_host
+                for tag in tags
+            )
+            if not matched:
+                return
+            if pk not in tally or created_at > tally[pk]:
+                tally[pk] = created_at
+
+        events_read = run_strfry_scan_streaming(
+            {"kinds": [kind], "limit": SUBSCRIBER_SCAN_LIMIT}, on_event,
+            timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb,
+        )
+        return tally, events_read >= SUBSCRIBER_SCAN_LIMIT
+
+    dm_tally, dm_saturated = scan_kind(10050)
+    general_tally, general_saturated = scan_kind(10002)
+
+    # giftwrap_count cross-references the last COMPLETED recipients scan,
+    # which may be older than this scan or (giftwrap_count: null) may never
+    # have run at all — never presented as a fresh number.
+    recipients_ever_scanned = _recipients_cache.get("scanned_at") is not None
+    recipient_counts = {r["pubkey"]: r["count"] for r in _recipients_cache.get("recipients", [])}
+
+    def build_rows(tally):
+        rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
+        to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
+        try:
+            profiles = resolve_profiles(to_resolve)
+        except Exception as e:
+            log(f"server86: subscriber name resolution failed: {e}")
+            profiles = {}
+        out = []
+        for pk, listed_at in rows:
+            try:
+                npub = bech32.npub_encode(pk)
+            except (ValueError, TypeError):
+                continue
+            profile = profiles.get(pk) or {}
+            out.append({
+                "pubkey": pk, "npub": npub,
+                "name": profile.get("name"), "nip05": profile.get("nip05"),
+                "listed_at": listed_at,
+                "giftwrap_count": recipient_counts.get(pk) if recipients_ever_scanned else None,
+            })
+        return out
+
+    return {
+        "scanned_at": int(time.time()),
+        "relay_url": relay_url,
+        "saturated": dm_saturated or general_saturated,
+        "warning": None,
+        "subscribers": build_rows(dm_tally),
+        "general_subscribers": build_rows(general_tally),
+    }
+
+
+_subscribers_lock = threading.Lock()
+_subscribers_job = {"status": "idle", "started_at": None, "progress": None}
+_subscribers_cache = _load_cache_or(SUBSCRIBERS_CACHE_PATH, _empty_subscribers_result())
+
+
+def start_subscribers_scan():
+    def run():
+        _run_scan_job(
+            "subscribers", _subscribers_lock, _subscribers_job, _subscribers_cache,
+            SUBSCRIBERS_CACHE_PATH, compute_subscribers,
+        )
+    return _start_scan_job(_subscribers_lock, _subscribers_job, run)
+
+
+def get_subscribers_status():
+    return _scan_status(_subscribers_lock, _subscribers_job, _subscribers_cache)
 
 
 def validate_authors_scan_mode(body):
@@ -910,11 +1236,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_authors_status())
             return
 
+        if path == "/api/recipients":
+            self._send_json(200, get_recipients_status())
+            return
+
+        if path == "/api/subscribers":
+            self._send_json(200, get_subscribers_status())
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/api/unban", "/api/ban", "/api/authors/scan", "/api/names"):
+        if path not in (
+            "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
+            "/api/recipients", "/api/subscribers",
+        ):
             self._send_json(404, {"error": "not found"})
             return
 
@@ -947,6 +1284,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": err})
                 return
             status = start_authors_scan(mode)
+            self._send_json(202, status)
+            return
+
+        if path == "/api/recipients":
+            status = start_recipients_scan()
+            self._send_json(202, status)
+            return
+
+        if path == "/api/subscribers":
+            status = start_subscribers_scan()
             self._send_json(202, status)
             return
 
