@@ -176,6 +176,10 @@ function s86BuildProfileEntryField(statusEl) {
   var input = document.createElement('input');
   input.type = 'search';
   input.placeholder = 'npub or hex — view a pubkey\'s profile';
+  // size is an HTML attribute, not a CSS rule, so it doesn't touch the
+  // locked per-page <style> block — plain enough for the placeholder to
+  // read in full instead of clipping at the browser default ~20 chars.
+  input.size = 40;
 
   var btn = document.createElement('button');
   btn.type = 'button';
@@ -1073,6 +1077,70 @@ function s86BuildRecordDetailList(entries) {
   return ul;
 }
 
+// Inline "set reason" row for a ban/report record line: one text input
+// (prefilled with the current reason, empty if none) and one button,
+// disabled while the input is empty — same disable rule as the bulk-reason
+// row on bans.html, since an empty reason submitted from a row with no
+// checkbox concept would otherwise silently no-op. Posts /api/reason in
+// 'replace' mode for exactly the pubkeys this record concerns (the single
+// subject, or the whole bulk-ban group sharing one reason input already),
+// then records a normal 'reason' undo entry — reusing the existing
+// mechanism rather than inventing a second way to undo a reason change.
+function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
+  var p = document.createElement('p');
+
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentReason || '';
+  input.placeholder = 'reason — shown publicly';
+  input.maxLength = 500;
+
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = 'Set reason';
+  var label = 'set reason on ' + (pubkeys.length === 1 ? 'this ban' : pubkeys.length + ' bans');
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+  btn.disabled = input.value.trim().length === 0;
+
+  input.addEventListener('input', function () {
+    btn.disabled = input.value.trim().length === 0;
+  });
+
+  btn.addEventListener('click', function () {
+    btn.disabled = true;
+    s86SignAndPost('/api/reason', { pubkeys: pubkeys, reason: input.value, mode: 'replace' })
+      .then(function (result) {
+        if (!result.ok) {
+          btn.disabled = false;
+          if (callbacks.onError) callbacks.onError('set reason failed: ' + s86ErrMsg(result));
+          return;
+        }
+        var updated = result.body.updated;
+        if (updated.length > 0) {
+          s86AddRecord({
+            type: 'reason',
+            at: Date.now(),
+            count: updated.length,
+            entries: updated.length <= S86_REASON_UNDO_MAX
+              ? updated.map(function (u) { return { pubkey: u.pubkey, old_reason: u.old_reason }; })
+              : null
+          });
+        }
+        if (callbacks.onChanged) callbacks.onChanged();
+      })
+      .catch(function () {
+        btn.disabled = false;
+        if (callbacks.onError) callbacks.onError('set reason failed');
+      });
+  });
+
+  p.appendChild(input);
+  p.appendChild(document.createTextNode(' '));
+  p.appendChild(btn);
+  return p;
+}
+
 // parts: {verb, name, nip05, suffix, npub, entries} — see
 // s86RecordLabelParts. npub is omitted (no trailing element at all) when
 // null. `entries` (2+ pubkeys) replaces that omitted npub with a third
@@ -1083,7 +1151,13 @@ function s86BuildRecordDetailList(entries) {
 // unavailable" case, once its snapshot exceeds S86_REASON_UNDO_MAX) omits
 // the Undo button entirely rather than rendering one that can't work. A
 // truncated undo is worse than none.
-function s86BuildRecordLine(parts, onUndo, onDismiss) {
+//
+// reasonEdit is optional: {pubkeys, currentReason, callbacks}. When present
+// (ban and report records only — never unban or reason records), renders
+// the inline reason row from s86BuildReasonEditRow as a second row below
+// the line, exactly like the expand-arrow detail list, so it never disturbs
+// the main line's fixed dismiss/label/Undo/npub ordering.
+function s86BuildRecordLine(parts, onUndo, onDismiss, reasonEdit) {
   var wrap = document.createElement('div');
   var line = document.createElement('p');
 
@@ -1135,6 +1209,10 @@ function s86BuildRecordLine(parts, onUndo, onDismiss) {
       expandBtn.setAttribute('aria-label', expandBtn.title);
     });
     wrap.appendChild(detail);
+  }
+
+  if (reasonEdit) {
+    wrap.appendChild(s86BuildReasonEditRow(reasonEdit.pubkeys, reasonEdit.currentReason, reasonEdit.callbacks));
   }
 
   return wrap;
@@ -1301,13 +1379,19 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
     if (l.kind === 'stored') {
       var record = l.ref;
       var canUndo = !(record.type === 'reason' && !record.entries);
+      var reasonEdit = record.type === 'ban' ? {
+        pubkeys: record.entries.map(function (e) { return e.pubkey; }),
+        currentReason: (record.entries[0] && record.entries[0].reason) || '',
+        callbacks: callbacks
+      } : null;
       var line = s86BuildRecordLine(
         s86RecordLabelParts(record),
         canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
         function () {
           s86RemoveStoredRecord(record.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        }
+        },
+        reasonEdit
       );
       container.appendChild(line);
     } else {
@@ -1326,7 +1410,8 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         function () {
           s86DismissReport(l.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        }
+        },
+        { pubkeys: [ban.pubkey], currentReason: ban.reason || '', callbacks: callbacks }
       );
       container.appendChild(line);
     }
