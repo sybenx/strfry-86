@@ -33,6 +33,7 @@ DEPLOYABLE_FILES = [
     "authors.html",
     "profile.html",
     "domain.html",
+    "report.html",
     "common86.js",
     "lib86/__init__.py",
     "lib86/bip340.py",

@@ -12,7 +12,7 @@ li { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>strfry-86 — active authors</h1>
-<p><a href="/">← ban list</a></p>
+<p><a href="/">← ban list</a> · <a href="/report">relay report</a></p>
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
@@ -350,10 +350,15 @@ function stopPolling() {
 function applyAuthorsStatus(data) {
   lastAuthorsResult = data;
   var running = data.status === 'running';
-  document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) { r.disabled = running; });
-  scanBtn.disabled = running;
-  if (running) {
-    provenanceLine.textContent = 'scanning… ' + (data.progress || 0) + ' events read';
+  var blocked = !!data.blocked_by;
+  document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) { r.disabled = running || blocked; });
+  scanBtn.disabled = running || blocked;
+  if (running || blocked) {
+    // Same shared status-line wording report.html's panels use — a
+    // scanning line means the same thing everywhere it's read, and a
+    // blocked button says which OTHER job it's waiting on rather than
+    // just sitting dead.
+    provenanceLine.textContent = s86ScanStatusText(data);
     compositionLine.textContent = '';
   } else {
     renderProvenance(data);

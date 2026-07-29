@@ -11,7 +11,7 @@ How it works, end to end:
 3. A stdlib web server (`server86.py`) serves four bare HTML pages: the public ban list, the author list, a single-pubkey profile, and a domain roster. The admin logs in with a NIP-07 extension; every privileged action is authorized per-request with a NIP-98 signed event — no sessions.
 4. A single self-contained installer/updater (`strfry-86-updater.py`) handles first install, config, strfry.conf rewrite, and all future updates, run via one `docker exec` command.
 
-**No charts, no graphs, no history reporting, and no sweep that the admin did not press a button for.** The scans that exist return tallies rendered as plain text lines. Anything larger than what those bounded scans cover — a whole-database walk, or anything destructive — is emitted as a copyable `strfry` command for the operator to run in a terminal, where a ten-minute operation is visible, interruptible, and harmless. server86 has no delete endpoint of any kind.
+**No charts, no graphs, no history reporting, and no sweep that the admin did not press a button for.** Every scan in this project — including the whole-database walk — returns tallies rendered as plain text lines, is started by a labelled button, and stores exactly ONE latest result that is replaced wholesale. Nothing accumulates a series. What remains a copyable `strfry` command for the operator to run in a terminal is everything DESTRUCTIVE, without exception: server86 has no delete endpoint of any kind and never will.
 
 ## Hard environment constraints (do not violate)
 
@@ -21,13 +21,19 @@ How it works, end to end:
 - **`plugin86.py` writes nothing but protocol JSON to stdout** (stderr for all logging) and never crashes on bad input — a dead plugin can wedge the relay.
 - Only the admin pubkey can ban (via kind 1984, or manually via NIP-98 `/api/ban`) or unban (via NIP-98). No other trust roots.
 - The admin pubkey can never end up in the blacklist (silent no-op on any attempt).
-- **Every scan that can exceed ~10 seconds runs ASYNCHRONOUSLY and is polled; it is never held open inside an HTTP request.** `POST /api/authors/scan`, `POST /api/recipients`, and `POST /api/subscribers` validate auth, start ONE bounded scan in a background thread, and return `202 {"status": "running", "started_at": <unix>}` immediately. The page polls the matching `GET` every few seconds until `status` returns to `idle`, then renders the persisted result. One code path for all of them — not a fast one and a slow one that behave differently under failure.
+- **Every scan that can exceed ~10 seconds runs ASYNCHRONOUSLY and is polled; it is never held open inside an HTTP request.** `POST /api/authors/scan`, `POST /api/recipients`, `POST /api/subscribers`, `POST /api/report/totals`, and `POST /api/report/walk` validate auth, start ONE scan in a background thread, and return `202 {"status": "running", "started_at": <unix>}` immediately. The page polls the matching `GET` every few seconds until `status` returns to `idle`, then renders the persisted result. One code path for all of them — not a fast one and a slow one that behave differently under failure.
 
-  **This does not weaken the no-background-work rule; read that rule precisely.** What it forbids is UNREQUESTED and UNBOUNDED work — a scan on a timer, on page load, or because a cache went stale. A scan the admin pressed a labelled button to start, bounded before it was issued by mechanism 1 or 2, does not become unrequested merely because the HTTP response returned before it finished. The button is still the only thing that starts it, the single-flight lock still permits exactly one at a time, and `AUTHOR_SCAN_DEADLINE` still terminates it. Nothing may start a scan except an authenticated press; a `GET` that finds no cache returns empty and starts nothing, forever.
+  **This does not weaken the no-background-work rule; read that rule precisely.** What it forbids is UNREQUESTED and UNBOUNDED work — a scan on a timer, on page load, or because a cache went stale. A scan the admin pressed a labelled button to start, bounded before it was issued by mechanism 1 or 2, does not become unrequested merely because the HTTP response returned before it finished. The button is still the only thing that starts it, the global scan lock still permits exactly one at a time across the whole server, and a deadline still terminates it. Nothing may start a scan except an authenticated press; a `GET` that finds no cache returns empty and starts nothing, forever.
 
-  Why it is worth the thread: the full author scan runs past two minutes, and no HTTP request should be held open that long by anything. Polling means no request lasts more than a second and closing the tab mid-scan costs nothing, because the result persists. The status must be visible while running — `scanning… 412,000 events read` — since a progress line is the only thing distinguishing a running scan from a broken button.
+  Why it is worth the thread: the full author scan runs past two minutes, and no HTTP request should be held open that long by anything. Polling means no request lasts more than a second and closing the tab mid-scan costs nothing, because the result persists. The status must be visible while running — `scanning… 412,000 of 2,628,121 events (16%) — ~7 min left` — since a progress line is the only thing distinguishing a running scan from a broken button.
 
-- **Every expensive scan result is persisted; every cheap one is recomputed.** The threshold is roughly ten seconds: if a scan can exceed it, its result is written to a `<name>-cache.json` in `/config/strfry86/` and reloaded at startup. This is not an optimisation, it is a correctness rule about a specific failure — **the updater kills and respawns server86 after every successful update**, so an in-memory-only result is destroyed on a schedule the operator does not control, and the page then reports "no scan yet" for work the operator deliberately paid two minutes for. Today that covers `authors-cache.json`, `recipients-cache.json`, and `subscribers-cache.json`; `names.json` already worked this way. Sub-second lookups — `/api/banned` name resolution, `/api/profile`, `/api/pubkeys/lookup` — are recomputed and must not grow cache files.
+- **ONE global scan lock, not one per endpoint.** Every asynchronous scan in the project takes the same lock. Three buttons sitting on one page is an invitation to run three walks concurrently against the same LMDB and the same disk, which is slower than running them in series, competes with the live relay for I/O, and destroys the throughput measurement that every progress estimate depends on — a rate measured under self-contention is not a rate.
+
+  While the lock is held, every other scan `POST` returns `202` with the RUNNING JOB'S status rather than starting anything, exactly as a second POST to the same endpoint does today. Every scan `GET` additionally returns `blocked_by: "<job name>" | null`, so a single poll on any endpoint tells the page the state of the whole server and every affected button can disable itself and say which job it is waiting on. Silence about the lock would render as a dead button.
+
+  **A deadline is a FAILURE timeout whose real job is releasing this lock.** It bounds nothing — line-50 reasoning is unchanged — but a hung subprocess with no deadline holds the lock forever, and since there is no cancel control anywhere in this design, that disables every scan in the deployment until the operator restarts the container, with nothing on any page explaining why. Every job therefore has a deadline; hitting one kills the subprocess, releases the lock, preserves the previous cache, and records a `warning`.
+
+- **Every expensive scan result is persisted; every cheap one is recomputed.** The threshold is roughly ten seconds: if a scan can exceed it, its result is written to a `<name>-cache.json` in `/config/strfry86/` and reloaded at startup. This is not an optimisation, it is a correctness rule about a specific failure — **the updater kills and respawns server86 after every successful update**, so an in-memory-only result is destroyed on a schedule the operator does not control, and the page then reports "no scan yet" for work the operator deliberately paid two minutes for. Today that covers `authors-cache.json`, `recipients-cache.json`, `subscribers-cache.json`, and `report-cache.json`; `names.json` already worked this way. Sub-second lookups — `/api/banned` name resolution, `/api/profile`, `/api/pubkeys/lookup` — are recomputed and must not grow cache files.
 
   Three rules for every one of them: they are DERIVED, never operator-owned — absent from the manifest, absent from the bundle, safe to delete at any moment, and rewritten wholesale rather than merged. They store `scanned_at` verbatim and every page renders the AGE alongside the data, because a persisted result silently presented as current is worse than no result. And they are written atomically (`.tmp` + `os.replace`) like everything else here.
 
@@ -47,7 +53,11 @@ How it works, end to end:
 
   Nothing else counts as a bound — not `since`/`until`, which bound the time range but not the result size, and not "it is probably small." A scan whose result size is not knowable in advance from a constant or a finite list must not be issued at all.
 
-  **A wall-clock deadline is NOT a bound, and the attempt to make it one was tried and rejected.** A whole-database option (`limit: 0`, `scan '{}'`) was specified and then killed by measurement: an unlimited body-streaming scan runs past four minutes, so it would have returned a deadline-truncated partial on every press. And `limit` is verified to return the NEWEST events while the traversal order of an UNLIMITED scan is specified nowhere — so a truncated `{}` scan yields an arbitrary slice in unknown order, possibly the oldest events in the database, presented as a survey of the relay. Deadlines remain FAILURE timeouts (`SCAN_TIMEOUT`, `AUTHOR_SCAN_DEADLINE`); a scan that hits one is an ERROR that preserves the previous cache, never a result.
+  **A wall-clock deadline is NOT a bound, and the attempt to make it one was tried and rejected.** A whole-database AUTHOR LIST (`limit: 0`, `scan '{}'`) was specified and then killed by measurement: an unlimited body-streaming scan runs past four minutes, so it would have returned a deadline-truncated partial on every press. And `limit` is verified to return the NEWEST events while the traversal order of an UNLIMITED scan is specified nowhere — so a truncated `{}` scan yields an arbitrary slice in unknown order, possibly the oldest events in the database, presented as a survey of the relay. Deadlines remain FAILURE timeouts (`SCAN_TIMEOUT`, `AUTHOR_SCAN_DEADLINE`, `REPORT_WALK_DEADLINE`); a scan that hits one is an ERROR that preserves the previous cache, never a result.
+
+  **`POST /api/report/walk` is the ONE unlimited scan in the project, and it is admissible only because it is all-or-nothing.** It reads `scan '{}'` for aggregate figures — a distinct-author count and a per-kind histogram — and never for a list, a row, or anything an operator acts on. The reasoning above is what makes it safe rather than what forbids it: because a truncated walk is an unknown subset rather than a smaller window, the walk NEVER renders a partial. It completes and replaces its result, or it hits `REPORT_WALK_DEADLINE` and changes nothing. There is no third outcome and no `partial` field, here or anywhere.
+
+  This is a genuine exception to "every scan is bounded before it is issued," and it is the only one. It is granted because the output is four numbers rather than an enumeration, because the operator pressed a button that stated the cost, and because the alternative — the histogram as a nine-minute terminal command — was measurably a command nobody ran, which left `AUTHOR_SCAN_KINDS` unaudited on every relay in existence. Nothing else may cite this paragraph; a scan producing rows is bounded or it does not happen.
 
 ## Repo layout
 
@@ -64,7 +74,8 @@ bans.html              # public ban list page, served at /
 authors.html           # admin-only active-author page, served at /authors
 profile.html           # admin-only single-pubkey detail page, served at /profile
 domain.html            # admin-only nip-05 domain roster page, served at /domain
-common86.js            # shared client code for all four pages
+report.html            # admin-only cached-scan results page, served at /report
+common86.js            # shared client code for all five pages
 manifest.json          # sha256 of every deployable file, consumed by the updater
 strfry86-bundle.tar.gz # all deployable files + manifest, for offline (no-network-container) installs
 tools/make_bundle.py   # regenerates manifest.json AND strfry86-bundle.tar.gz; run before every release commit
@@ -84,6 +95,7 @@ Deployed layout inside the container (created by the updater):
   authors.html
   profile.html
   domain.html
+  report.html
   common86.js
   manifest.json
   config.json        # OPERATOR-OWNED: admin pubkey (hex), port, bind, contact_appeal. Never in manifest; the updater may only ADD a missing key, never change an existing value.
@@ -91,6 +103,7 @@ Deployed layout inside the container (created by the updater):
   authors-cache.json     # DERIVED CACHE: last author-scan result, verbatim.
   recipients-cache.json  # DERIVED CACHE: last gift-wrap recipient tally.
   subscribers-cache.json # DERIVED CACHE: last DM-relay-list search.
+  report-cache.json      # DERIVED CACHE: relay totals + whole-database walk, two records, separate ages.
   names.json         # DERIVED CACHE: pubkey -> name/nip05/checked_at/source, for pubkeys that are NOT banned.
 ```
 
@@ -182,6 +195,9 @@ AUTHOR_SCAN_MODES      = {       # selectable by NAME only; the request never su
     "full":   {"kinds": AUTHOR_SCAN_KINDS, "limit": AUTHOR_SCAN_FULL_LIMIT},
 }
 AUTHOR_SCAN_DEADLINE   = 240     # seconds; a FAILURE timeout for the async scans, not a bound
+REPORT_WALK_DEADLINE   = 1800    # seconds; FAILURE timeout for the one unlimited scan (see below)
+REPORT_AUTHOR_KEY_BYTES = 8      # bytes of pubkey retained per distinct author during the walk
+RATE_SMOOTHING_WINDOW  = 10      # seconds of history the live throughput estimate averages over
 REASON_MAX_LEN         = 500     # characters accepted for a ban reason
 REASON_UNDO_MAX        = 50      # entries whose prior reasons are snapshotted for undo
 RECIPIENT_SCAN_LIMIT   = 250000  # newest kind-1059 events tallied for storage accounting
@@ -197,11 +213,13 @@ DOMAIN_LOOKUP_MAX      = 1000    # pubkeys accepted in one /api/pubkeys/lookup b
 RENDER_MAX             = 500     # list rows rendered client-side before truncation
 ```
 
-`AUTHOR_SCAN_DEADLINE` bounds the three asynchronous scans (`/api/authors/scan`, `/api/recipients`, `/api/subscribers`). `SCAN_TIMEOUT` bounds every synchronous one: the `/api/banned` name lookup, the three `/api/profile` subprocesses, and the `/api/pubkeys/lookup` name scan.
+`AUTHOR_SCAN_DEADLINE` is the failure timeout for four of the asynchronous scans (`/api/authors/scan`, `/api/recipients`, `/api/subscribers`, `/api/report/totals`). `REPORT_WALK_DEADLINE` covers the fifth, `/api/report/walk`, and is far larger because it is the only unlimited scan and because hitting it costs two figures rather than a whole result. `SCAN_TIMEOUT` bounds every synchronous one: the `/api/banned` name lookup, the three `/api/profile` subprocesses, and the `/api/pubkeys/lookup` name scan.
+
+`REPORT_WALK_DEADLINE` is 1800 because at the measured ~4,814 events/sec that is roughly a 9,000,000-event relay — comfortably past the ~1,500,000 non-gift-wrap ceiling this design admits to elsewhere, so the walk keeps working long after `full` mode has had to become something else.
 
 ### Routes
 
-- **Static routes are an explicit allowlist**, never a filesystem path join: `/` → `bans.html`, `/authors` → `authors.html`, `/profile` → `profile.html`, `/domain` → `domain.html`, `/common86.js` → `common86.js` (`Content-Type: application/javascript`). Match on the PATH ONLY, with any query string stripped before matching and never otherwise inspected server-side — `/profile?npub=…` and `/domain?d=…` serve the identical static bytes to every requester, and the parameter is read by the page's own JavaScript from `location.search`. Anything else 404s. There is no directory serving and no path derived from the request, so path traversal is not mitigated here — it is impossible. `config.json`, `blacklist.json`, `names.json`, and the three `*-cache.json` files sit in the same directory and must never be reachable over HTTP.
+- **Static routes are an explicit allowlist**, never a filesystem path join: `/` → `bans.html`, `/authors` → `authors.html`, `/profile` → `profile.html`, `/domain` → `domain.html`, `/report` → `report.html`, `/common86.js` → `common86.js` (`Content-Type: application/javascript`). Match on the PATH ONLY, with any query string stripped before matching and never otherwise inspected server-side — `/profile?npub=…` and `/domain?d=…` serve the identical static bytes to every requester, and the parameter is read by the page's own JavaScript from `location.search`. Anything else 404s. There is no directory serving and no path derived from the request, so path traversal is not mitigated here — it is impossible. `config.json`, `blacklist.json`, `names.json`, and the four `*-cache.json` files sit in the same directory and must never be reachable over HTTP.
 
 - `GET /api/banned` → `{"admin": "<hex>", "contact_appeal": "<string>", "banned": [{"pubkey", "npub", "banned_at", "reason", "report_type", "report_event_id", "name", "nip05", "name_checked_at"}]}`. `report_event_id` is the id of the admin's kind-1984 report that caused the ban (null for manual bans) — already-public event data, and it lets the page derive the report record lines. Public read is fine. `contact_appeal` is echoed verbatim from `config.json`, or `""` if the key is absent, null, or not a string — this endpoint must never 500 over a hand-edited config. Re-read it from `config.json` on mtime change (the same once-per-second check `lib86/blacklist.py` uses) so a hand-edit takes effect on the next page load without restarting anything.
 
@@ -258,11 +276,11 @@ Shape: `{"<hex>": {"name": <str|null>, "nip05": <str|null>, "checked_at": <unix>
 
   **`full` is complete until it saturates, and must announce the transition.** When the scan returns exactly `AUTHOR_SCAN_FULL_LIMIT` results, the relay has outgrown the constant: the result is now a newest-first window. Set `saturated: true`, and the page must switch its own language from "all authors" to "the most recent 1,500,000 events of these kinds."
 
-  **`full` is complete only for enumerated kinds.** Nostr filters cannot express "not kind 1059," so `AUTHOR_SCAN_KINDS` is a hand-maintained allowlist and an event of an unlisted kind is invisible to this scan. The page therefore says "all moderation kinds," never "everything"; true completeness is a command block (`scan '{}'`) and deliberately not a page.
+  **`full` is complete only for enumerated kinds.** Nostr filters cannot express "not kind 1059," so `AUTHOR_SCAN_KINDS` is a hand-maintained allowlist and an event of an unlisted kind is invisible to this scan. The page therefore says "all moderation kinds," never "everything." What the allowlist is missing is answered by `/api/report/walk`, which is where whole-database truth lives — as four aggregate numbers, never as a list.
 
   **Streaming and memory.** Read stdout line by line, take `pubkey`, `kind`, and `created_at`, discard the parsed event immediately; never accumulate event bodies, never hold more than one line at a time. The accumulated state is two dicts — per-pubkey `{count, last_seen}` and per-kind counts — both bounded by distinct pubkeys and kinds rather than by events read. Memory stays flat at any limit; the limit constant is what bounds the time.
 
-  **Any scan that streams event bodies tallies everything cheap in the same pass.** Parsing a line to read `pubkey` already costs the parse; taking `kind` from the same object and folding it into a dict costs one more lookup. So no scan in this project reads events and reports only the one number it was asked for: `full` and `recent` both return `kinds` and `singleton_kinds` alongside the author tally, and the command generator's histogram intent returns the total event count, the per-kind histogram, the distinct-author count, and the gift-wrap share from ONE pass.
+  **Any scan that streams event bodies tallies everything cheap in the same pass.** Parsing a line to read `pubkey` already costs the parse; taking `kind` from the same object and folding it into a dict costs one more lookup. So no scan in this project reads events and reports only the one number it was asked for: `full` and `recent` both return `kinds` and `singleton_kinds` alongside the author tally, and `/api/report/walk` returns the per-kind histogram, the unlisted-kind breakdown, and the distinct-author count from ONE pass.
 
   **Deadline is a failure, not a result.** A scan still reading at `AUTHOR_SCAN_DEADLINE` terminates the subprocess, DISCARDS what it read, preserves the previous cache, and returns `warning: "scan exceeded 240s in mode full — nothing changed"`. It must never return the partial tally: the traversal order of a truncated scan is not guaranteed to be the newest-first order `limit` provides, so a partial tally is not a smaller window but an unknown one, and rendering it under a provenance line that claims a span would be a lie the page cannot detect. There is no `partial` field anywhere in this design; the only truncation the API reports is `saturated`, which is honest because the window it describes is the newest-first one `limit` guarantees. If an operator hits the deadline repeatedly, the answer is `recent` mode or a terminal command, not a longer deadline.
 
@@ -276,7 +294,7 @@ Shape: `{"<hex>": {"name": <str|null>, "nip05": <str|null>, "checked_at": <unix>
 
   **`singleton_kinds`** counts, per kind, the authors whose FINAL tally is exactly 1 — computed in one pass over the per-pubkey dict after the read, costing nothing.
 
-  **What this list is**: in `recent` mode, the authors among the newest 20,000 events — a window, never everyone. In `full` mode, every author of every `AUTHOR_SCAN_KINDS` event in the database, until `saturated` says otherwise. Neither mode covers gift-wrap authors, by design. The question "who has ever posted anything at all, including kind 1059" remains a terminal command.
+  **What this list is**: in `recent` mode, the authors among the newest 20,000 events — a window, never everyone. In `full` mode, every author of every `AUTHOR_SCAN_KINDS` event in the database, until `saturated` says otherwise. Neither mode covers gift-wrap authors, by design. HOW MANY distinct authors exist across the entire database, gift wraps included, is answered by `/api/report/walk`; enumerating them as a list remains a terminal command, and should stay one.
 
 - `POST /api/recipients` → body `{"auth": <signed nostr event>}`. NIP-98 admin auth. Storage accounting for gift wraps: scans `{"kinds":[1059],"limit":RECIPIENT_SCAN_LIMIT}` and tallies the `p` tag of each event, returning `{"scanned_at", "events_read", "span_start", "span_end", "saturated", "recipients": [{"pubkey", "npub", "name", "nip05", "count"}]}`, sorted by count descending. Same async path, single-flight lock, deadline, persistence, and name resolution as the author scan; `GET /api/recipients` serves the cache and never scans.
 
@@ -293,6 +311,28 @@ Shape: `{"<hex>": {"name": <str|null>, "nip05": <str|null>, "checked_at": <unix>
   This result is an INPUT TO A DESTRUCTIVE COMMAND — the retention purge exempts exactly these pubkeys — so it must never be silently empty because a restart cleared it. An empty list would generate a purge command that deletes the DMs of every subscriber, the single worst outcome this document is trying to prevent. **When the cache is absent or older than 7 days, the purge generator refuses to emit the subscriber-exempt form and says why.**
 
   This is public data — these pubkeys published a signed event specifically to announce that this relay is their DM inbox — so surfacing it discloses nothing.
+
+- `POST /api/report/totals` → body `{"auth": <signed nostr event>}`. NIP-98 admin auth. Four `scan --count` calls, no event bodies, seconds even on a large relay: `{}`, `{"kinds":[1059]}`, `{"kinds": AUTHOR_SCAN_KINDS}`, and nothing else — the fourth figure is arithmetic. Returns `{"scanned_at", "duration", "total_events", "giftwrap_events", "giftwrap_share", "allowlist_events", "gap_events", "gap_share", "warning"}`.
+
+  `gap_events = total_events − allowlist_events − giftwrap_events` and `gap_share = gap_events / (total_events − giftwrap_events)`. **These numbers are EXACT.** They come from the index, there is no window, no `limit`, and therefore no `saturated` field to render — the one place in this project where a count is simply a count.
+
+  **It is asynchronous despite being fast**, and this is deliberate: one code path for every scan, so nothing behaves differently under failure because it happened to be quick. It takes the same global lock, persists the same way, and is polled the same way.
+
+  **`gap_share` is the allowlist audit, promoted from a release step to a number on a page.** It is the only thing that can detect `AUTHOR_SCAN_KINDS` going stale, its failure mode is silent (authors quietly stop appearing in a list the UI calls complete), and until now it existed only inside `test.sh` — which this document admits has never been run against real data. Above `2%` the page must say the allowlist is stale, in words, and point at the walk for the composition.
+
+- `POST /api/report/walk` → body `{"auth": <signed nostr event>}`. NIP-98 admin auth. **The one unlimited scan in the project** (see the carve-out under the bounding rules). Runs `scan --count '{}'` first to establish the denominator, then streams `scan '{}'` in full, and returns `{"scanned_at", "duration", "rate", "events_read", "distinct_authors", "kinds": {"<kind>": <count>}, "unlisted_kinds": {"<kind>": <count>}, "warning"}`.
+
+  - **`unlisted_kinds` is the whole point.** Counting can tell you the SIZE of the allowlist gap; only reading events can tell you its COMPOSITION, because Nostr filters have neither negation nor group-by. This is what found kind 2003 sitting at 258,290 events — more numerous than every kind-1 note on the reference relay — with its authors entirely invisible to the author list. `unlisted_kinds` is every kind seen that is in neither `AUTHOR_SCAN_KINDS` nor `{1059}`, and it is read as a to-do list for the tuple.
+  - **The `--count` it runs first refreshes the totals record as a byproduct.** The denominator is the same number `/api/report/totals` produces, so the walk writes both records rather than computing one twice.
+  - **All or nothing.** On reaching `REPORT_WALK_DEADLINE` it kills the subprocess, discards everything read, preserves the previous walk record, releases the lock, and sets `warning`. The totals record is untouched and stays exact — which is the entire reason the two are separate records with separate `scanned_at` stamps and separate buttons. A relay too large to walk still gets its totals and its gap alarm, forever, instead of a report that fails whole and says nothing.
+
+  **Memory: distinct authors are stored as `REPORT_AUTHOR_KEY_BYTES` binary prefixes, and gift-wrap authors are not stored at all.** This is the one scan whose distinct-pubkey set is NOT small — on a DM-carrying relay it approaches the event count, and a set of 2.6M 64-char hex strings is several hundred MB inside the operator's live relay container. Two measures: kind 1059 is skipped entirely, because NIP-17 gift wraps are signed by a fresh key per message by specification, so their distinct-author count IS their event count and is already known exactly from the `--count`; and every other author is folded in as `bytes.fromhex(pubkey)[:8]`. Over a million authors the 64-bit collision probability is under 3e-8, which is far below the honesty threshold of every other number on the page. Report `distinct_authors` as the two figures summed, and state the gift-wrap component separately, since one is structural and the other is measured.
+
+  Everything else about this endpoint is the shared async path: global lock, `202` on a second press, atomic persistence to `report-cache.json`, `GET` serving the cache and never scanning.
+
+- `GET /api/report` → both records plus live job status, in one response: `{"status": "idle"|"running", "job": "totals"|"walk"|null, "started_at", "progress", "total", "rate", "eta", "blocked_by", "totals": {...}|null, "walk": {...}|null}`. One endpoint for both records because the page renders them together and two polls for one page is two chances to disagree. **Never scans and never starts one**, same stance as `GET /api/authors`.
+
+  **`progress`, `total`, `rate`, and `eta` are computed server-side and are the honest ones.** `total` is the denominator from the `--count`; `rate` is `events_read / elapsed` averaged over the trailing `RATE_SMOOTHING_WINDOW` seconds, not since the start, so it settles quickly instead of drifting; `eta` is `(total − progress) / rate`. Before a rate exists, all four are null and the page says `estimating…` rather than showing a number. **No estimate is ever derived from a constant, a per-GB figure, or the developer's own relay** — throughput here is events per second, event sizes vary by an order of magnitude between a gift wrap and a note, and the only rate that is right on every relay is the one being measured on it right now.
 
 - `POST /api/reason` → body `{"auth": <signed nostr event>, "pubkeys": ["<hex>", ...], "reason": "<string>", "mode": "replace"|"append"}`. NIP-98 admin auth. Sets or extends the `reason` on existing blacklist entries in bulk. Returns `{"ok": true, "updated": [{"pubkey", "old_reason", "new_reason"}, ...], "skipped": [...]}`.
 
@@ -360,7 +400,7 @@ Kind 9735 zap receipts remain the theoretical runner-up for singleton bulk but c
 
 **Gift-wrap share is measured DB-wide, never extrapolated from a window.** On the reference relay 1059 is 88% of the recent 20,000-event sample but 64.8% of the database — the recent share is higher because DM traffic is growing.
 
-### Auditing the allowlist — a required release step, not a suggestion
+### Auditing the allowlist — now a number on a page, and still a release step
 
 `AUTHOR_SCAN_KINDS` is hand-maintained and WILL drift as Nostr adds kinds, and its failure mode is silent: authors simply do not appear, and the page keeps calling the list complete. So the gap is computed, not assumed:
 
@@ -368,7 +408,9 @@ Kind 9735 zap receipts remain the theoretical runner-up for singleton bulk but c
 gap = scan --count '{}'  −  scan --count '{kinds: AUTHOR_SCAN_KINDS}'  −  scan --count '{"kinds":[1059]}'
 ```
 
-All three terms are index counts answered in seconds. **A gap above 2% of the non-giftwrap total means the allowlist is stale**; run the histogram intent in the command generator to identify what is missing and extend the tuple. This check found the original twelve-kind list missing 411,339 events — including kind 2003 (NIP-35 torrents) at 258,290, more numerous than every kind-1 note on the relay, whose authors were entirely invisible.
+All three terms are index counts answered in seconds. This is exactly `POST /api/report/totals`, which is why that endpoint exists: **the check now runs on every operator's relay whenever they press a button, instead of only in a `test.sh` invocation this document admits has never happened against real data.** `test.sh` keeps its assertion — CI catching it before release is still better than an operator catching it after — but the page is what catches drift on relays whose kind mix nobody anticipated.
+
+**A gap above 2% of the non-giftwrap total means the allowlist is stale.** The size is the alarm; the composition comes from `/api/report/walk`'s `unlisted_kinds`, since no count can group by a kind you did not already know to ask about. This check found the original twelve-kind list missing 411,339 events — including kind 2003 (NIP-35 torrents) at 258,290, more numerous than every kind-1 note on the relay, whose authors were entirely invisible.
 
 **A recent-window sample cannot substitute for this.** A kind used heavily two years ago and since abandoned holds its events forever and appears in no recent scan; the 20,000-event sample that seeded the original list showed neither 2003 nor 30166 at meaningful volume. Only a whole-database count can find them.
 
@@ -386,25 +428,29 @@ Required on `/api/unban`, `/api/ban`, `/api/reason`, `/api/authors/scan`, `/api/
 
 No sessions, cookies, or tokens.
 
-## Client pages — `bans.html`, `authors.html`, `profile.html`, `domain.html`, `common86.js`
+## Client pages — `bans.html`, `authors.html`, `profile.html`, `domain.html`, `report.html`, `common86.js`
 
-Four pages. **The rule was never "two pages" — it is that the ban list and the author list must never share a document.** That split is a safety property: the two lists carry destructive controls pointing in OPPOSITE directions — "Unban selected" on one, "Ban selected" on the other — over lists that look identical and share the same filter, select-visible, and live count. On a single page the button you reach after filtering and scrolling depends on which region you are inside, and the failure mode is mass-unbanning people you meant to purge. Separate documents make it structural: `bans.html` has no ban-selected control in its DOM at all.
+Five pages. **The rule was never "two pages" — it is that the ban list and the author list must never share a document.** That split is a safety property: the two lists carry destructive controls pointing in OPPOSITE directions — "Unban selected" on one, "Ban selected" on the other — over lists that look identical and share the same filter, select-visible, and live count. On a single page the button you reach after filtering and scrolling depends on which region you are inside, and the failure mode is mass-unbanning people you meant to purge. Separate documents make it structural: `bans.html` has no ban-selected control in its DOM at all.
 
-`profile.html` and `domain.html` do not touch that rule. Neither is a second copy of an existing list: the profile page has ONE subject and no list at all, and the domain page has a roster that comes from outside the relay and carries a ban control only. A page is admissible when it cannot be confused with another page's list; it is not admissible merely because the content is related.
+`profile.html`, `domain.html`, and `report.html` do not touch that rule. None is a second copy of an existing list: the profile page has ONE subject and no list at all, the domain page has a roster that comes from outside the relay and carries a ban control only, and the report page has no checkbox, no ban control, and no unban control anywhere in its DOM — it is structurally the safest document in the project. A page is admissible when it cannot be confused with another page's list; it is not admissible merely because the content is related.
+
+**The report page therefore never renders a list an operator could act on.** Where it needs to refer to one — the author list in particular — it renders a single sentence and a link, never a copy. A mirrored list is how that safety property gets lost six months from now, quietly, in a commit that looks like a convenience.
 
 Every page carries the identical `<style>` block, the identical login flow, the identical record lines, and the identical command generator. New pages inherit chrome; they never invent it.
 
 ### `common86.js`
 
-Everything the pages share lives in ONE locally-served file, served by server86 from `/common86.js` with `Content-Type: application/javascript`. This is mandatory, not a preference: the duplicated surface would otherwise include NIP-07 login, NIP-98 event construction and signing, the filter, select-visible and its live count, the sort controls, the `textContent` rendering rules, the timestamp formatter, the npub link builder, the profile entry field, the record lines, and the command generator — that is most of the client code and ALL of the security-relevant parts. Two copies of signing logic is how an auth fix lands in one file and not the other. **Anything used on a second page moves into `common86.js` in the same commit that introduces the second use.**
+Everything the pages share lives in ONE locally-served file, served by server86 from `/common86.js` with `Content-Type: application/javascript`. This is mandatory, not a preference: the duplicated surface would otherwise include NIP-07 login, NIP-98 event construction and signing, the filter, select-visible and its live count, the sort controls, the `textContent` rendering rules, the timestamp formatter, the npub link builder, the profile entry field, the record lines, the command generator, and the cached-scan panel — that is most of the client code and ALL of the security-relevant parts. Two copies of signing logic is how an auth fix lands in one file and not the other. **Anything used on a second page moves into `common86.js` in the same commit that introduces the second use.**
 
 This does not breach "no libraries, no CDN": it is the operator's own file, served from the operator's own server, vendored exactly like `lib86/`. It is a deployable file — in `manifest.json`, in the bundle, hash-checked by the updater like everything else.
 
-All four pages are still raw HTML with no framework, no build step, and no bundler. Each page has its own small `<script>` block for page-specific wiring.
+All five pages are still raw HTML with no framework, no build step, and no bundler. Each page has its own small `<script>` block for page-specific wiring.
+
+**The cached-scan panel is one shared component, used five times.** `/api/authors`, `/api/recipients`, `/api/subscribers`, `/api/report/totals`, and `/api/report/walk` are the same behaviour wearing five names: press a labelled button, take the global lock, poll, show progress, persist, render an age. That is a single function taking an endpoint and a renderer — see the panel shape under `report.html`, which `authors.html` also adopts for its scan controls. Five hand-written copies of a polling loop is five places for a status field to be read wrong.
 
 ### Shared chrome (identical on every page)
 
-`<meta name="viewport" content="width=device-width, initial-scale=1">`. One `<style>` block per page, byte-identical across all four, containing ONLY these layout rules — nothing else, browser defaults throughout:
+`<meta name="viewport" content="width=device-width, initial-scale=1">`. One `<style>` block per page, byte-identical across all five, containing ONLY these layout rules — nothing else, browser defaults throughout:
 
 ```css
 body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
@@ -414,7 +460,7 @@ li { overflow-wrap: anywhere; }
 
 The `padding: 0 1em` is REQUIRED — without it, content sits flush against the screen edge on mobile. The `overflow-wrap: anywhere` is REQUIRED — npubs are 63-char unbreakable strings and will overflow the viewport horizontally without it. Do not remove either in the name of minimalism.
 
-- **Cross-page navigation**: plain `<a>` elements directly under the `<h1>`, separated by a bare `·`. `bans.html` and `authors.html` link to each other; `profile.html` and `domain.html` link to both. No nav bar, no styling, no active-state logic, no breadcrumbs, no history manipulation — `location.href` and the browser's own back button are the whole navigation model.
+- **Cross-page navigation**: plain `<a>` elements directly under the `<h1>`, separated by a bare `·`. `bans.html` and `authors.html` link to each other and to `/report`; `profile.html`, `domain.html`, and `report.html` link to all of the others. No nav bar, no styling, no active-state logic, no breadcrumbs, no history manipulation — `location.href` and the browser's own back button are the whole navigation model.
 - **Profile entry field** (admin only, every page, directly above the command generator): one `<input type="search">` accepting an npub or 64-hex pubkey, and a "View profile" button navigating to `/profile?npub=<npub>`. Invalid input sets a plain status line and navigates nowhere. Enter in the field submits it. This is deliberately a typed/pasted entry rather than a link on every row: it keeps npubs copyable as plain text in lists and record lines without turning each one into a touch target.
 - **Login, and why remembering it is safe**: `window.nostr.getPublicKey()` on the "Login with extension" button. A successful match stores the admin pubkey in localStorage and every page reads it on load to decide what to reveal, so navigating between pages does not re-prompt. This grants NOTHING: there are no sessions and no tokens, every privileged action is still individually signed and verified server-side, and a user who hand-edits that localStorage value gets a page full of buttons that all fail at the server. It is a UI hint, not a credential. A "log out" control clears it.
 - **Timestamps**: render unix times as `YYYY-MM-DD@HH:MM UTC` (derive from `toISOString()`, replace the `T` with `@`, drop seconds/milliseconds and the `Z`, append " UTC"), italicized via an `<i>` wrapper. Bold/italic come from semantic tags with browser default styling — no CSS additions.
@@ -425,22 +471,25 @@ The `padding: 0 1em` is REQUIRED — without it, content sits flush against the 
 - **Sort controls** (wherever a list has more than one meaningful order): a plain row of `<button>`s reading `sort: <field> · <field> · …`, the active one wrapped in `<b>`, a second click on the active field reversing direction and appending ` ↑`/` ↓`. Sorting is `array.sort()` over the in-memory result followed by re-appending the existing nodes — no re-fetch, no re-scan, no server round-trip, no table element. Three rules, all safety rather than polish: **re-apply the filter after every re-sort**, **clear the checked set and reset select-visible after every re-sort** (a selection carried across a re-order is the mass-unban failure mode in its purest form), and never sort a list whose rows the user cannot see the sort key for.
 - **`RENDER_MAX`**: no list renders more than `RENDER_MAX` rows. Beyond that, render the first `RENDER_MAX` after sorting, plus a line reading `showing top 500 of 12,481 — filter to narrow`. Truncation happens AFTER sort and filter, so filtering always searches the full result set.
 - **"Copy purge command" button** (admin only, every page with a list): operates on the checked set. Builds `strfry delete --filter '{"authors":["<hex>", ...]}'` and copies it to the clipboard — it does NOT run anything. Bans are forward-looking; deleting a user's existing events is destructive and irreversible, and belongs in a terminal where the command can be read before it is run. Also render the command in a `<pre>` below the button, so the clipboard is a convenience rather than the only path. Disabled with nothing checked. It is NOT absorbed into the command generator, because it operates on the current checked set, which the generator has no access to.
-- **Command generator** (admin only, every page, inside a `<details>`): ONE `<select>` of intents, ONE input that appears only when the selected intent needs one, ONE `<pre>` holding the rendered command, ONE copy button. This replaced a wall of static blocks: nine `<pre>`s stop being read, and a command block nobody reads is worse than absent, because the terminal is where this project sends everything it refuses to do itself.
+- **Command generator** (admin only, every page, inside a `<details>` labelled `terminal commands (destructive)`): ONE `<select>` of intents, a FIELD SET that changes with the selection, ONE `<pre>` holding the rendered command, ONE copy button. This replaced a wall of static blocks: nine `<pre>`s stop being read, and a command block nobody reads is worse than absent, because the terminal is where this project sends everything it refuses to do itself.
 
-  | Intent | Input |
-  |---|---|
-  | Count all events | — |
-  | Whole-database report: total, kind histogram, author count, gift-wrap share (~9 min) | — |
-  | Event kinds by author | pubkey |
-  | Delete all events by author | pubkey |
-  | Gift-wrap retention purge | days (default 90) |
-  | Who lists this relay as their DM inbox | — |
-  | Fetch a domain's nostr.json | domain |
+  **The generator is now almost entirely destructive, and the label says so.** Every non-destructive intent it used to carry is a button somewhere else: `Count all events` and `Whole-database report` are `/api/report/*`; `Who lists this relay as their DM inbox` is `/api/subscribers`; `Fetch a domain's nostr.json` is what `domain.html` does in the browser. Each of those was a second implementation of a question the software already answered, and a command block duplicating a working button is how the block goes stale without anyone noticing.
+
+  | Intent | Fields | Destructive |
+  |---|---|---|
+  | Delete all events by author | pubkey; older than (days, blank = all time); kind (optional) | yes |
+  | Gift-wrap retention purge | older than (days, default 90); exempt subscribers (checkbox) | yes |
+  | Event kinds by author, lifetime | pubkey | no |
+
+  `Event kinds by author, lifetime` is the one survivor, kept because it is not a duplicate: `/api/profile` reports the kind tally over the most recent `PROFILE_EVENT_LIMIT` events, and this is the whole-history version. The profile page says so where it renders the bounded one.
 
   Rules:
-  - **Never substitute unvalidated text into a rendered command.** A pubkey is decoded and re-encoded to canonical hex before it reaches the `<pre>`; a domain is hostname-validated; days is an integer. Nothing here executes, but a moderation tool that renders whatever it is handed teaches a habit that is wrong everywhere else.
+  - **Fields are typed, and the type is validated before substitution.** Each intent declares a list of fields, each with a declared type (`pubkey`, `int`, `hostname`, `kind`) and a default. A pubkey is decoded and re-encoded to canonical hex before it reaches the `<pre>`; days is an integer; a kind is an integer, offered as a `<datalist>` of known kinds for convenience but never restricted to it. Nothing here executes, but a moderation tool that renders whatever it is handed teaches a habit that is wrong everywhere else.
   - **Destructive intents render their test first.** When the selection is a `delete`, render the equivalent `scan --count` line with the IDENTICAL filter directly above it, labelled as the count. The operator sees how many events the command destroys before copying the command that destroys them. This is not optional.
-  - The gift-wrap purge renders the subscriber-exempt form whenever `/api/recipients` and `/api/subscribers` have both been run this session, with the blanket form below it and visibly blunter. If the subscriber cache is absent or older than 7 days, it refuses the exempt form and says why.
+  - **The count line and the command are generated TOGETHER, on every field change, always.** With mutable fields the count goes stale the instant a number changes, and a count sitting above a filter it no longer describes is worse than no count at all. They are one render or they are blank; there is no code path that produces one without the other.
+  - **Time bounds resolve at render time, never as a relative expression.** `older than 90 days` becomes `"until": <now − 90*86400>` as a literal integer, so the copied command means the same thing an hour later as it did in the clipboard — and it means slightly LESS deletion, which is the correct direction to be wrong in.
+  - **A blank time field is a louder state, not a quieter one.** Blank renders the unbounded filter, which is legitimate, but an empty input reads as "no opinion" while meaning "everything" — so the label next to the `<pre>` must change to say `no time bound — this deletes every matching event, all time` whenever the field is empty.
+  - The gift-wrap purge renders the subscriber-exempt form whenever both the recipients and subscribers CACHES are present and the subscriber one is under 7 days old, with the blanket form below it and visibly blunter. Cache-based, not session-based: the results are server-side now, so an admin who ran the scans yesterday from a different browser gets the exempt form today. If the subscriber cache is absent or stale, it refuses the exempt form and says why, per the rule under `/api/subscribers`.
   - Nothing here is executed, nothing is fetched, no output ever returns to the page.
 
   **Flags blurb**, four plain lines above the generator, because these four facts explain every command it emits: `--config` is mandatory or strfry reads the wrong database; `--count` returns a number without streaming event bodies, which is why counting is seconds and the histogram is minutes; `scan` reads and `delete` destroys while taking the SAME filter syntax, so any filter can and should be tested with `scan --count` before being run with `delete`; and a filter is one shell argument in single quotes, so its inner quotes are never escaped.
@@ -473,7 +522,7 @@ Public. For everyone, this page loads the ban list and whatever names the server
 
 Page order is fixed, top to bottom, with ALL non-list UI above the list so controls stay reachable when the list is thousands of entries long:
 
-1. `<h1>strfry-86</h1>`, then the links to `/authors` and `/domain`
+1. `<h1>strfry-86</h1>`, then the links to `/authors`, `/report`, and `/domain`
 2. "Login with extension" button (plus its status text: "this key is not the admin" / "a NIP-07 extension is required"), then the name-resolution status line (admin only, present only when the flow ran this page-load)
 3. Profile entry field (admin only, hidden until login)
 4. Command generator (`<details>`, admin only, hidden until login)
@@ -507,7 +556,7 @@ Page order is fixed, top to bottom, with ALL non-list UI above the list so contr
 
 Admin only. Find who is currently posting, and ban them in bulk.
 
-1. `<h1>strfry-86 — active authors</h1>`, then the links to `/` and `/domain`
+1. `<h1>strfry-86 — active authors</h1>`, then the links to `/`, `/report`, and `/domain`
 2. "Login with extension" button and status text
 3. Profile entry field
 4. Command generator (`<details>`)
@@ -521,7 +570,8 @@ Admin only. Find who is currently posting, and ban them in bulk.
 
 - **Logged out**: heading, navigation links, and the login button only. No list, no scan control, no filter — nothing that could start work or leak a list. There is no public view of this page.
 - **Scan mode selector**: two radio buttons, not a dropdown, because the two modes answer different questions rather than offering more of the same thing — `recent activity (newest 20,000 events, all kinds)` and `full author list (every note, reaction, report and profile — excludes DMs, ~2 minutes)`. The page posts the MODE NAME, never a number or a filter. The scan button's label restates the selection before the press: `build full author list (~2 minutes — you can close this tab)`. **The reassurance is the point**: the result persists server-side and the page only polls for it, so an admin who navigates away loses nothing, and telling them so is what stops them watching a progress line for two minutes.
-- **Polling**: while `status` is `running`, disable both scan buttons, poll the `GET` every 3 seconds, and render `scanning… <progress> events read` as plain text where the provenance line will go. On reaching `idle`, render the result normally. A page loaded fresh into a running scan picks up the same polling from the same status field — there is no client-side job state, so nothing to lose or desynchronise. If a poll fails, keep polling and say `connection lost — still scanning` rather than declaring failure; the scan is server-side and unaffected by the browser. When a `full` result comes back `saturated`, the page's own wording drops the word "full" everywhere it appears. Nothing scans on page load, on login, or on a timer.
+- **Scan controls use the shared cached-scan panel** defined under `report.html` — same button-then-status-then-result shape, same age rendering, same progress line, same global lock handling. The author scan keeps its own page because its result is an ACTIONABLE list with a "Ban selected" control, which is exactly what the report page must not hold; only the chrome is shared.
+- **Polling**: while `status` is `running`, disable both scan buttons, poll the `GET` every 3 seconds, and render the shared progress line as plain text where the provenance line will go. On reaching `idle`, render the result normally. A page loaded fresh into a running scan picks up the same polling from the same status field — there is no client-side job state, so nothing to lose or desynchronise. If a poll fails, keep polling and say `connection lost — still scanning` rather than declaring failure; the scan is server-side and unaffected by the browser. When `blocked_by` is non-null, both scan buttons disable and say which job they are waiting on — a button that is dead for a reason must state the reason. When a `full` result comes back `saturated`, the page's own wording drops the word "full" everywhere it appears. Nothing scans on page load, on login, or on a timer.
 - **Provenance line**, rendered whenever a result is present, as plain text: `<events_read> events, <span_start> → <span_end>, <n> authors — scanned <scanned_at>`, with all timestamps in the shared format. This line is not optional. It is what makes the list honest: the page shows a window, not "everyone," and the span tells the admin whether that is six hours or four months on their relay.
 - **Composition line**, directly below it: the top kinds in the window from `kinds`, then the singleton breakdown from `singleton_kinds`, then the multi-event figures — e.g. `18,516 of 19,004 authors posted exactly 1 event; of those, 17,588 were kind 1059 and 803 were kind 5 — 1,484 events from the 488 authors who posted more than once`. This answers a question the page previously could not: a scan dominated by one-event authors is usually NIP-17 gift wraps, whose keys are fresh per message by design and therefore unbannable. Render the kind numbers plainly and do not editorialise beyond naming well-known kinds (0 profile, 1 note, 1059 gift wrap, 9735 zap receipt, 1984 report).
 - **"Hide single-event authors" checkbox, DEFAULT ON**, directly under the filter. On a real relay this is 90%+ of the rows and approximately none of the moderation targets. The count it hides is stated next to it, BROKEN DOWN BY KIND (`hiding 18,516 single-event authors — 17,588 kind 1059, 803 kind 5, 125 other`), so it is never a silent omission; unchecking it is one click.
@@ -538,7 +588,7 @@ Admin only. Find who is currently posting, and ban them in bulk.
 
 Admin only. Everything the relay knows about ONE pubkey, on one page, so that judging an account does not require leaving for njump. Reads `npub` (or `hex`) from `location.search`, decodes client-side via the shared decoder, signs a kind-27235 event with `u` = `/api/profile`, and renders the response. Bad or missing parameter → a plain error line and the profile entry field, nothing else.
 
-1. `<h1>` with the display name if known, else the truncated npub; then the links to `/`, `/authors`, and `/domain`
+1. `<h1>` with the display name if known, else the truncated npub; then the links to `/`, `/authors`, `/report`, and `/domain`
 2. "Login with extension" button and status text
 3. The full npub as plain selectable text, and beside it a single `<a href="https://njump.me/<npub>" target="_blank">njump</a>`; directly below, the nip05 as plain text when known, rendered as nothing at all (no empty element) when it isn't
 4. Ban status: `(banned)` with reason, report type, and ban time if banned — plus a "Ban" or "Unban" button with the shared reason input, signing the same endpoints every other page uses
@@ -549,7 +599,7 @@ Admin only. Everything the relay knows about ONE pubkey, on one page, so that ju
 9. Command generator (`<details>`), pre-filled with this pubkey
 
 - **`picture` and `website` are rendered as plain text URLs and NEVER as `<img src>` or `<a href>`.** An `<img>` pointing at an attacker-chosen host is an outbound connection from the admin's browser, disclosing their IP on page load, to a URL supplied by the very account under investigation. That defeats the entire no-outbound design more thoroughly than anything else on any page, and it would happen automatically, invisibly, and to every profile viewed. The URL as text is fully sufficient for a moderator, who can decide to open it.
-- **Two different measurements, never conflated**: `total_events` covers the whole database; the kind tally covers only the most recent `PROFILE_EVENT_LIMIT` events. Label them separately and, when `kinds_saturated` is true, say `kind breakdown covers the most recent 500 events, not all <total>`.
+- **Two different measurements, never conflated**: `total_events` covers the whole database; the kind tally covers only the most recent `PROFILE_EVENT_LIMIT` events. Label them separately and, when `kinds_saturated` is true, say `kind breakdown covers the most recent 500 events, not all <total>` and point at the generator's `Event kinds by author, lifetime` intent — which is pre-filled with this pubkey already, and is the whole-history version of the number directly above it.
 - **Reports against this pubkey**: one line each — reporter npub, report type, reason, time — with the reporter's npub as plain text. Show the distinct reporter count above the list, and when `reports_saturated` is true say the cap was reached. **Reports from anyone are a signal to look, never grounds in themselves**: only the admin's own kind-1984 events ban anyone, and a brigade of reports from a hundred fresh keys is a thing this page must let the admin SEE rather than something it acts on.
 - **Recent event previews**: kind, time, and the truncated content of each, as plain text with the untrusted-string rule in full force. This is the section that answers the actual question — is this spam, a bot, or a busy human — and is the reason the page exists.
 - **Name and nip05 fall back outward**: local database, then the name cache, then, if still unresolved, ONE automatic query against the fallback relay chain for this single pubkey, posted back through `/api/names`. Automatic is correct here and nowhere else in bulk: one profile lookup for a page the admin deliberately opened is exactly what any Nostr client does.
@@ -559,7 +609,7 @@ Admin only. Everything the relay knows about ONE pubkey, on one page, so that ju
 
 Admin only. The authoritative counterpart to the author list's nip05 filter: a kind-0 `nip05` is a claim BY a pubkey, while `.well-known/nostr.json` is a roster published BY the domain. When the question is "who does this domain vouch for," only the second one answers it.
 
-1. `<h1>strfry-86 — domain roster</h1>`, then the links to `/` and `/authors`
+1. `<h1>strfry-86 — domain roster</h1>`, then the links to `/`, `/authors`, and `/report`
 2. "Login with extension" button and status text
 3. A domain input (pre-filled from `?d=`) and a "Fetch roster" button
 4. A textarea for pasting `nostr.json` contents directly, inside a `<details>` labelled "fetch failed? paste it here"
@@ -568,13 +618,60 @@ Admin only. The authoritative counterpart to the author list's nip05 filter: a k
 7. "Select visible", "Ban selected", "Copy purge command", the reason input, the live count
 8. The roster list
 
-- **Fetch happens in the browser**, `https://<domain>/.well-known/nostr.json`, on button press only. NIP-05 requires `Access-Control-Allow-Origin: *` and most hosts comply, but when it fails there is nothing to fall back on — hence the paste textarea and the `curl` intent in the command generator. Accept both a bare `names` map and a full NIP-05 document. Validate every value as 64-hex client-side before posting.
+- **Fetch happens in the browser**, `https://<domain>/.well-known/nostr.json`, on button press only. NIP-05 requires `Access-Control-Allow-Origin: *` and most hosts comply, but when it fails there is nothing to fall back on — hence the paste textarea, which renders a bare `curl https://<domain>/.well-known/nostr.json` line directly above it, built from the domain already in the input. **That line lives HERE, not in the command generator**: the generator's domain-fetch intent was dropped as a duplicate of what this page does in the browser, and the remedy belongs at the point of failure rather than inside a `<details>` on four other pages. Accept both a bare `names` map and a full NIP-05 document. Validate every value as 64-hex client-side before posting.
 - The pubkey list goes to `POST /api/pubkeys/lookup`, capped at `DOMAIN_LOOKUP_MAX`. Over the cap is an error, not a truncation: silently dropping rows from a list the admin is about to bulk-ban is exactly the class of failure this project designs against.
 - **Roster list**: one `<li>` per entry — the local part from the roster in `<b>`, the npub as plain text, ban status, the kind-0 name and nip05 if known, the event count if the pubkey appears in the current author-scan cache, and the `claims_domain` marker. Checkbox on every unbanned entry except the admin's own pubkey.
 - **`claims_domain` is displayed as a comparison of two unverified claims, not as verification.** `listed, claims this domain` is agreement; `listed, but claims <other>` or `listed, claims nothing` is a stale or unclaimed roster entry. The page must never say "verified." Conversely, someone claiming this domain whom the roster omits is a possible impersonator — the roster cannot show them, so the page carries one line pointing at the author list's filter for that direction.
 - **Provenance line**: `<n> pubkeys listed by <domain>, fetched <time> — <m> already banned, <k> seen in the current scan`. When the response contains no `names` map or a single entry, say `this domain does not publish a full directory` rather than reporting zero users, which is a different and misleading claim.
 - Sort row: `sort: name · events · banned · claims domain`. Same shared rules — re-filter and clear the selection on every re-sort.
 - **This page is why a domain is never accepted in the manual ban form.** Ban-by-domain exists, but it is preview, count, filter, select-visible, then ban — four deliberate steps with the roster on screen — rather than a domain typed into a text box that bans four thousand people on Enter.
+
+### `report.html` — `GET /report`
+
+Admin only. Everything server86 has already measured about the relay, in one place, so that logging in shows the operator what is known rather than requiring them to remember which page held which number. **No checkbox, no ban control, no unban control, no actionable list — not now and not later.**
+
+1. `<h1>strfry-86 — relay report</h1>`, then the links to `/`, `/authors`, and `/domain`
+2. "Login with extension" button and status text
+3. Profile entry field
+4. `§ Database` — the totals panel, then the walk panel, then the author-list pointer line
+5. `§ Gift wrap storage` — one line stating that the retention decision needs both, then the recipients panel, then the subscribers panel
+6. Command generator (`<details>`)
+7. Record lines
+
+- **Logged out**: heading, navigation links, and the login button only. Nothing else exists in the rendered page — no panels, no buttons, no numbers.
+
+- **The cached-scan panel** is the page, repeated. Every result renders the same five things in the same order, and this shape is shared code used by `authors.html` too:
+
+  ```
+  heading            — what this is
+  cost line          — what the button will do and what it costs, before it is pressed
+  [button]
+  status line        — never run | scanning… | scanned <absolute> (<relative>)
+  result             — plain text tally lines, or nothing
+  ```
+
+  - **`never run` is a VISIBLE state, not a hidden panel.** An admin logging in for the first time sees the full inventory of what this page can tell them, empty, with the buttons that fill it. Hiding unrun panels would make the page's apparent capabilities depend on its own history, which is the one thing a report page must not do.
+  - **Age renders absolute AND relative**: `scanned 2026-07-26@14:02 UTC (3 days ago)`. The absolute form is the locked project format and stays; the relative form is what makes staleness legible at a glance on a page holding four results of four different ages, without the operator doing arithmetic.
+  - **Staleness that has a CONSEQUENCE states the consequence.** The subscribers panel past 7 days does not merely render an age — it says `older than 7 days — the subscriber-exempt purge command is unavailable until this is re-run`, because that is already the rule under `/api/subscribers` and an operator should not have to discover it by finding a command block missing on another page.
+  - **The cost line is written before any measurement exists**, so it describes the WORK, never a duration: `reads every event in the database — the estimate appears within a few seconds of starting`. Once a run has happened, the panel appends the measured figure from the operator's OWN relay: `last run: 9m 06s at 4,814 events/sec`. No duration from the developer's relay is ever printed anywhere in this project's UI; a stranger's disk is not this disk.
+  - **While running**: `scanning… 412,000 of 2,628,121 events (16%) — ~7 min left at 4,800 events/sec`, every figure from the server per `GET /api/report`. The client may tick the elapsed seconds locally between polls; it may not compute, smooth, or invent any of the others. Before a rate exists the line reads `scanning… estimating…`.
+
+- **Two buttons in `§ Database`, not one.** Independent persistence implies independent triggers, and a single button that takes three seconds on Tuesday and nine minutes on Wednesday is how an operator learns to be afraid of a button. `refresh totals` is the seconds-long exact one; `run full database walk` is the long one. The walk runs the same `--count` first for its denominator, so pressing it refreshes the totals as a byproduct — the reverse is not true and the panels must not imply it is.
+
+- **The totals panel renders the gap as a fact or as an alarm.** Under tolerance: `allowlist gap: 0.4% of non-gift-wrap events`. Over 2%:
+
+  ```
+  allowlist gap: 4.1% of non-gift-wrap events — AUTHOR_SCAN_KINDS is stale.
+  The full author list is missing authors. Run the database walk to see which kinds.
+  ```
+
+  This is the only place in the running software where that check surfaces, and it is the reason this page pays for itself independently of everything else on it.
+
+- **The walk panel renders `unlisted_kinds` as a to-do list**, ranked by count, with the well-known kinds named exactly as the composition line elsewhere names them. It also states the distinct-author figure as its two components — the measured non-gift-wrap set and the structural gift-wrap count — because one is a measurement and the other is a consequence of NIP-17, and presenting them as one number would hide that.
+
+- **The author-list pointer** is one sentence and a link: `full author list — 19,004 authors, scanned 2 days ago → /authors`, or `full author list — never run → /authors`. It reads `GET /api/authors` for the two numbers and renders nothing else from it. This is the boundary that keeps the page safe, and it is stated here so that a future commit adding "just the top ten" has to argue with a sentence rather than with a habit.
+
+- **The global lock is visible.** While any job runs, every other button on the page disables and says `waiting on the database walk`. Four buttons that silently do nothing while a fifth job runs is indistinguishable from four broken buttons.
 
 ## README.md
 
@@ -613,12 +710,14 @@ README must also cover, briefly:
 - Adjusting the container name if not `strfry`.
 - The admin key is asked for once on first run (defaulting to `relay.info.pubkey` from strfry.conf if set) and stored in `/config/strfry86/config.json` — public key only, nsec never leaves your extension.
 - `contact_appeal` is optional, asked once (re-asked later only if the key is missing entirely), shown publicly to everyone including logged-out visitors, and editable or blankable by hand at any time with effect on the next page load.
-- The compose `ports:` line (`127.0.0.1:8686:8686`, with a note on tailnet/reverse-proxy exposure). No special proxy timeout is needed: every scan is asynchronous and polled, so no request is held open for more than about a second.
+- The compose `ports:` line (`127.0.0.1:8686:8686`, with a note on tailnet/reverse-proxy exposure). No special proxy timeout is needed: every scan is asynchronous and polled, so no request is held open for more than about a second — including the database walk, which can run for half an hour with the browser closed.
+- Only one scan runs at a time, server-wide. Pressing a scan button while another is running does not queue it and does not start a second one; the page says which job it is waiting on.
 - The author page offers a fast recent window and a slower full author list covering every kind except DMs (~2 minutes on a 2.6M-event relay). The tab can be closed while it runs and the result collected later. The list defaults to hiding single-event authors, because on most relays those are NIP-17 gift wraps whose keys are never reused and therefore cannot usefully be banned.
 - Add the relay to your write relays in jumble.social so your reports actually reach it.
-- strfry-86 deliberately shows no charts or statistics; anything needing a whole-database sweep is offered as a copyable terminal command instead.
+- The `/report` page holds everything server86 has measured about the relay: exact totals from the index in seconds, and a whole-database walk (distinct authors, kind histogram, kinds missing from the author scan's allowlist) that takes minutes and is worth pressing occasionally. Both are button-triggered, cached server-side, and stamped with their age; nothing scans on its own. There are still no charts and no history — each result is one set of plain text lines, replaced wholesale by the next run.
+- The report's `allowlist gap` figure is the one number worth checking after a strfry upgrade or a year of Nostr adding kinds: above 2%, the author list is silently missing people and the walk will tell you which kinds to add.
 - Banned users' profile names are resolved first from the local database and, only for the remainder, via a single batched query against a fallback chain of public relays (`wss://purplepag.es`, `wss://indexer.coracle.social`, `wss://user.kindpag.es`, `wss://relay.nos.social`, `wss://relay.ditto.pub`, `wss://relay.noswhere.com`, tried in order until one connects) made from the admin's logged-in browser (the server itself never opens outbound connections). Results and misses persist in `blacklist.json`, so each pubkey is queried externally at most once ever — hand-deleting an entry's `name_checked_at` makes it eligible for one more try.
-- `names.json` is a throwaway cache for non-banned pubkeys and can be deleted at any time at the cost of one rescan. So can the three `*-cache.json` files.
+- `names.json` is a throwaway cache for non-banned pubkeys and can be deleted at any time at the cost of one rescan. So can the four `*-cache.json` files.
 - The profile page shows what the relay itself knows about one pubkey, and renders profile picture and website URLs as plain text on purpose, since loading them would disclose the admin's IP to a host chosen by the account under investigation.
 - The domain page reads a domain's own `.well-known/nostr.json` from the admin's browser. Neither that roster nor a profile's nip05 is verified by anything — they are two unverified claims the page compares for you, never proof, and never on their own a reason to ban.
 - Bans are forward-looking; existing events are purged with `strfry delete --filter '{"authors":["<hex>"]}'`.
@@ -634,7 +733,9 @@ test.sh must:
 - Verify the manifest matches the working tree AND that the committed bundle's contents hash-match the manifest.
 - Pipe crafted JSONL through `python3 plugin86.py` and assert accept/reject for: normal event accepted; banned author rejected; admin 1984 bans its p-tags; non-admin 1984 does not ban; admin pubkey cannot be banned.
 - Assert the `AUTHOR_SCAN_KINDS` coverage gap against a live database when one is reachable, skipping cleanly (`SKIP: ...`, not a failure) when no strfry binary is found — detect it the same way `server86.get_strfry_bin()` does. Fail if the gap exceeds 2% of non-giftwrap events. This is the only check that can catch an allowlist that has silently gone stale, and staleness removes authors from a list the UI describes as complete. **It has never run against real data in development — whoever has a real relay should run `bash test.sh` there at least once.**
-- Assert the bounds, since every one is a silent failure if it stops holding: a `mode` not in `AUTHOR_SCAN_MODES` is a 400 with no scan and no default fallback; a body carrying a raw `limit` or its own `kinds` array is rejected; a `full` result returning exactly `AUTHOR_SCAN_FULL_LIMIT` rows sets `saturated`; `/api/pubkeys/lookup` over `DOMAIN_LOOKUP_MAX` is an error rather than a truncation; `/api/names` rejects a verified kind-0 whose pubkey is neither banned nor in the scan cache; a second `POST /api/authors/scan` during a running scan returns the same `202 running` shape rather than a 409 or a second scan; and the static route table serves the same bytes for `/profile` and `/profile?npub=<anything>`, including values containing `../`.
+- Assert the report endpoints, whose failures are all quiet ones: `gap_events` equals `total_events − allowlist_events − giftwrap_events` on a live database when one is reachable (skipping cleanly otherwise, like the coverage check); a walk that hits `REPORT_WALK_DEADLINE` leaves the PREVIOUS walk record byte-identical and leaves the totals record untouched entirely; `GET /api/report` never starts a scan, on an empty cache or a populated one; and the walk's distinct-author counter excludes kind 1059 and stores `REPORT_AUTHOR_KEY_BYTES` prefixes rather than hex strings, since that is the difference between a flat-memory scan and one that can be OOM-killed inside the operator's relay container.
+- Assert the global scan lock: with one job running, a `POST` to EVERY other scan endpoint returns the `202 running` shape naming the running job rather than starting a second subprocess, and every scan `GET` reports the same non-null `blocked_by`. Assert too that a job hitting its deadline RELEASES the lock — a deadline that fires without releasing is worse than no deadline, because the feature then dies silently instead of loudly.
+- Assert the bounds, since every one is a silent failure if it stops holding: a `mode` not in `AUTHOR_SCAN_MODES` is a 400 with no scan and no default fallback; a body carrying a raw `limit` or its own `kinds` array is rejected; a `full` result returning exactly `AUTHOR_SCAN_FULL_LIMIT` rows sets `saturated`; `/api/pubkeys/lookup` over `DOMAIN_LOOKUP_MAX` is an error rather than a truncation; `/api/names` rejects a verified kind-0 whose pubkey is neither banned nor in the scan cache; a second `POST /api/authors/scan` during a running scan returns the same `202 running` shape rather than a 409 or a second scan; and the static route table serves the same bytes for `/profile` and `/profile?npub=<anything>`, including values containing `../`. The route table check covers `/report` identically.
 
 ## Crypto tests (non-negotiable — this is the whole authorization system)
 

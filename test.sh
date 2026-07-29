@@ -477,7 +477,7 @@ with open(os.path.join(REPO_ROOT, "tests", "kind0-fixture.json")) as f:
     kind0_fixture = json.load(f)
 real_pubkey = kind0_fixture["valid"]["pubkey"]
 
-with server86._authors_lock:
+with server86._scan_lock:
     server86._authors_cache = dict(server86._authors_cache)
     server86._authors_cache["authors"] = [{"pubkey": real_pubkey, "npub": "npub1fake", "count": 3}]
 
@@ -511,9 +511,11 @@ server86.RECIPIENTS_CACHE_PATH = os.path.join(_cache_tmpdir, "recipients-cache.j
 server86.SUBSCRIBERS_CACHE_PATH = os.path.join(_cache_tmpdir, "subscribers-cache.json")
 
 # never-scanned skeleton shape
-check(server86.get_recipients_status() == {**server86._empty_recipients_result(), "status": "idle", "started_at": None, "progress": None},
+_idle_job_fields = {"status": "idle", "started_at": None, "progress": None,
+                     "total": None, "rate": None, "eta": None, "blocked_by": None}
+check(server86.get_recipients_status() == {**server86._empty_recipients_result(), **_idle_job_fields},
       "get_recipients_status is the never-scanned skeleton before any scan has run")
-check(server86.get_subscribers_status() == {**server86._empty_subscribers_result(), "status": "idle", "started_at": None, "progress": None},
+check(server86.get_subscribers_status() == {**server86._empty_subscribers_result(), **_idle_job_fields},
       "get_subscribers_status is the never-scanned skeleton before any scan has run")
 
 # single-flight, for both resources, mirroring the authors coverage above
@@ -806,7 +808,7 @@ server86.compute_profile = lambda pk: {"total_events": 7, "kinds": {}, "kinds_wi
                                         "reports": [], "reports_saturated": False, "warning": None}
 server86.resolve_profiles = lambda pks: {pks[0]: {"name": "alice", "nip05": "alice@example.com"}}
 
-with server86._authors_lock:
+with server86._scan_lock:
     server86._authors_cache = dict(server86._authors_cache)
     server86._authors_cache["authors"] = [
         {"pubkey": "9" * 64, "count": 100},
@@ -881,7 +883,7 @@ server86.resolve_profiles = lambda pks: {
     pk_no_nip05: {"name": "carol", "nip05": None},
 }
 
-with server86._authors_lock:
+with server86._scan_lock:
     server86._authors_cache = dict(server86._authors_cache)
     server86._authors_cache["authors"] = [{"pubkey": pk_claims, "count": 17}]
 
@@ -923,6 +925,155 @@ check(row["name"] == "eve" and row["claims_domain"] is True,
 server86.resolve_profiles = _orig_resolve_profiles2
 
 
+# --- report endpoints (server86.py: /api/report/totals, /api/report/walk) -
+# Cache path redirected into the same tempdir Phase 2 uses, for the same
+# reason: a test run must never write a *-cache.json into the repo.
+
+server86.REPORT_CACHE_PATH = os.path.join(_cache_tmpdir, "report-cache.json")
+server86._report_cache = server86._load_report_cache()
+
+report_status = server86.get_report_status()
+check(report_status["status"] == "idle" and report_status["job"] is None
+      and report_status["totals"] is None and report_status["walk"] is None,
+      "GET /api/report is the never-scanned skeleton before any report scan has run, and never scans to produce it")
+
+# gap_events / gap_share: three counts, no fourth call — the fourth figure
+# is pure arithmetic on the other three.
+_orig_run_strfry_count = server86.run_strfry_count
+_totals_canned = [2628121, 1702655, 909056]  # total, giftwrap, allowlist — reference-relay-shaped
+_totals_calls = {"n": 0}
+
+
+def _fake_run_strfry_count(filter_obj, timeout=None):
+    v = _totals_canned[_totals_calls["n"]]
+    _totals_calls["n"] += 1
+    return v
+
+
+server86.run_strfry_count = _fake_run_strfry_count
+totals_record = server86.compute_report_totals()
+server86.run_strfry_count = _orig_run_strfry_count
+
+check(_totals_calls["n"] == 3, "compute_report_totals makes exactly three scan --count calls, never a fourth")
+expected_gap = 2628121 - 909056 - 1702655
+check(totals_record["gap_events"] == expected_gap,
+      "compute_report_totals: gap_events = total_events - allowlist_events - giftwrap_events")
+check(abs(totals_record["gap_share"] - expected_gap / (2628121 - 1702655)) < 1e-9,
+      "compute_report_totals: gap_share is gap_events / non-giftwrap total, not gap_events / total_events")
+
+# compute_report_walk: the one unlimited scan. Two non-giftwrap authors
+# sharing a REPORT_AUTHOR_KEY_BYTES-byte pubkey PREFIX must collapse to one
+# distinct author (that's the memory-bounding trade this endpoint makes);
+# gift-wrap authors must never enter that set at all, since their count is
+# already known exactly from the tally and storing them would defeat the
+# whole point of skipping kind 1059.
+shared_prefix = "ab" * server86.REPORT_AUTHOR_KEY_BYTES
+pk_a = shared_prefix + "11" * (32 - server86.REPORT_AUTHOR_KEY_BYTES)
+pk_b = shared_prefix + "22" * (32 - server86.REPORT_AUTHOR_KEY_BYTES)
+
+
+def _streaming_walk(filter_obj, on_event, timeout, on_progress=None):
+    check(filter_obj == {}, "compute_report_walk streams the genuinely unbounded filter '{}' — the one sanctioned exception to the bounding rule")
+    on_event({"kind": 1, "pubkey": pk_a})
+    on_event({"kind": 1, "pubkey": pk_b})
+    on_event({"kind": 1059, "pubkey": "c" * 64})
+    on_event({"kind": 1059, "pubkey": "d" * 64})
+    on_event({"kind": 99999, "pubkey": pk_a})
+    return 5
+
+
+server86.run_strfry_count = lambda filter_obj, timeout=None: 5
+server86.run_strfry_scan_streaming = _streaming_walk
+walk_result = server86.compute_report_walk()
+server86.run_strfry_scan_streaming = _orig_streaming
+server86.run_strfry_count = _orig_run_strfry_count
+
+check(walk_result["walk"]["distinct_authors_nongiftwrap"] == 1,
+      "compute_report_walk: two authors sharing a REPORT_AUTHOR_KEY_BYTES-byte prefix collapse to ONE distinct author")
+check(walk_result["walk"]["distinct_authors_giftwrap"] == 2,
+      "compute_report_walk: gift-wrap distinct-author count is the gift-wrap EVENT count (structural, one key per message), never a stored set")
+check(walk_result["walk"]["distinct_authors"] == 3,
+      "compute_report_walk: distinct_authors sums the measured non-giftwrap set and the structural giftwrap count")
+check(99999 in walk_result["walk"]["unlisted_kinds"] and walk_result["walk"]["unlisted_kinds"][99999] == 1,
+      "compute_report_walk: unlisted_kinds reports a kind that is neither in AUTHOR_SCAN_KINDS nor 1059")
+check(1059 not in walk_result["walk"]["unlisted_kinds"] and 1 not in walk_result["walk"]["unlisted_kinds"],
+      "compute_report_walk: unlisted_kinds excludes gift wraps and allowlisted kinds")
+
+# deadline: preserves the PREVIOUS walk record byte-identical, releases the
+# lock, and never even touches the totals record — a walk timeout must not
+# make totals look stale AND wrong at once.
+server86._report_cache["walk"] = {**server86._empty_report_walk(), "scanned_at": 12345, "events_read": 999}
+server86._report_cache["totals"] = {**server86._empty_report_totals(), "scanned_at": 67890, "total_events": 111}
+_prev_totals_snapshot = dict(server86._report_cache["totals"])
+
+
+def _streaming_timeout(filter_obj, on_event, timeout, on_progress=None):
+    raise RuntimeError(f"strfry scan exceeded {timeout}s budget after reading 3 events")
+
+
+server86.run_strfry_count = lambda filter_obj, timeout=None: 100
+server86.run_strfry_scan_streaming = _streaming_timeout
+
+walk_status = server86.start_report_walk_scan()
+check(walk_status["status"] == "running" and walk_status["job"] == "walk",
+      "POST /api/report/walk starts the job and returns 202 running immediately")
+_time.sleep(0.3)
+
+check(server86._report_cache["walk"]["events_read"] == 999 and server86._report_cache["walk"]["scanned_at"] == 12345,
+      "a walk that hits its deadline preserves the PREVIOUS walk record byte-identical, never a partial")
+check(server86._report_cache["walk"].get("warning") is not None,
+      "a walk that hits its deadline attaches a warning to the walk record")
+check(server86._report_cache["totals"] == _prev_totals_snapshot,
+      "a failed walk leaves the totals record completely untouched — not even a warning added")
+check(server86._active_scan["name"] is None,
+      "a deadline that fires RELEASES the global lock — a lock that never releases disables every scan in the deployment")
+
+server86.run_strfry_count = _orig_run_strfry_count
+server86.run_strfry_scan_streaming = _orig_streaming
+
+
+# --- global scan lock (server86.py: shared by every async scan) -----------
+# Every asynchronous scan in the project takes the SAME lock, so a POST to
+# any OTHER scan endpoint while one is running must not start a second
+# subprocess and must not 409 — it returns the RUNNING job's own status,
+# and every scan GET names it via blocked_by.
+
+server86._active_scan["name"] = None  # clean slate — earlier sections may have left a job mid-run
+server86.AUTHORS_CACHE_PATH = os.path.join(_cache_tmpdir, "authors-cache.json")
+
+
+def _slow_compute_authors(mode, progress_cb=None):
+    _time.sleep(0.4)
+    return server86._empty_authors_result()
+
+
+_orig_compute_authors = server86.compute_authors
+server86.compute_authors = _slow_compute_authors
+
+authors_start = server86.start_authors_scan("recent")
+check(authors_start["status"] == "running", "global lock setup: author scan is running")
+
+recipients_blocked = server86.start_recipients_scan()
+check(recipients_blocked["blocked_by"] == "authors" and recipients_blocked["status"] == "running",
+      "global lock: POST /api/recipients while the author scan holds the lock returns the RUNNING job's own status, naming it, never a second scan")
+
+subscribers_get_blocked = server86.get_subscribers_status()
+check(subscribers_get_blocked["blocked_by"] == "authors",
+      "global lock: GET /api/subscribers reports blocked_by while a DIFFERENT job holds the lock")
+
+report_totals_blocked = server86.start_report_totals_scan()
+check(report_totals_blocked["blocked_by"] == "authors",
+      "global lock: POST /api/report/totals while the author scan holds the lock is blocked, never a concurrent scan")
+
+_time.sleep(0.6)
+check(server86.get_authors_status()["blocked_by"] is None,
+      "global lock: once the author scan finishes, blocked_by clears for the next caller")
+check(server86._active_scan["name"] is None,
+      "global lock: a completed scan releases the lock")
+
+server86.compute_authors = _orig_compute_authors
+
+
 # --- static route table: query strings never affect routing --------------
 # CLAUDE.md requires this exact check: /profile and /profile?npub=<anything>
 # (including a value containing '../') must serve identical bytes, since
@@ -948,7 +1099,7 @@ def _get_bytes(path):
 
 
 try:
-    for route, label in (("/profile", "profile.html"), ("/domain", "domain.html")):
+    for route, label in (("/profile", "profile.html"), ("/domain", "domain.html"), ("/report", "report.html")):
         status_plain, body_plain = _get_bytes(route)
         status_query, body_query = _get_bytes(route + "?d=../../../../etc/passwd&npub=../../../../etc/passwd")
         check(status_plain == 200 and status_query == 200 and body_plain == body_query,

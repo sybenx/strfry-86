@@ -12,7 +12,7 @@ li { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>strfry-86 — domain roster</h1>
-<p><a href="/">← ban list</a> · <a href="/authors">active authors</a></p>
+<p><a href="/">← ban list</a> · <a href="/authors">active authors</a> · <a href="/report">relay report</a></p>
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
@@ -26,6 +26,7 @@ li { overflow-wrap: anywhere; }
   </p>
   <details id="paste-details">
     <summary>fetch failed? paste it here</summary>
+    <pre id="curl-hint"></pre>
     <p><textarea id="paste-textarea" rows="6" cols="50" placeholder='{"names": {"bob": "&lt;hex pubkey&gt;"}}'></textarea></p>
     <p><button id="paste-submit-btn" type="button">Use pasted roster</button></p>
   </details>
@@ -67,6 +68,7 @@ var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var domainInput = document.getElementById('domain-input');
 var fetchRosterBtn = document.getElementById('fetch-roster-btn');
+var curlHint = document.getElementById('curl-hint');
 var pasteTextarea = document.getElementById('paste-textarea');
 var pasteSubmitBtn = document.getElementById('paste-submit-btn');
 var provenanceLine = document.getElementById('provenance-line');
@@ -188,12 +190,23 @@ function runLookup(pubkeys, singleEntry) {
     });
 }
 
+// The curl fallback lives HERE, at the point of failure, rather than in
+// the command generator — that generator's domain-fetch intent was
+// dropped as a duplicate of exactly this page action.
+function updateCurlHint() {
+  var domain = domainInput.value.trim();
+  curlHint.textContent = domain ? ('curl -s https://' + domain + '/.well-known/nostr.json') : '';
+}
+domainInput.addEventListener('input', updateCurlHint);
+updateCurlHint();
+
 fetchRosterBtn.addEventListener('click', function () {
   var domain = domainInput.value.trim();
   if (!domain) {
     setStatus('enter a domain first');
     return;
   }
+  updateCurlHint();
   setStatus('fetching .well-known/nostr.json…');
   fetch('https://' + domain + '/.well-known/nostr.json')
     .then(function (res) {
@@ -380,7 +393,7 @@ if (prefillDomain) {
 }
 
 profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
-commandBlockContainer.appendChild(s86BuildCommandGenerator({ domain: prefillDomain }));
+commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 s86WireFilter(filterInput, listEl);
 filterInput.addEventListener('input', function () {

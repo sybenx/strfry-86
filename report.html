@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strfry-86 — relay report</title>
+<style>
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li { overflow-wrap: anywhere; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+</style>
+</head>
+<body>
+<h1>strfry-86 — relay report</h1>
+<p><a href="/">← ban list</a> · <a href="/authors">active authors</a> · <a href="/domain">domain roster</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <div id="profile-entry-container"></div>
+
+  <h2>Database</h2>
+  <div id="totals-panel-container"></div>
+  <div id="walk-panel-container"></div>
+  <p id="author-pointer-line"></p>
+
+  <h2>Gift wrap storage</h2>
+  <p>A safe gift-wrap retention purge needs both scans below: recipients, so the purge command can name whose gift wraps it would delete, and subscribers, so it can exempt the ones this relay is their own DM inbox for.</p>
+  <div id="recipients-panel-container"></div>
+  <div id="subscribers-panel-container"></div>
+
+  <div id="command-block-container"></div>
+  <div id="records-list"></div>
+</div>
+<script src="/common86.js"></script>
+<script>
+var adminPubkey = null;
+var isAdmin = false;
+var lastBanned = [];
+
+var statusEl = document.getElementById('status');
+var loginBtn = document.getElementById('login-btn');
+var adminSection = document.getElementById('admin-section');
+var profileEntryContainer = document.getElementById('profile-entry-container');
+var commandBlockContainer = document.getElementById('command-block-container');
+var recordsList = document.getElementById('records-list');
+var authorPointerLine = document.getElementById('author-pointer-line');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+var KNOWN_KINDS = {
+  0: 'profile', 1: 'note', 5: 'deletion', 6: 'repost', 7: 'reaction',
+  1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt',
+  10002: 'relay list', 10050: 'DM relay list', 30023: 'long-form'
+};
+function kindLabel(kind) {
+  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+}
+
+// --- § Database: totals + walk, sharing GET /api/report ------------------
+
+function reportJobStatusFor(data, jobName, record) {
+  var scannedAt = record ? record.scanned_at : null;
+  if (data.status === 'running') {
+    if (data.job === jobName) {
+      return { status: 'running', progress: data.progress, total: data.total, rate: data.rate, eta: data.eta, blocked_by: null, scanned_at: scannedAt };
+    }
+    return { status: 'idle', blocked_by: 'report-' + data.job, scanned_at: scannedAt };
+  }
+  return { status: 'idle', blocked_by: data.blocked_by, scanned_at: scannedAt, warning: record ? record.warning : null };
+}
+
+var totalsPanel = s86BuildScanPanel({
+  heading: 'database totals',
+  costText: 'reads three index counts — exact, seconds even on a large relay',
+  buttonLabel: 'refresh totals',
+  onStart: function () { return startReportJob('/api/report/totals'); },
+  lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration)) : null; },
+  renderResult: function (container, record) {
+    container.appendChild(s86El('p', record.total_events.toLocaleString() + ' events, '
+      + record.giftwrap_events.toLocaleString() + ' gift wraps (' + (record.giftwrap_share * 100).toFixed(1) + '%), '
+      + record.allowlist_events.toLocaleString() + ' in AUTHOR_SCAN_KINDS'));
+    var gapPct = record.gap_share * 100;
+    if (gapPct > 2) {
+      container.appendChild(s86El('p', 'allowlist gap: ' + gapPct.toFixed(1) + '% of non-gift-wrap events — AUTHOR_SCAN_KINDS is stale.'));
+      container.appendChild(s86El('p', 'The full author list is missing authors. Run the database walk below to see which kinds.'));
+    } else {
+      container.appendChild(s86El('p', 'allowlist gap: ' + gapPct.toFixed(1) + '% of non-gift-wrap events.'));
+    }
+  }
+});
+
+var walkPanel = s86BuildScanPanel({
+  heading: 'whole-database walk',
+  costText: 'reads every event in the database — the estimate appears within a few seconds of starting',
+  buttonLabel: 'run full database walk',
+  onStart: function () { return startReportJob('/api/report/walk'); },
+  lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration) + ' at ' + s86FormatRate(record.rate)) : null; },
+  renderResult: function (container, record) {
+    container.appendChild(s86El('p', 'distinct authors: ' + record.distinct_authors.toLocaleString()
+      + ' (' + record.distinct_authors_nongiftwrap.toLocaleString() + ' measured, '
+      + record.distinct_authors_giftwrap.toLocaleString() + ' structural — gift wraps, one key per message)'));
+    var unlisted = Object.keys(record.unlisted_kinds || {})
+      .map(function (k) { return [parseInt(k, 10), record.unlisted_kinds[k]]; })
+      .sort(function (a, b) { return b[1] - a[1]; });
+    if (unlisted.length === 0) {
+      container.appendChild(s86El('p', 'no event kinds outside AUTHOR_SCAN_KINDS were seen'));
+    } else {
+      container.appendChild(s86El('p', 'kinds missing from AUTHOR_SCAN_KINDS: '
+        + unlisted.map(function (e) { return kindLabel(e[0]) + ': ' + e[1].toLocaleString(); }).join(', ')));
+    }
+  }
+});
+
+document.getElementById('totals-panel-container').appendChild(totalsPanel.el);
+document.getElementById('walk-panel-container').appendChild(walkPanel.el);
+
+function applyReportStatus(data) {
+  totalsPanel.applyStatus(reportJobStatusFor(data, 'totals', data.totals), data.totals);
+  walkPanel.applyStatus(reportJobStatusFor(data, 'walk', data.walk), data.walk);
+}
+
+function fetchReport() {
+  return fetch('/api/report').then(function (res) { return res.json(); });
+}
+
+function startReportJob(endpoint) {
+  return s86SignAndPost(endpoint, {}).then(function (result) {
+    if (!result.ok) {
+      throw new Error(s86ErrMsg(result));
+    }
+    s86PollStatus(fetchReport, applyReportStatus);
+  });
+}
+
+function loadAuthorPointer() {
+  fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      authorPointerLine.textContent = '';
+      var prefix = data.scanned_at
+        ? ('full author list — ' + (data.authors || []).length.toLocaleString() + ' authors, ' + s86FormatRelativeAge(data.scanned_at) + ' → ')
+        : 'full author list — never run → ';
+      authorPointerLine.appendChild(document.createTextNode(prefix));
+      var link = document.createElement('a');
+      link.href = '/authors';
+      link.textContent = '/authors';
+      authorPointerLine.appendChild(link);
+    })
+    .catch(function () {});
+}
+
+// --- § Gift wrap storage: recipients + subscribers, each its own endpoint -
+
+var recipientsPanel = s86BuildScanPanel({
+  heading: 'gift-wrap recipients',
+  costText: 'reads the newest 250,000 gift-wrap events — a few seconds to a couple of minutes',
+  buttonLabel: 'scan gift-wrap recipients',
+  onStart: function () { return startSimpleJob('/api/recipients', fetchRecipients, applyRecipientsStatus); },
+  renderResult: function (container, record) {
+    container.appendChild(s86El('p', record.events_read.toLocaleString() + ' gift-wrap events read, '
+      + record.recipients.length.toLocaleString() + ' distinct recipients, '
+      + s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end)
+      + (record.saturated ? ' — SATURATED: window limit reached' : '')));
+  }
+});
+
+var subscribersPanel = s86BuildScanPanel({
+  heading: 'DM-inbox subscribers',
+  costText: 'reads up to 50,000 DM-relay-list and general-relay-list events — a few seconds to a couple of minutes',
+  buttonLabel: 'scan subscribers',
+  onStart: function () { return startSimpleJob('/api/subscribers', fetchSubscribers, applySubscribersStatus); },
+  renderResult: function (container, record) {
+    if (!record.relay_url) {
+      container.appendChild(s86El('p', 'relay.info.url is not set in strfry.conf — cannot match subscriber relay lists'));
+      return;
+    }
+    container.appendChild(s86El('p', 'relay: ' + record.relay_url));
+    container.appendChild(s86El('p', record.subscribers.length.toLocaleString() + ' DM-inbox subscribers, '
+      + record.general_subscribers.length.toLocaleString() + ' general relay-list subscribers'
+      + (record.saturated ? ' — SATURATED: window limit reached' : '')));
+  },
+  extraNote: function (record) {
+    if (!record.scanned_at) {
+      return null;
+    }
+    var ageSec = Math.floor(Date.now() / 1000) - record.scanned_at;
+    return ageSec > 7 * 24 * 3600
+      ? 'older than 7 days — the subscriber-exempt purge command is unavailable until this is re-run'
+      : null;
+  }
+});
+
+document.getElementById('recipients-panel-container').appendChild(recipientsPanel.el);
+document.getElementById('subscribers-panel-container').appendChild(subscribersPanel.el);
+
+function fetchRecipients() { return fetch('/api/recipients').then(function (res) { return res.json(); }); }
+function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
+function applyRecipientsStatus(data) { recipientsPanel.applyStatus(data, data.scanned_at ? data : null); }
+function applySubscribersStatus(data) { subscribersPanel.applyStatus(data, data.scanned_at ? data : null); }
+
+function startSimpleJob(postEndpoint, fetchFn, applyFn) {
+  return s86SignAndPost(postEndpoint, {}).then(function (result) {
+    if (!result.ok) {
+      throw new Error(s86ErrMsg(result));
+    }
+    applyFn(result.body);
+    s86PollStatus(fetchFn, applyFn);
+  });
+}
+
+// --- records / login -------------------------------------------------------
+
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () { loadBanned(); },
+    onError: setStatus
+  });
+}
+
+function loadBanned() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      lastBanned = data.banned;
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      } else {
+        renderRecords();
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  renderRecords();
+  fetchReport().then(applyReportStatus);
+  fetchRecipients().then(applyRecipientsStatus);
+  fetchSubscribers().then(applySubscribersStatus);
+  loadAuthorPointer();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
+commandBlockContainer.appendChild(s86BuildCommandGenerator());
+
+loadBanned();
+</script>
+</body>
+</html>

@@ -10,6 +10,7 @@ Routes:
   GET  /authors           -> authors.html (admin-only active-author page)
   GET  /profile           -> profile.html (admin-only single-pubkey detail page)
   GET  /domain            -> domain.html (admin-only nip-05 domain roster page)
+  GET  /report            -> report.html (admin-only cached-scan results page)
   GET  /common86.js       -> shared client JS for all pages
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
@@ -18,6 +19,9 @@ Routes:
   POST /api/recipients    -> NIP-98 authenticated: run exactly one bounded scan
   GET  /api/subscribers   -> public read of the last DM/general relay-list search (never scans)
   POST /api/subscribers   -> NIP-98 authenticated: run exactly one bounded scan
+  GET  /api/report        -> public read of the totals + whole-database-walk records (never scans)
+  POST /api/report/totals -> NIP-98 authenticated: four index counts, seconds even on a large relay
+  POST /api/report/walk   -> NIP-98 authenticated: the one unlimited scan in the project
   POST /api/unban         -> NIP-98 authenticated unban
   POST /api/ban           -> NIP-98 authenticated manual ban
   POST /api/reason        -> NIP-98 authenticated: bulk-edit reason on existing bans
@@ -50,6 +54,7 @@ STRFRY_CONF_PATH = "/config/strfry.conf"
 AUTHORS_CACHE_PATH = os.path.join(SCRIPT_DIR, "authors-cache.json")
 RECIPIENTS_CACHE_PATH = os.path.join(SCRIPT_DIR, "recipients-cache.json")
 SUBSCRIBERS_CACHE_PATH = os.path.join(SCRIPT_DIR, "subscribers-cache.json")
+REPORT_CACHE_PATH = os.path.join(SCRIPT_DIR, "report-cache.json")
 # dockurr/strfry ships the binary at /app/strfry, which is NOT on PATH for a
 # detached process; the official image installs to /usr/local/bin.
 STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry")
@@ -63,6 +68,7 @@ STATIC_ROUTES = {
     "/authors": ("authors.html", "text/html; charset=utf-8"),
     "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/domain": ("domain.html", "text/html; charset=utf-8"),
+    "/report": ("report.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
 }
 
@@ -94,6 +100,9 @@ AUTHOR_SCAN_MODES = {
     "full": {"kinds": AUTHOR_SCAN_KINDS, "limit": AUTHOR_SCAN_FULL_LIMIT},    # every moderation-kind event, ~137s measured
 }
 AUTHOR_SCAN_DEADLINE = 240      # seconds; a FAILURE timeout for the deep scans, not a bound
+REPORT_WALK_DEADLINE = 1800     # seconds; FAILURE timeout for the one unlimited scan (see compute_report_walk)
+REPORT_AUTHOR_KEY_BYTES = 8     # bytes of pubkey retained per distinct non-giftwrap author during the walk
+RATE_SMOOTHING_WINDOW = 10      # seconds of history the live throughput estimate (rate/eta) averages over
 REASON_MAX_LEN = 500            # characters accepted for a ban reason
 REASON_UNDO_MAX = 50            # entries whose prior reasons are snapshotted for undo
 RECIPIENT_SCAN_LIMIT = 250000   # newest kind-1059 events tallied for storage accounting
@@ -117,8 +126,20 @@ _relay_cwd_path = None
 # The author list is never recomputed on a timer or because it went stale
 # — only POST /api/authors/scan (an explicit admin button press) starts a
 # scan, which then runs in a background thread so the request never blocks.
-_authors_lock = threading.Lock()
-_authors_job = {"status": "idle", "mode": None, "started_at": None, "progress": None}
+#
+# ONE global lock is shared by every asynchronous scan in the project
+# (author list, gift-wrap recipients, DM/general-relay-list subscribers,
+# report totals, report walk) — see _start_scan_job / _run_scan_job below.
+# Running two of these concurrently would contend the same LMDB and the
+# same disk, which is slower than running them in series and destroys the
+# throughput measurement every progress estimate depends on. _active_scan
+# names whichever job currently holds it, or None; _JOB_REGISTRY maps a
+# job name to the job-status dict a blocked POST should echo back.
+_scan_lock = threading.Lock()
+_active_scan = {"name": None}
+_JOB_REGISTRY = {}  # populated once every job dict below has been created
+
+_authors_job = {"status": "idle", "mode": None, "started_at": None, "progress": None, "total": None, "rate": None, "eta": None}
 # _authors_cache is initialized after _load_cache_or()/_empty_authors_result() are defined below.
 
 CONTACT_APPEAL_CHECK_INTERVAL = 1.0
@@ -507,18 +528,15 @@ def _resolve_profiles_locally(pubkeys):
 
 # --- generic async scan job machinery -------------------------------------
 # Shared by every asynchronous scan (author list, gift-wrap recipients,
-# DM/general-relay-list subscribers): validate auth, start ONE bounded scan
-# in a background thread, return 202 immediately, and let the page poll the
-# matching GET until status returns to idle. One code path for all three —
-# not a fast one and a slow one that behave differently under failure.
+# DM/general-relay-list subscribers, report totals, report walk): validate
+# auth, start ONE scan in a background thread under the single global
+# _scan_lock, return 202 immediately, and let the page poll the matching
+# GET until status returns to idle. One code path for all of them — not a
+# fast one and a slow one that behave differently under failure.
 #
-# Each resource still owns its own lock/job/cache module globals (so a
-# stalled recipients scan can never block an author-scan poll, and so
-# direct access like `server86._authors_lock` / `server86._authors_cache`
-# keeps working), but every one of them runs through the three functions
-# below. `job` and `cache` are mutated IN PLACE rather than rebound to a
-# new dict, so the caller's module-level dict object — the thing readers
-# actually hold a reference to — is always what gets updated.
+# `job` and `cache` are mutated IN PLACE rather than rebound to a new dict,
+# so the caller's module-level dict object — the thing readers actually
+# hold a reference to — is always what gets updated.
 
 def _save_cache_atomic(path, result):
     tmp_path = path + ".tmp"
@@ -539,25 +557,66 @@ def _load_cache_or(path, empty_result):
     return dict(empty_result)
 
 
-def _run_scan_job(name, lock, job, cache, cache_path, compute_fn):
+def _make_progress_cb(job):
+    """Returns a stateful progress_cb(count, total=None) closure for one
+    scan run. `total` is sticky — once given (e.g. the report walk seeding
+    it from its own `--count` before streaming starts), later calls that
+    omit it keep the last known value. rate/eta are a trailing average over
+    RATE_SMOOTHING_WINDOW seconds of (time, count) samples rather than
+    since-start, so they settle quickly instead of drifting; before two
+    samples exist in the window both are None and callers must render
+    'estimating…' rather than a number."""
+    samples = []
+    state = {"total": None}
+
+    def cb(count, total=None):
+        if total is not None:
+            state["total"] = total
+        now = time.monotonic()
+        samples.append((now, count))
+        while len(samples) > 1 and now - samples[0][0] > RATE_SMOOTHING_WINDOW:
+            samples.pop(0)
+        rate = None
+        eta = None
+        if len(samples) >= 2:
+            dt = samples[-1][0] - samples[0][0]
+            dc = samples[-1][1] - samples[0][1]
+            if dt > 0 and dc > 0:
+                rate = dc / dt
+                if state["total"] is not None and state["total"] > count:
+                    eta = (state["total"] - count) / rate
+        with _scan_lock:
+            job["progress"] = count
+            job["total"] = state["total"]
+            job["rate"] = rate
+            job["eta"] = eta
+
+    return cb
+
+
+def _run_scan_job(name, job, cache, cache_path, compute_fn):
     """Background-thread body for one async scan. `compute_fn(progress_cb)`
     returns the result dict on success. On failure the previous cache is
     preserved (mutated with a `warning` attached) and NEVER replaced with
     a partial result — a scan that hit its deadline is an error, not a
-    smaller answer."""
-    def progress_cb(count):
-        with lock:
-            job["progress"] = count
-
+    smaller answer. Always releases the global lock on the way out,
+    success or failure — a deadline that fires without releasing the lock
+    would disable every scan in the deployment until the container
+    restarts."""
+    progress_cb = _make_progress_cb(job)
     try:
         result = compute_fn(progress_cb)
     except Exception as e:
         warning = f"{name} scan failed: {type(e).__name__}: {e}"[:600]
         log(f"server86: {warning}")
-        with lock:
+        with _scan_lock:
             cache["warning"] = warning
             job["status"] = "idle"
             job["progress"] = None
+            job["total"] = None
+            job["rate"] = None
+            job["eta"] = None
+            _active_scan["name"] = None
         return
 
     try:
@@ -565,40 +624,65 @@ def _run_scan_job(name, lock, job, cache, cache_path, compute_fn):
     except OSError as e:
         log(f"server86: failed to persist {os.path.basename(cache_path)}: {e}")
 
-    with lock:
+    with _scan_lock:
         cache.clear()
         cache.update(result)
         job["status"] = "idle"
         job["progress"] = None
+        job["total"] = None
+        job["rate"] = None
+        job["eta"] = None
+        _active_scan["name"] = None
 
 
-def _start_scan_job(lock, job, run_target, extra_job_fields=None):
-    """Single-flight: a POST while one is already running does NOT start a
-    second scan and does NOT 409 — it returns the SAME 202 shape the
-    original POST returned, so a POST-then-GET from one client never
-    observes a state its own POST couldn't have produced."""
-    with lock:
-        if job["status"] == "running":
-            return dict(job)
+def _start_scan_job(name, job, run_target, extra_job_fields=None):
+    """Single-flight per endpoint, AND global across every scan endpoint:
+
+    - A POST naming the job that is already running returns the SAME 202
+      shape the original POST returned, so a POST-then-GET from one client
+      never observes a state its own POST couldn't have produced.
+    - A POST naming a DIFFERENT job while one is running does not start a
+      second subprocess and does not 409 — it returns the RUNNING job's own
+      status, with `blocked_by` naming it, so the caller can tell the two
+      apart from the response shape alone."""
+    with _scan_lock:
+        running = _active_scan["name"]
+        if running == name:
+            status = dict(job)
+            status["blocked_by"] = None
+            return status
+        if running is not None:
+            status = dict(_JOB_REGISTRY[running])
+            status["blocked_by"] = running
+            return status
+        _active_scan["name"] = name
         job.clear()
-        job.update({"status": "running", "started_at": int(time.time()), "progress": 0})
+        job.update({
+            "status": "running", "started_at": int(time.time()),
+            "progress": 0, "total": None, "rate": None, "eta": None,
+        })
         if extra_job_fields:
             job.update(extra_job_fields)
         status = dict(job)
+        status["blocked_by"] = None
 
     threading.Thread(target=run_target, daemon=True).start()
     return status
 
 
-def _scan_status(lock, job, cache):
+def _scan_status(name, job, cache):
     """GET handler body: never scans, never starts one. Merges the live
     job status over the last persisted result, so status/progress always
     reflect what's happening now and every other field reflects the last
-    completed scan (or the never-scanned skeleton)."""
-    with lock:
+    completed scan (or the never-scanned skeleton). `blocked_by` names
+    whatever OTHER job currently holds the global lock — null while this
+    job is the one running, or while nothing is running at all."""
+    with _scan_lock:
         status = dict(job)
         cached = dict(cache)
+        running = _active_scan["name"]
     cached.update(status)
+    cached["blocked_by"] = running if running not in (None, name) else None
     return cached
 
 
@@ -618,6 +702,8 @@ def compute_authors(mode, progress_cb=None):
     press."""
     filter_obj = dict(AUTHOR_SCAN_MODES[mode])
     limit = filter_obj["limit"]
+    if progress_cb:
+        progress_cb(0, total=limit)
     tally = {}  # pubkey -> {"count": int, "last_seen": int, "kind": int_or_None}
     kind_counts = {}
     span = {"start": None, "end": None}
@@ -745,29 +831,31 @@ def _empty_authors_result():
 
 
 _authors_cache = _load_cache_or(AUTHORS_CACHE_PATH, _empty_authors_result())
+_JOB_REGISTRY["authors"] = _authors_job
 
 
 def start_authors_scan(mode):
     """Start one bounded author scan in a background thread if none is
-    already running — never blocks the request."""
+    already running (and no OTHER scan holds the global lock) — never
+    blocks the request."""
     def run():
         _run_scan_job(
-            "author", _authors_lock, _authors_job, _authors_cache, AUTHORS_CACHE_PATH,
+            "authors", _authors_job, _authors_cache, AUTHORS_CACHE_PATH,
             lambda progress_cb: compute_authors(mode, progress_cb=progress_cb),
         )
-    return _start_scan_job(_authors_lock, _authors_job, run, extra_job_fields={"mode": mode})
+    return _start_scan_job("authors", _authors_job, run, extra_job_fields={"mode": mode})
 
 
 def get_authors_status():
     """GET /api/authors: never scans, never starts one."""
-    return _scan_status(_authors_lock, _authors_job, _authors_cache)
+    return _scan_status("authors", _authors_job, _authors_cache)
 
 
 def authors_scan_pubkeys():
     """The set of pubkeys currently in the author-scan cache — the second
     half of /api/names' accept-bound (banned OR in this set), and never
     itself a scan."""
-    with _authors_lock:
+    with _scan_lock:
         cached = _authors_cache
     return {a["pubkey"] for a in cached.get("authors", [])}
 
@@ -797,6 +885,8 @@ def compute_recipients(progress_cb=None):
     encrypted and senders are unlinkable; nothing here reveals who is
     talking to whom, and recipient counts are for retention/capacity
     decisions only, never a moderation signal."""
+    if progress_cb:
+        progress_cb(0, total=RECIPIENT_SCAN_LIMIT)
     tally = {}
     span = {"start": None, "end": None}
 
@@ -853,22 +943,22 @@ def compute_recipients(progress_cb=None):
     }
 
 
-_recipients_lock = threading.Lock()
-_recipients_job = {"status": "idle", "started_at": None, "progress": None}
+_recipients_job = {"status": "idle", "started_at": None, "progress": None, "total": None, "rate": None, "eta": None}
 _recipients_cache = _load_cache_or(RECIPIENTS_CACHE_PATH, _empty_recipients_result())
+_JOB_REGISTRY["recipients"] = _recipients_job
 
 
 def start_recipients_scan():
     def run():
         _run_scan_job(
-            "recipients", _recipients_lock, _recipients_job, _recipients_cache,
+            "recipients", _recipients_job, _recipients_cache,
             RECIPIENTS_CACHE_PATH, compute_recipients,
         )
-    return _start_scan_job(_recipients_lock, _recipients_job, run)
+    return _start_scan_job("recipients", _recipients_job, run)
 
 
 def get_recipients_status():
-    return _scan_status(_recipients_lock, _recipients_job, _recipients_cache)
+    return _scan_status("recipients", _recipients_job, _recipients_cache)
 
 
 # --- DM / general relay-list subscriber search -----------------------------
@@ -980,6 +1070,8 @@ def compute_subscribers(progress_cb=None):
 
     def scan_kind(kind):
         tally = {}  # pubkey -> latest created_at among matching events
+        if progress_cb:
+            progress_cb(0, total=SUBSCRIBER_SCAN_LIMIT)
 
         def on_event(ev):
             if not isinstance(ev, dict):
@@ -1047,22 +1139,276 @@ def compute_subscribers(progress_cb=None):
     }
 
 
-_subscribers_lock = threading.Lock()
-_subscribers_job = {"status": "idle", "started_at": None, "progress": None}
+_subscribers_job = {"status": "idle", "started_at": None, "progress": None, "total": None, "rate": None, "eta": None}
 _subscribers_cache = _load_cache_or(SUBSCRIBERS_CACHE_PATH, _empty_subscribers_result())
+_JOB_REGISTRY["subscribers"] = _subscribers_job
 
 
 def start_subscribers_scan():
     def run():
         _run_scan_job(
-            "subscribers", _subscribers_lock, _subscribers_job, _subscribers_cache,
+            "subscribers", _subscribers_job, _subscribers_cache,
             SUBSCRIBERS_CACHE_PATH, compute_subscribers,
         )
-    return _start_scan_job(_subscribers_lock, _subscribers_job, run)
+    return _start_scan_job("subscribers", _subscribers_job, run)
 
 
 def get_subscribers_status():
-    return _scan_status(_subscribers_lock, _subscribers_job, _subscribers_cache)
+    return _scan_status("subscribers", _subscribers_job, _subscribers_cache)
+
+
+# --- relay report: exact totals + the one unlimited scan -------------------
+# /api/report/totals answers "how big is the AUTHOR_SCAN_KINDS gap" with
+# three index counts — seconds even on a large relay, no window, no
+# `saturated`, because a `--count` is simply exact. /api/report/walk is the
+# one scan in the project allowed to be genuinely unbounded (see CLAUDE.md's
+# bounding-rule carve-out): it streams the whole database once for aggregate
+# figures only — a distinct-author count and a per-kind histogram — never a
+# list an operator could act on. Both records live in one report-cache.json,
+# written wholesale per record, with independent `scanned_at` stamps.
+
+def _empty_report_totals():
+    return {
+        "scanned_at": None, "duration": None, "total_events": None,
+        "giftwrap_events": None, "giftwrap_share": None,
+        "allowlist_events": None, "gap_events": None, "gap_share": None,
+        "warning": None,
+    }
+
+
+def _empty_report_walk():
+    return {
+        "scanned_at": None, "duration": None, "rate": None, "events_read": None,
+        "distinct_authors": None, "distinct_authors_nongiftwrap": None,
+        "distinct_authors_giftwrap": None, "kinds": {}, "unlisted_kinds": {},
+        "warning": None,
+    }
+
+
+def _load_report_cache():
+    data = _load_cache_or(REPORT_CACHE_PATH, {})
+    totals = data.get("totals")
+    walk = data.get("walk")
+    return {
+        "totals": totals if isinstance(totals, dict) else _empty_report_totals(),
+        "walk": walk if isinstance(walk, dict) else _empty_report_walk(),
+    }
+
+
+def compute_report_totals(progress_cb=None):
+    """Three `scan --count` calls, no event bodies — exact, index-only, and
+    seconds even on a large relay. The fourth figure (`gap_events`) is pure
+    arithmetic on the other three; there is no fourth call. This is the
+    AUTHOR_SCAN_KINDS staleness check from CLAUDE.md's "Auditing the
+    allowlist", promoted from a test.sh-only assertion to a number an
+    operator can press a button to see."""
+    start = time.monotonic()
+    total_events = run_strfry_count({}, timeout=AUTHOR_SCAN_DEADLINE)
+    giftwrap_events = run_strfry_count({"kinds": [1059]}, timeout=AUTHOR_SCAN_DEADLINE)
+    allowlist_events = run_strfry_count({"kinds": list(AUTHOR_SCAN_KINDS)}, timeout=AUTHOR_SCAN_DEADLINE)
+    duration = time.monotonic() - start
+
+    non_giftwrap = total_events - giftwrap_events
+    gap_events = total_events - allowlist_events - giftwrap_events
+    return {
+        "scanned_at": int(time.time()),
+        "duration": duration,
+        "total_events": total_events,
+        "giftwrap_events": giftwrap_events,
+        "giftwrap_share": (giftwrap_events / total_events) if total_events > 0 else 0.0,
+        "allowlist_events": allowlist_events,
+        "gap_events": gap_events,
+        "gap_share": (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0,
+        "warning": None,
+    }
+
+
+def compute_report_walk(progress_cb=None):
+    """The one genuinely unbounded scan in the project. Runs `--count '{}'`
+    first to learn the denominator (and seed it into progress_cb as `total`
+    before streaming starts, so a polling GET can show a percentage and an
+    ETA from the first progress tick), then streams every event exactly
+    once. All-or-nothing: on success it returns BOTH a totals record and a
+    walk record (the `--count` this needed anyway, plus the kind tally the
+    stream produces as a byproduct, refresh the totals record without a
+    second full-database pass); on hitting REPORT_WALK_DEADLINE it raises,
+    and the caller (_run_scan_job) discards everything read and preserves
+    whatever was there before.
+
+    Distinct authors are NOT stored as 64-char hex strings — on a
+    DM-carrying relay the distinct-pubkey set approaches the event count,
+    and a few million hex strings is several hundred MB inside the
+    operator's live relay container. Two measures: kind 1059 (gift wraps)
+    is skipped entirely, since NIP-17 gift wraps are signed by a fresh key
+    per message by specification, so their distinct-author count IS their
+    event count, already known exactly from the tally; every other author
+    is folded into a set of REPORT_AUTHOR_KEY_BYTES-byte prefixes, whose
+    collision probability stays far below the honesty threshold of every
+    other number on this page even past a million distinct authors."""
+    count_start = time.monotonic()
+    total_events = run_strfry_count({}, timeout=REPORT_WALK_DEADLINE)
+    if progress_cb:
+        progress_cb(0, total=total_events)
+    count_duration = time.monotonic() - count_start
+
+    kind_counts = {}
+    distinct_prefixes = set()
+    giftwrap_count = 0
+
+    def on_event(ev):
+        nonlocal giftwrap_count
+        if not isinstance(ev, dict):
+            return
+        kind = ev.get("kind")
+        if isinstance(kind, int):
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if kind == 1059:
+            giftwrap_count += 1
+            return
+        pk = ev.get("pubkey")
+        if isinstance(pk, str) and is_hex64(pk):
+            distinct_prefixes.add(bytes.fromhex(pk)[:REPORT_AUTHOR_KEY_BYTES])
+
+    stream_start = time.monotonic()
+    events_read = run_strfry_scan_streaming(
+        {}, on_event, timeout=REPORT_WALK_DEADLINE,
+        on_progress=(lambda c: progress_cb(c)) if progress_cb else None,
+    )
+    duration = count_duration + (time.monotonic() - stream_start)
+    rate = events_read / duration if duration > 0 else None
+
+    allowlist_kinds_set = set(AUTHOR_SCAN_KINDS)
+    unlisted_kinds = {
+        k: c for k, c in kind_counts.items()
+        if k not in allowlist_kinds_set and k != 1059
+    }
+
+    giftwrap_events = kind_counts.get(1059, 0)
+    allowlist_events = sum(c for k, c in kind_counts.items() if k in allowlist_kinds_set)
+    non_giftwrap = total_events - giftwrap_events
+    gap_events = total_events - allowlist_events - giftwrap_events
+
+    totals_record = {
+        "scanned_at": int(time.time()),
+        "duration": count_duration,
+        "total_events": total_events,
+        "giftwrap_events": giftwrap_events,
+        "giftwrap_share": (giftwrap_events / total_events) if total_events > 0 else 0.0,
+        "allowlist_events": allowlist_events,
+        "gap_events": gap_events,
+        "gap_share": (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0,
+        "warning": None,
+    }
+    walk_record = {
+        "scanned_at": int(time.time()),
+        "duration": duration,
+        "rate": rate,
+        "events_read": events_read,
+        "distinct_authors": len(distinct_prefixes) + giftwrap_count,
+        "distinct_authors_nongiftwrap": len(distinct_prefixes),
+        "distinct_authors_giftwrap": giftwrap_count,
+        "kinds": kind_counts,
+        "unlisted_kinds": unlisted_kinds,
+        "warning": None,
+    }
+    return {"totals": totals_record, "walk": walk_record}
+
+
+_report_job = {
+    "status": "idle", "job": None, "started_at": None,
+    "progress": None, "total": None, "rate": None, "eta": None,
+}
+_report_cache = _load_report_cache()
+# Both report job names resolve to the same _report_job dict: totals and
+# walk share the report resource and therefore share the report entry in
+# _JOB_REGISTRY — only one of the two can ever run at a time anyway, since
+# both take the same global _scan_lock like every other scan here.
+_JOB_REGISTRY["report-totals"] = _report_job
+_JOB_REGISTRY["report-walk"] = _report_job
+
+
+def _run_report_job(job_name, compute_fn):
+    """Same shape as _run_scan_job, specialized for the two-record report
+    cache: a totals-only run replaces just the totals record; a walk run
+    replaces both (see compute_report_walk). A failure attaches `warning`
+    to the record THIS run was attempting and leaves the other completely
+    untouched — a walk timeout must never even brush the totals record."""
+    progress_cb = _make_progress_cb(_report_job)
+    try:
+        result = compute_fn(progress_cb)
+    except Exception as e:
+        warning = f"report {job_name} failed: {type(e).__name__}: {e}"[:600]
+        log(f"server86: {warning}")
+        with _scan_lock:
+            key = "totals" if job_name == "totals" else "walk"
+            _report_cache[key]["warning"] = warning
+            _report_job["status"] = "idle"
+            _report_job["job"] = None
+            _report_job["progress"] = None
+            _report_job["total"] = None
+            _report_job["rate"] = None
+            _report_job["eta"] = None
+            _active_scan["name"] = None
+        return
+
+    if job_name == "totals":
+        new_totals, new_walk = result, dict(_report_cache["walk"])
+    else:
+        new_totals, new_walk = result["totals"], result["walk"]
+
+    try:
+        _save_cache_atomic(REPORT_CACHE_PATH, {"totals": new_totals, "walk": new_walk})
+    except OSError as e:
+        log(f"server86: failed to persist report-cache.json: {e}")
+
+    with _scan_lock:
+        _report_cache["totals"] = new_totals
+        _report_cache["walk"] = new_walk
+        _report_job["status"] = "idle"
+        _report_job["job"] = None
+        _report_job["progress"] = None
+        _report_job["total"] = None
+        _report_job["rate"] = None
+        _report_job["eta"] = None
+        _active_scan["name"] = None
+
+
+def start_report_totals_scan():
+    def run():
+        _run_report_job("totals", compute_report_totals)
+    return _start_scan_job("report-totals", _report_job, run, extra_job_fields={"job": "totals"})
+
+
+def start_report_walk_scan():
+    def run():
+        _run_report_job("walk", compute_report_walk)
+    return _start_scan_job("report-walk", _report_job, run, extra_job_fields={"job": "walk"})
+
+
+def get_report_status():
+    """GET /api/report: never scans, never starts one. `totals`/`walk` are
+    null until each has run at least once — the page's own 'never run'
+    state — rather than a skeleton dict with every field null, so the
+    client can tell 'no result yet' apart from 'a result with nulls in it'
+    with one falsy check."""
+    with _scan_lock:
+        job = dict(_report_job)
+        totals = dict(_report_cache["totals"])
+        walk = dict(_report_cache["walk"])
+        running = _active_scan["name"]
+    blocked_by = running if running not in (None, "report-totals", "report-walk") else None
+    return {
+        "status": job["status"],
+        "job": job["job"],
+        "started_at": job["started_at"],
+        "progress": job["progress"],
+        "total": job["total"],
+        "rate": job["rate"],
+        "eta": job["eta"],
+        "blocked_by": blocked_by,
+        "totals": totals if totals.get("scanned_at") is not None else None,
+        "walk": walk if walk.get("scanned_at") is not None else None,
+    }
 
 
 def validate_authors_scan_mode(body):
@@ -1240,7 +1586,7 @@ def build_profile_response(pubkey_hex):
 
     scan_rank = None
     scan_count = None
-    with _authors_lock:
+    with _scan_lock:
         cached_authors = list(_authors_cache.get("authors", []))
     for i, a in enumerate(cached_authors):
         if a.get("pubkey") == pubkey_hex:
@@ -1292,7 +1638,7 @@ def compute_pubkeys_lookup(pubkeys, domain):
     NAME_RESOLVE_MAX, everything else a dict lookup against the
     blacklist and the author-scan cache. No scan beyond that one batch."""
     blacklist_data = blacklist.load()
-    with _authors_lock:
+    with _scan_lock:
         scan_counts = {a["pubkey"]: a.get("count") for a in _authors_cache.get("authors", [])}
 
     try:
@@ -1524,6 +1870,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_subscribers_status())
             return
 
+        if path == "/api/report":
+            self._send_json(200, get_report_status())
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1531,7 +1881,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in (
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
-            "/api/pubkeys/lookup",
+            "/api/pubkeys/lookup", "/api/report/totals", "/api/report/walk",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -1575,6 +1925,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/subscribers":
             status = start_subscribers_scan()
+            self._send_json(202, status)
+            return
+
+        if path == "/api/report/totals":
+            status = start_report_totals_scan()
+            self._send_json(202, status)
+            return
+
+        if path == "/api/report/walk":
+            status = start_report_walk_scan()
             self._send_json(202, status)
             return
 

@@ -478,29 +478,240 @@ function s86WireCopyPurge(buttonEl, preEl, listEl, checkboxClass) {
 
 // --- command blocks -----------------------------------------------------
 // Nothing here is executed and nothing here is fetched — every command is
-// plain copyable text. Identical on both pages.
+// plain copyable text. Identical on every page.
+
+// --- cached-scan panel ----------------------------------------------------
+// Shared by report.html's four panels and by authors.html's own scan area
+// (chrome only there — authors.html keeps its bespoke mode-radio UI, but
+// renders its status line through s86ScanStatusText so the wording is
+// identical everywhere a scan's progress is shown). heading / cost line /
+// button / status line / result, in that fixed order. 'never run' is a
+// visible state, not a hidden panel — the admin's first login shows the
+// full inventory of what this page can tell them, empty, with the buttons
+// that fill it.
+
+var S86_JOB_LABELS = {
+  authors: 'the author scan',
+  recipients: 'the gift-wrap recipient scan',
+  subscribers: 'the subscriber scan',
+  'report-totals': 'the database totals refresh',
+  'report-walk': 'the database walk'
+};
+
+function s86FormatRelativeAge(unixSeconds) {
+  if (!unixSeconds) {
+    return '';
+  }
+  var deltaSec = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
+  if (deltaSec < 60) {
+    return 'just now';
+  }
+  var mins = Math.floor(deltaSec / 60);
+  if (mins < 60) {
+    return mins + ' minute' + (mins === 1 ? '' : 's') + ' ago';
+  }
+  var hours = Math.floor(mins / 60);
+  if (hours < 24) {
+    return hours + ' hour' + (hours === 1 ? '' : 's') + ' ago';
+  }
+  var days = Math.floor(hours / 24);
+  return days + ' day' + (days === 1 ? '' : 's') + ' ago';
+}
+
+// Absolute AND relative, always together: 'scanned 2026-07-26@14:02 UTC (3
+// days ago)'. The absolute form is the locked project timestamp format;
+// the relative form is what makes staleness legible at a glance on a page
+// holding several results of several different ages.
+function s86FormatScanAge(unixSeconds) {
+  return 'scanned ' + s86FormatDate(unixSeconds) + ' (' + s86FormatRelativeAge(unixSeconds) + ')';
+}
+
+function s86FormatRate(rate) {
+  return Math.max(0, Math.round(rate)).toLocaleString() + ' events/sec';
+}
+
+function s86FormatEta(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) {
+    return 'estimating…';
+  }
+  if (seconds < 60) {
+    return '<1 min left';
+  }
+  var mins = Math.round(seconds / 60);
+  if (mins < 60) {
+    return '~' + mins + ' min left';
+  }
+  var hours = Math.floor(mins / 60);
+  var remMins = mins % 60;
+  return '~' + hours + 'h' + (remMins ? ' ' + remMins + 'm' : '') + ' left';
+}
+
+function s86FormatDuration(seconds) {
+  if (seconds == null) {
+    return '';
+  }
+  var m = Math.floor(seconds / 60);
+  var s = Math.round(seconds % 60);
+  return m > 0 ? (m + 'm ' + (s < 10 ? '0' : '') + s + 's') : (s + 's');
+}
+
+// status: {status: 'idle'|'running', scanned_at, progress, total, rate,
+// eta, blocked_by, warning}. The one function that renders a scan's
+// progress line everywhere it appears, so 'scanning…' means the same
+// thing on every page. No estimate is ever computed client-side beyond
+// formatting the server's own numbers — the client may not invent a rate.
+function s86ScanStatusText(status) {
+  if (status.blocked_by) {
+    return 'waiting on ' + (S86_JOB_LABELS[status.blocked_by] || status.blocked_by);
+  }
+  if (status.status === 'running') {
+    var progress = status.progress || 0;
+    if (status.total && status.rate) {
+      var pct = Math.min(100, Math.floor(progress / status.total * 100));
+      return 'scanning… ' + progress.toLocaleString() + ' of ' + status.total.toLocaleString()
+        + ' events (' + pct + '%) — ' + s86FormatEta(status.eta) + ' at ' + s86FormatRate(status.rate);
+    }
+    if (status.total) {
+      return 'scanning… ' + progress.toLocaleString() + ' of ' + status.total.toLocaleString() + ' events — estimating…';
+    }
+    return 'scanning… ' + progress.toLocaleString() + ' events read';
+  }
+  if (!status.scanned_at) {
+    return 'never run';
+  }
+  var line = s86FormatScanAge(status.scanned_at);
+  if (status.warning) {
+    line += ' — ' + status.warning;
+  }
+  return line;
+}
+
+// opts: {
+//   heading, costText (string shown before any run — describes the WORK,
+//     never a duration), buttonLabel, onStart (function() -> Promise,
+//     issues the signed POST),
+//   renderResult(container, record) — record is never null when called,
+//   lastRunNote(record) -> string|null, appended to the cost line once a
+//     record exists ('last run: 9m 06s at 4,814 events/sec'). No duration
+//     from a relay other than the operator's own is ever printed here.
+//   extraNote(record) -> string|null — a staleness-consequence line.
+// }
+// Returns {el, applyStatus(jobStatus, record)}. The caller owns polling
+// and auth; this only owns the DOM shape and the shared status wording.
+function s86BuildScanPanel(opts) {
+  var el = document.createElement('div');
+  el.appendChild(s86El('h3', opts.heading));
+
+  var costLine = s86El('p', opts.costText);
+  el.appendChild(costLine);
+
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = opts.buttonLabel;
+  var btnP = document.createElement('p');
+  btnP.appendChild(btn);
+  el.appendChild(btnP);
+
+  var statusLine = s86El('p', 'never run');
+  el.appendChild(statusLine);
+
+  var resultEl = document.createElement('div');
+  el.appendChild(resultEl);
+
+  btn.addEventListener('click', function () {
+    if (btn.disabled) {
+      return;
+    }
+    btn.disabled = true;
+    opts.onStart().catch(function () {
+      statusLine.textContent = opts.buttonLabel + ' failed';
+      btn.disabled = false;
+    });
+  });
+
+  function applyStatus(jobStatus, record) {
+    statusLine.textContent = s86ScanStatusText(jobStatus);
+    btn.disabled = jobStatus.status === 'running' || !!jobStatus.blocked_by;
+
+    resultEl.textContent = '';
+    costLine.textContent = opts.costText;
+    if (record) {
+      if (opts.lastRunNote) {
+        var note = opts.lastRunNote(record);
+        if (note) {
+          costLine.textContent = opts.costText + ' — ' + note;
+        }
+      }
+      opts.renderResult(resultEl, record);
+      if (opts.extraNote) {
+        var extra = opts.extraNote(record);
+        if (extra) {
+          resultEl.appendChild(s86El('p', extra));
+        }
+      }
+    }
+  }
+
+  return { el: el, applyStatus: applyStatus };
+}
+
+// --- generic status polling -----------------------------------------------
+// fetchFn() -> Promise<data>; applyFn(data) renders it. Re-polls every 3s
+// while data.status === 'running', stops otherwise. A failed fetch keeps
+// polling rather than declaring failure — every one of these scans is
+// server-side and unaffected by the browser's connection to it.
+function s86PollStatus(fetchFn, applyFn, onError) {
+  function poll() {
+    fetchFn()
+      .then(function (data) {
+        applyFn(data);
+        if (data.status === 'running') {
+          setTimeout(poll, 3000);
+        }
+      })
+      .catch(function () {
+        if (onError) {
+          onError();
+        }
+        setTimeout(poll, 3000);
+      });
+  }
+  poll();
+}
 
 // --- command generator ---------------------------------------------------
-// ONE <select> of intents, ONE input that appears only when the selected
-// intent needs one, ONE <pre> holding the rendered command, ONE copy
-// button. Replaces a wall of static <pre>s nobody read. Nothing here is
+// ONE <select> of intents, a FIELD SET that changes with the selection,
+// ONE <pre> holding the rendered command, ONE copy button. Nothing here is
 // executed, nothing is fetched by pressing anything in it, no output ever
 // returns to the page — the terminal is where this project sends
-// everything it refuses to do itself. The one exception is the gift-wrap
-// purge intent's own "scan recipients"/"scan subscribers" buttons, which
-// are the SAME admin-triggered async scans Phase 2 already built — a
-// legitimate server action feeding parameters INTO a rendered command,
-// never the rendered command itself.
+// everything it refuses to do itself.
 //
-// A pubkey is decoded and re-encoded to canonical hex before it reaches
-// the <pre>; a domain is hostname-validated; days is a plain positive
-// integer. Nothing here executes, but a tool that renders whatever it's
-// handed teaches a habit that's wrong everywhere else in this project.
+// The generator is now almost entirely destructive: every non-destructive
+// intent it used to carry is a live button somewhere else (report.html's
+// totals/walk panels, GET /api/subscribers, domain.html's own fetch). Each
+// of those was a second implementation of a question the software already
+// answered — a command block duplicating a working button is how the
+// block goes stale without anyone noticing. 'Event kinds by author,
+// lifetime' is the one survivor, because it is not a duplicate:
+// /api/profile reports the kind tally over the most recent
+// PROFILE_EVENT_LIMIT events, and this is the whole-history version.
+//
+// Fields are typed, and the type is validated before substitution. A
+// pubkey is decoded and re-encoded to canonical hex before it reaches the
+// <pre>; days is an integer; a kind is an integer, offered as a
+// <datalist> for convenience but never restricted to it. Nothing here
+// executes, but a tool that renders whatever it's handed teaches a habit
+// that's wrong everywhere else in this project.
 
 var S86_GIFTWRAP_PURGE_DEFAULT_DAYS = 90;
 var S86_SUBSCRIBER_CACHE_STALE_SECONDS = 7 * 24 * 3600;
 var S86_GIFTWRAP_PURGE_CHUNK_SIZE = 200;
 var S86_STRFRY_CONFIG_FLAG = '--config /config/strfry.conf';
+var S86_KNOWN_KINDS_LIST = [
+  [0, 'profile'], [1, 'note'], [5, 'deletion'], [6, 'repost'], [7, 'reaction'],
+  [1059, 'gift wrap'], [1984, 'report'], [9735, 'zap receipt'],
+  [10002, 'relay list'], [10050, 'DM relay list'], [30023, 'long-form']
+];
 
 function s86ValidateDomainInput(raw) {
   raw = (raw || '').trim();
@@ -531,19 +742,46 @@ function s86ValidateDaysInput(raw) {
   return n > 0 ? { ok: true, value: n } : { ok: false, value: null };
 }
 
+// Returns {ok, value}. Blank is valid and means 'no time bound' (value:
+// null) — a distinct, louder state from a default, since 'delete all
+// events by this author, all time' is not the same claim as 'the last 90
+// days' and must never be reached by leaving a field empty by accident.
+function s86ValidateOptionalDaysInput(raw) {
+  raw = (raw || '').trim();
+  if (!raw) {
+    return { ok: true, value: null };
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    return { ok: false, value: null };
+  }
+  var n = parseInt(raw, 10);
+  return n > 0 ? { ok: true, value: n } : { ok: false, value: null };
+}
+
+// Returns {ok, value}. Blank is valid (value: null, no kind filter);
+// present-but-non-numeric is rejected rather than silently ignored.
+function s86ValidateOptionalKindInput(raw) {
+  raw = (raw || '').trim();
+  if (!raw) {
+    return { ok: true, value: null };
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    return { ok: false, value: null };
+  }
+  return { ok: true, value: parseInt(raw, 10) };
+}
+
 // A small json-lines tally, written in python3 rather than jq/awk because
 // python3 is a hard requirement of this whole project (server86.py and
 // plugin86.py both run on it inside the operator's own container), so it
 // is guaranteed present — unlike jq, and unlike an awk one-liner naive
 // quote-splitting would need, which breaks the moment `content` contains
 // an internal quote.
-function s86PyKindTallyScript(withAuthorsAndGiftwrapShare) {
-  var lines = [
+function s86PyKindTallyScript() {
+  return [
     'import sys, json',
     'total = 0',
     'kinds = {}',
-    withAuthorsAndGiftwrapShare ? 'authors = set()' : null,
-    withAuthorsAndGiftwrapShare ? 'giftwraps = 0' : null,
     'for line in sys.stdin:',
     '    line = line.strip()',
     '    if not line:',
@@ -555,17 +793,11 @@ function s86PyKindTallyScript(withAuthorsAndGiftwrapShare) {
     '    total += 1',
     '    k = e.get("kind")',
     '    kinds[k] = kinds.get(k, 0) + 1',
-    withAuthorsAndGiftwrapShare ? '    authors.add(e.get("pubkey"))' : null,
-    withAuthorsAndGiftwrapShare ? '    if k == 1059:' : null,
-    withAuthorsAndGiftwrapShare ? '        giftwraps += 1' : null,
-    withAuthorsAndGiftwrapShare ? 'print("total events:", total)' : null,
-    withAuthorsAndGiftwrapShare ? 'print("distinct authors:", len(authors))' : null,
-    withAuthorsAndGiftwrapShare ? 'print("gift-wrap share: %.1f%%" % (giftwraps / total * 100 if total else 0))' : null,
+    'print("total events:", total)',
     'print("kind histogram:")',
     'for k, c in sorted(kinds.items(), key=lambda kv: -kv[1]):',
     '    print("  kind", k, ":", c)',
-  ].filter(function (l) { return l !== null; });
-  return lines.join('\n');
+  ].join('\n');
 }
 
 function s86RenderDeleteWithCountFirst(filterObj) {
@@ -637,12 +869,39 @@ function s86WireGiftwrapPurgeSources(onUpdate) {
   };
 }
 
+var S86_COMMAND_INTENTS = [
+  {
+    key: 'delete_by_author',
+    label: 'Delete all events by author',
+    fields: [
+      { key: 'pubkey', type: 'pubkey', label: 'pubkey (npub or hex): ' },
+      { key: 'days', type: 'days_optional', label: 'older than (days, blank = all time): ' },
+      { key: 'kind', type: 'kind_optional', label: 'kind (optional): ' }
+    ]
+  },
+  {
+    key: 'giftwrap_purge',
+    label: 'Gift-wrap retention purge',
+    fields: [
+      { key: 'days', type: 'days', label: 'older than (days): ' },
+      { key: 'exempt', type: 'checkbox', label: 'exempt subscribers' }
+    ]
+  },
+  {
+    key: 'kinds_by_author',
+    label: 'Event kinds by author, lifetime',
+    fields: [
+      { key: 'pubkey', type: 'pubkey', label: 'pubkey (npub or hex): ' }
+    ]
+  }
+];
+
 function s86BuildCommandGenerator(options) {
   options = options || {};
 
   var container = document.createElement('div');
   var details = document.createElement('details');
-  details.appendChild(s86El('summary', 'terminal commands'));
+  details.appendChild(s86El('summary', 'terminal commands (destructive)'));
 
   ['--config is mandatory or strfry reads the wrong database.',
    '--count returns a number without streaming event bodies, which is why counting is seconds and the histogram is minutes.',
@@ -651,16 +910,7 @@ function s86BuildCommandGenerator(options) {
   ].forEach(function (line) { details.appendChild(s86El('p', line)); });
 
   var select = document.createElement('select');
-  var intents = [
-    { key: 'count_all', label: 'Count all events', input: null },
-    { key: 'whole_db_report', label: 'Whole-database report: total, kind histogram, author count, gift-wrap share (~9 min)', input: null },
-    { key: 'kinds_by_author', label: 'Event kinds by author', input: 'pubkey' },
-    { key: 'delete_by_author', label: 'Delete all events by author', input: 'pubkey' },
-    { key: 'giftwrap_purge', label: 'Gift-wrap retention purge', input: 'days' },
-    { key: 'dm_inbox_list', label: 'Who lists this relay as their DM inbox', input: null },
-    { key: 'fetch_domain', label: "Fetch a domain's nostr.json", input: 'domain' },
-  ];
-  intents.forEach(function (intent) {
+  S86_COMMAND_INTENTS.forEach(function (intent) {
     var opt = document.createElement('option');
     opt.value = intent.key;
     opt.textContent = intent.label;
@@ -668,20 +918,24 @@ function s86BuildCommandGenerator(options) {
   });
   if (options.pubkey) {
     select.value = 'kinds_by_author';
-  } else if (options.domain) {
-    select.value = 'fetch_domain';
   }
   var selectRow = document.createElement('p');
   selectRow.appendChild(select);
   details.appendChild(selectRow);
 
-  var inputRow = document.createElement('p');
-  var inputLabel = document.createElement('span');
-  var input = document.createElement('input');
-  input.type = 'text';
-  inputRow.appendChild(inputLabel);
-  inputRow.appendChild(input);
-  details.appendChild(inputRow);
+  var kindDatalistId = 's86-known-kinds-' + Math.random().toString(36).slice(2);
+  var kindDatalist = document.createElement('datalist');
+  kindDatalist.id = kindDatalistId;
+  S86_KNOWN_KINDS_LIST.forEach(function (pair) {
+    var opt = document.createElement('option');
+    opt.value = String(pair[0]);
+    opt.label = pair[1];
+    kindDatalist.appendChild(opt);
+  });
+  details.appendChild(kindDatalist);
+
+  var fieldsEl = document.createElement('div');
+  details.appendChild(fieldsEl);
 
   var extraEl = document.createElement('div');
   details.appendChild(extraEl);
@@ -699,23 +953,93 @@ function s86BuildCommandGenerator(options) {
   });
   details.appendChild(copyBtn);
 
-  // Wired once, unconditionally — the two GETs are public reads and this
-  // just keeps the generator's own data current; onUpdate re-renders IF
-  // the purge intent happens to be the one currently selected, so a fetch
-  // resolving shortly after the intent was picked doesn't get stranded.
+  // Wired once, unconditionally — the two GETs are public reads (they
+  // serve the same persisted caches report.html's own panels poll) and
+  // this just keeps the generator's own data current; onUpdate re-renders
+  // IF the purge intent happens to be the one currently selected, so a
+  // fetch resolving shortly after the intent was picked doesn't get
+  // stranded.
   var purgeSources = s86WireGiftwrapPurgeSources(function () {
     if (currentIntent().key === 'giftwrap_purge') {
-      renderGiftwrapPurge();
+      render();
     }
   });
 
+  var fieldInputs = {};
+
   function currentIntent() {
-    return intents.filter(function (i) { return i.key === select.value; })[0];
+    return S86_COMMAND_INTENTS.filter(function (i) { return i.key === select.value; })[0];
+  }
+
+  function buildFields(intent) {
+    fieldsEl.textContent = '';
+    fieldInputs = {};
+    intent.fields.forEach(function (f) {
+      var p = document.createElement('p');
+      p.appendChild(s86El('span', f.label));
+
+      var input = document.createElement('input');
+      if (f.type === 'checkbox') {
+        input.type = 'checkbox';
+        input.checked = true;
+      } else {
+        input.type = 'text';
+        if (f.type === 'kind_optional') {
+          input.setAttribute('list', kindDatalistId);
+          input.placeholder = 'e.g. 1';
+        } else if (f.type === 'pubkey') {
+          input.placeholder = 'npub or hex';
+        } else if (f.type === 'days') {
+          input.placeholder = String(S86_GIFTWRAP_PURGE_DEFAULT_DAYS);
+        } else if (f.type === 'days_optional') {
+          input.placeholder = 'blank = all time';
+        }
+      }
+      input.addEventListener(f.type === 'checkbox' ? 'change' : 'input', render);
+      fieldInputs[f.key] = input;
+      p.appendChild(input);
+      fieldsEl.appendChild(p);
+    });
+  }
+
+  // Destructive intents render their equivalent scan --count line directly
+  // above the delete command, on every field change, always — the count
+  // and the command are one render or they are blank, never out of sync.
+
+  function renderDeleteByAuthor() {
+    var hex = s86PubkeyInputToHex(fieldInputs.pubkey.value);
+    if (!hex) {
+      pre.textContent = 'enter a pubkey above';
+      return;
+    }
+    var daysCheck = s86ValidateOptionalDaysInput(fieldInputs.days.value);
+    if (!daysCheck.ok) {
+      pre.textContent = 'enter a positive whole number of days above, or leave it blank for all time';
+      return;
+    }
+    var kindCheck = s86ValidateOptionalKindInput(fieldInputs.kind.value);
+    if (!kindCheck.ok) {
+      pre.textContent = 'enter a valid kind number above, or leave it blank';
+      return;
+    }
+    var filter = { authors: [hex] };
+    if (daysCheck.value != null) {
+      // Resolved to a literal timestamp at render time, never a relative
+      // expression — the copied command means the same thing an hour
+      // later as it did in the clipboard, and slightly LESS deletion,
+      // which is the correct direction to be wrong in.
+      filter.until = Math.floor(Date.now() / 1000) - daysCheck.value * 86400;
+    } else {
+      extraEl.appendChild(s86El('p', 'no time bound — this deletes every matching event, all time'));
+    }
+    if (kindCheck.value != null) {
+      filter.kinds = [kindCheck.value];
+    }
+    pre.textContent = s86RenderDeleteWithCountFirst(filter);
   }
 
   function renderGiftwrapPurge() {
-    var daysCheck = s86ValidateDaysInput(input.value);
-    extraEl.textContent = '';
+    var daysCheck = s86ValidateDaysInput(fieldInputs.days.value);
     if (!daysCheck.ok) {
       pre.textContent = 'enter a positive whole number of days above';
       return;
@@ -724,60 +1048,25 @@ function s86BuildCommandGenerator(options) {
     var cutoff = Math.floor(Date.now() / 1000) - days * 86400;
     var blanket = s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff });
 
+    if (!fieldInputs.exempt.checked) {
+      pre.textContent = blanket;
+      return;
+    }
+
     var recipients = purgeSources.getRecipientsCache();
     var subscribers = purgeSources.getSubscribersCache();
     var subsFresh = subscribers && subscribers.scanned_at
       && (Math.floor(Date.now() / 1000) - subscribers.scanned_at) <= S86_SUBSCRIBER_CACHE_STALE_SECONDS;
     var recipientsAvailable = recipients && recipients.scanned_at;
 
-    var notice = document.createElement('p');
     if (!recipientsAvailable || !subsFresh) {
       var reason = !recipients || !recipients.scanned_at
         ? 'no recipient scan has been run yet'
         : (!subscribers || !subscribers.scanned_at
           ? 'no subscriber scan has been run yet'
           : 'the subscriber scan is more than 7 days old');
-      notice.textContent = 'subscriber-exempt form unavailable: ' + reason + '. Showing the blanket form only — it purges EVERY subscriber\'s gift wraps too.';
-      extraEl.appendChild(notice);
-
-      var scanErrorLine = document.createElement('p');
-      extraEl.appendChild(scanErrorLine);
-
-      if (!recipients || !recipients.scanned_at) {
-        var rBtn = document.createElement('button');
-        rBtn.type = 'button';
-        rBtn.textContent = 'scan recipients now (a few minutes)';
-        rBtn.addEventListener('click', function () {
-          rBtn.disabled = true;
-          purgeSources.onScanRecipients(function (err) {
-            if (err) {
-              scanErrorLine.textContent = err;
-              rBtn.disabled = false;
-              return;
-            }
-            renderGiftwrapPurge();
-          });
-        });
-        extraEl.appendChild(rBtn);
-      }
-      if (!subscribers || !subscribers.scanned_at || !subsFresh) {
-        var sBtn = document.createElement('button');
-        sBtn.type = 'button';
-        sBtn.textContent = 'scan subscribers now';
-        sBtn.addEventListener('click', function () {
-          sBtn.disabled = true;
-          purgeSources.onScanSubscribers(function (err) {
-            if (err) {
-              scanErrorLine.textContent = err;
-              sBtn.disabled = false;
-              return;
-            }
-            renderGiftwrapPurge();
-          });
-        });
-        extraEl.appendChild(sBtn);
-      }
-
+      extraEl.appendChild(s86El('p', 'subscriber-exempt form unavailable: ' + reason
+        + '. Run the missing scan(s) on the report page, or uncheck "exempt subscribers" for the blanket form below.'));
       pre.textContent = blanket;
       return;
     }
@@ -788,8 +1077,7 @@ function s86BuildCommandGenerator(options) {
       .map(function (r) { return r.pubkey; })
       .filter(function (pk) { return !subscriberPubkeys[pk]; });
 
-    notice.textContent = 'subscriber-exempt form (excludes ' + Object.keys(subscriberPubkeys).length + ' DM-inbox subscriber(s)):';
-    extraEl.appendChild(notice);
+    extraEl.appendChild(s86El('p', 'subscriber-exempt form (excludes ' + Object.keys(subscriberPubkeys).length + ' DM-inbox subscriber(s)):'));
 
     var chunks = [];
     for (var i = 0; i < exempt.length; i += S86_GIFTWRAP_PURGE_CHUNK_SIZE) {
@@ -806,67 +1094,33 @@ function s86BuildCommandGenerator(options) {
       + blanket;
   }
 
+  function renderKindsByAuthor() {
+    var hex = s86PubkeyInputToHex(fieldInputs.pubkey.value);
+    pre.textContent = hex
+      ? ("strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript() + "\n'")
+      : 'enter a pubkey above';
+  }
+
   function render() {
-    var intent = currentIntent();
-    inputRow.style.display = intent.input ? '' : 'none';
     extraEl.textContent = '';
-    input.placeholder = '';
-
-    if (intent.input === 'pubkey') {
-      inputLabel.textContent = 'pubkey (npub or hex): ';
-      input.placeholder = 'npub or hex';
-    } else if (intent.input === 'domain') {
-      inputLabel.textContent = 'domain: ';
-      input.placeholder = 'example.com';
-    } else if (intent.input === 'days') {
-      inputLabel.textContent = 'days (default ' + S86_GIFTWRAP_PURGE_DEFAULT_DAYS + '): ';
-      input.placeholder = String(S86_GIFTWRAP_PURGE_DEFAULT_DAYS);
-    }
-
-    if (intent.key === 'count_all') {
-      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '{}'";
-    } else if (intent.key === 'whole_db_report') {
-      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '{}' | python3 -c '\n" + s86PyKindTallyScript(true) + "\n'";
-    } else if (intent.key === 'kinds_by_author') {
-      var hex = s86PubkeyInputToHex(input.value);
-      if (!hex) {
-        pre.textContent = 'enter a pubkey above';
-      } else {
-        pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript(false) + "\n'";
-      }
-    } else if (intent.key === 'delete_by_author') {
-      var hex2 = s86PubkeyInputToHex(input.value);
-      pre.textContent = hex2 ? s86RenderDeleteWithCountFirst({ authors: [hex2] }) : 'enter a pubkey above';
+    var intent = currentIntent();
+    if (intent.key === 'delete_by_author') {
+      renderDeleteByAuthor();
     } else if (intent.key === 'giftwrap_purge') {
       renderGiftwrapPurge();
-    } else if (intent.key === 'dm_inbox_list') {
-      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ kinds: [10050] }) + "' | python3 -c '\n"
-        + 'import sys, json\n'
-        + 'for line in sys.stdin:\n'
-        + '    line = line.strip()\n'
-        + '    if not line:\n'
-        + '        continue\n'
-        + '    try:\n'
-        + '        e = json.loads(line)\n'
-        + '    except ValueError:\n'
-        + '        continue\n'
-        + '    for tag in e.get("tags", []):\n'
-        + '        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "relay":\n'
-        + '            print(e.get("pubkey"), tag[1])\n'
-        + "'  # pubkey, relay-tag pairs — check manually against this relay's own URL";
-    } else if (intent.key === 'fetch_domain') {
-      var domain = s86ValidateDomainInput(input.value);
-      pre.textContent = domain ? ('curl -s https://' + domain + '/.well-known/nostr.json') : 'enter a domain above';
+    } else if (intent.key === 'kinds_by_author') {
+      renderKindsByAuthor();
     }
   }
 
-  select.addEventListener('change', render);
-  input.addEventListener('input', render);
+  select.addEventListener('change', function () {
+    buildFields(currentIntent());
+    render();
+  });
 
-  if (options.pubkey) {
-    input.value = options.pubkey;
-  } else if (options.domain) {
-    input.value = options.domain;
+  buildFields(currentIntent());
+  if (options.pubkey && fieldInputs.pubkey) {
+    fieldInputs.pubkey.value = options.pubkey;
   }
   render();
 
