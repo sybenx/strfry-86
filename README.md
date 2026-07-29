@@ -103,9 +103,13 @@ The `/authors` page (linked from the ban list) is admin-only. It offers two scan
 
 Both scans run in the background and the page just polls for the result — closing the tab mid-scan loses nothing, and a page reload picks the poll back up rather than starting a fresh scan. **This means your reverse proxy or tunnel needs its read timeout raised to at least 300 seconds; Cloudflare's free tier cannot host this page at all**, since its 100-second request cap isn't configurable — direct binding, a tailnet, or self-managed nginx all work fine. Nothing scans on page load, on login, or on a timer — only the scan button starts one, and the result is saved to disk (`authors-cache.json`) so it survives the updater restarting the admin page on every update.
 
-## Gift-wrap storage accounting (API only, for now)
+## Checking a domain's roster
 
-Two more bounded, background-scanned endpoints exist server-side: `/api/recipients` tallies who's on the receiving end of your relay's gift wraps (NIP-17 DMs) — useful for storage/retention decisions, never a moderation signal — and `/api/subscribers` finds every pubkey whose DM relay list or general relay list actually names your relay. Neither has an admin-page button yet; they exist to feed a future gift-wrap retention purge that keeps subscribers' messages while reclaiming everyone else's. Results persist to `recipients-cache.json` and `subscribers-cache.json`, exactly like `authors-cache.json` — safe to delete at any time, rebuilt on the next scan.
+The `/domain` page answers a different question than a kind-0 `nip05` field does: a `nip05` is a claim a pubkey makes about itself, while a domain's `.well-known/nostr.json` is the domain's own claim about who it vouches for. Enter a domain and click "Fetch roster" — this happens directly in your browser, and if the domain's server doesn't send the CORS header NIP-05 requires, there's a paste box as a fallback. Every entry is checked both ways: `claims this domain` means the pubkey's own profile agrees with the roster; `claims <something else>` or `claims nothing` flags a stale roster entry. Neither direction is verified by anything cryptographic — it's two unverified claims compared for you, never proof, and the page never claims otherwise. (The reverse case — someone claiming your domain that the roster doesn't list, a possible impersonator — shows up on the `/authors` page's nip05 filter instead.) From there it's filter, select, ban, same as everywhere else.
+
+## Gift-wrap storage accounting and the retention purge
+
+Two more bounded, background-scanned endpoints: `/api/recipients` tallies who's on the receiving end of your relay's gift wraps (NIP-17 DMs) — useful for storage/retention decisions, never a moderation signal — and `/api/subscribers` finds every pubkey whose DM relay list or general relay list actually names your relay. Results persist to `recipients-cache.json` and `subscribers-cache.json`, exactly like `authors-cache.json` — safe to delete at any time, rebuilt on the next scan.
 
 `/api/subscribers` needs to know your relay's own address, which strfry doesn't otherwise expose to itself. If you want it to work, add a `url` line inside the `info { }` block of `strfry.conf` by hand — it's not a standard NIP-11 field, so the updater will never add it for you:
 
@@ -120,11 +124,11 @@ relay {
 
 Without it, `/api/subscribers` returns an empty result and says why, rather than guessing.
 
-## No charts or statistics
+Both scans feed the "Gift-wrap retention purge" intent in the terminal-commands block (see below): open it, and if either scan hasn't been run in the last 7 days you'll see a "scan now" button right there before it renders anything destructive. Once both are fresh, it renders a `strfry delete` filter that excludes your subscribers' gift wraps — never their messages, just everyone else's — alongside the blunter blanket form for comparison.
 
 ## No charts or statistics
 
-strfry-86 deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead as copyable `strfry` commands in a "terminal commands" block on both pages, for you to read and run yourself.
+strfry-86 deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead through the "terminal commands" generator on every admin page: pick an intent from the dropdown, fill in whatever it asks for (a pubkey, a domain, a day count), and copy the rendered `strfry` command. Nothing in that block is ever run by the page itself — destructive intents (like deleting a pubkey's events) always render the equivalent `scan --count` line first, so you see how much a command destroys before you copy the command that destroys it.
 
 ## strfry.conf backups
 

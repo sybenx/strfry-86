@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strfry-86 — domain roster</title>
+<style>
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li { overflow-wrap: anywhere; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+</style>
+</head>
+<body>
+<h1>strfry-86 — domain roster</h1>
+<p><a href="/">← ban list</a> · <a href="/authors">active authors</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <div id="profile-entry-container"></div>
+  <div id="command-block-container"></div>
+  <div id="records-list"></div>
+
+  <p>
+    <input id="domain-input" type="text" placeholder="example.com">
+    <button id="fetch-roster-btn" type="button">Fetch roster</button>
+  </p>
+  <details id="paste-details">
+    <summary>fetch failed? paste it here</summary>
+    <p><textarea id="paste-textarea" rows="6" cols="50" placeholder='{"names": {"bob": "&lt;hex pubkey&gt;"}}'></textarea></p>
+    <p><button id="paste-submit-btn" type="button">Use pasted roster</button></p>
+  </details>
+
+  <p id="provenance-line"></p>
+  <p><input id="filter-input" type="search" placeholder="filter roster — name, nip05, or npub"></p>
+  <div id="sort-row"></div>
+  <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
+  <button id="ban-btn" type="button">Ban selected</button>
+  <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
+  <input id="ban-reason" type="text" placeholder="reason (optional)">
+  <b id="selected-count"></b>
+  <pre id="purge-pre" style="display:none"></pre>
+  <p id="truncated-line"></p>
+  <ul id="roster-list"></ul>
+</div>
+<script src="/common86.js"></script>
+<script>
+var S86_DOMAIN_LOOKUP_MAX_CLIENT = 1000;
+var RENDER_MAX_CLIENT = 500;
+
+var adminPubkey = null;
+var isAdmin = false;
+var lastBanned = [];
+var bannedPubkeys = {};
+var lastLookup = null;        // raw POST /api/pubkeys/lookup response
+var localPartByPubkey = {};   // pubkey -> the roster's own name key, from the last fetch
+var currentDomain = '';
+var currentRenderedRows = [];
+
+var sortField = 'name';
+var sortDir = 'asc';
+
+var statusEl = document.getElementById('status');
+var loginBtn = document.getElementById('login-btn');
+var adminSection = document.getElementById('admin-section');
+var profileEntryContainer = document.getElementById('profile-entry-container');
+var commandBlockContainer = document.getElementById('command-block-container');
+var recordsList = document.getElementById('records-list');
+var domainInput = document.getElementById('domain-input');
+var fetchRosterBtn = document.getElementById('fetch-roster-btn');
+var pasteTextarea = document.getElementById('paste-textarea');
+var pasteSubmitBtn = document.getElementById('paste-submit-btn');
+var provenanceLine = document.getElementById('provenance-line');
+var filterInput = document.getElementById('filter-input');
+var sortRowEl = document.getElementById('sort-row');
+var selectAll = document.getElementById('select-all');
+var banBtn = document.getElementById('ban-btn');
+var copyPurgeBtn = document.getElementById('copy-purge-btn');
+var banReason = document.getElementById('ban-reason');
+var selectedCount = document.getElementById('selected-count');
+var purgePre = document.getElementById('purge-pre');
+var truncatedLine = document.getElementById('truncated-line');
+var listEl = document.getElementById('roster-list');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+// --- roster extraction ---------------------------------------------------
+// Accepts both a bare `names` map and a full NIP-05 document; anything
+// else (relays, nip46, ...) is ignored. Every value is validated as
+// 64-hex client-side BEFORE posting — if even one entry is malformed the
+// whole lookup is refused, matching the server's own "reject, never
+// silently drop a roster row" rule, rather than quietly proceeding with
+// a partial list the admin didn't ask for.
+
+function extractNamesMap(parsed) {
+  if (parsed && typeof parsed === 'object' && parsed.names && typeof parsed.names === 'object') {
+    return parsed.names;
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed;
+  }
+  return null;
+}
+
+function showNoDirectory() {
+  var domain = domainInput.value.trim();
+  currentDomain = domain;
+  localPartByPubkey = {};
+  lastLookup = {
+    domain: domain, results: [],
+    _fetchedAt: Math.floor(Date.now() / 1000),
+    _singleEntry: false, _noDirectory: true
+  };
+  renderRoster();
+}
+
+function processRoster(rawText) {
+  var parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (e) {
+    setStatus('could not parse that as JSON');
+    return;
+  }
+  var names = extractNamesMap(parsed);
+  if (!names || typeof names !== 'object' || Object.keys(names).length === 0) {
+    // "no names map at all" and "a names map with nothing in it" are the
+    // same claim about the domain, and CLAUDE.md is explicit that this
+    // reports as a persistent state, not a transient status line —
+    // reporting zero users would be a different, misleading claim.
+    showNoDirectory();
+    return;
+  }
+
+  var entries = Object.keys(names);
+  if (entries.length > S86_DOMAIN_LOOKUP_MAX_CLIENT) {
+    setStatus('roster has ' + entries.length + ' entries, over the ' + S86_DOMAIN_LOOKUP_MAX_CLIENT + ' limit — refusing rather than truncating');
+    return;
+  }
+
+  var pubkeys = [];
+  localPartByPubkey = {};
+  for (var i = 0; i < entries.length; i++) {
+    var localPart = entries[i];
+    var value = names[localPart];
+    if (typeof value !== 'string' || !/^[0-9a-fA-F]{64}$/.test(value)) {
+      setStatus('malformed pubkey for "' + localPart + '" — refusing the whole roster rather than dropping one row');
+      return;
+    }
+    var hex = value.toLowerCase();
+    pubkeys.push(hex);
+    if (!(hex in localPartByPubkey)) {
+      localPartByPubkey[hex] = localPart;
+    }
+  }
+
+  var singleEntry = entries.length === 1;
+  runLookup(pubkeys, singleEntry);
+}
+
+function runLookup(pubkeys, singleEntry) {
+  if (!isAdmin) {
+    return;
+  }
+  var domain = domainInput.value.trim();
+  if (!domain) {
+    setStatus('enter a domain first');
+    return;
+  }
+  currentDomain = domain;
+  setStatus('looking up ' + pubkeys.length + ' pubkey(s)…');
+
+  s86SignAndPost('/api/pubkeys/lookup', { pubkeys: pubkeys, domain: domain })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('lookup failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('');
+      lastLookup = result.body;
+      lastLookup._fetchedAt = Math.floor(Date.now() / 1000);
+      lastLookup._singleEntry = singleEntry;
+      renderRoster();
+    })
+    .catch(function () {
+      setStatus('lookup failed');
+    });
+}
+
+fetchRosterBtn.addEventListener('click', function () {
+  var domain = domainInput.value.trim();
+  if (!domain) {
+    setStatus('enter a domain first');
+    return;
+  }
+  setStatus('fetching .well-known/nostr.json…');
+  fetch('https://' + domain + '/.well-known/nostr.json')
+    .then(function (res) {
+      if (!res.ok) {
+        throw new Error('http ' + res.status);
+      }
+      return res.text();
+    })
+    .then(function (text) {
+      setStatus('');
+      processRoster(text);
+    })
+    .catch(function () {
+      setStatus('fetch failed — CORS or network error. Try the paste box below.');
+    });
+});
+
+pasteSubmitBtn.addEventListener('click', function () {
+  processRoster(pasteTextarea.value);
+});
+
+// --- sort -------------------------------------------------------------
+
+var SORT_COMPARATORS = {
+  name: function (a, b) {
+    var an = a.name || '', bn = b.name || '';
+    if (!an && !bn) { return 0; }
+    if (!an) { return 1; }
+    if (!bn) { return -1; }
+    return an < bn ? -1 : (an > bn ? 1 : 0);
+  },
+  events: function (a, b) { return (a.scan_count || 0) - (b.scan_count || 0); },
+  banned: function (a, b) { return (a.banned ? 1 : 0) - (b.banned ? 1 : 0); },
+  claims_domain: function (a, b) { return (a.claims_domain ? 1 : 0) - (b.claims_domain ? 1 : 0); }
+};
+
+sortRowEl.appendChild(s86BuildSortRow(
+  [
+    { key: 'name', label: 'name', dir: 'asc' },
+    { key: 'events', label: 'events', dir: 'desc' },
+    { key: 'banned', label: 'banned', dir: 'desc' },
+    { key: 'claims_domain', label: 'claims domain', dir: 'desc' }
+  ],
+  sortField, sortDir,
+  function (field, dir) {
+    sortField = field;
+    sortDir = dir;
+    renderRoster();
+  }
+));
+
+// --- rendering ------------------------------------------------------------
+
+function renderProvenance() {
+  if (!lastLookup) {
+    provenanceLine.textContent = '';
+    return;
+  }
+  if (lastLookup._singleEntry || lastLookup._noDirectory) {
+    provenanceLine.textContent = 'this domain does not publish a full directory';
+    return;
+  }
+  var results = lastLookup.results || [];
+  var bannedCount = results.filter(function (r) { return r.banned; }).length;
+  var scannedCount = results.filter(function (r) { return r.scan_count !== null && r.scan_count !== undefined; }).length;
+  provenanceLine.textContent = results.length + ' pubkeys listed by ' + lastLookup.domain
+    + ', fetched ' + s86FormatDate(lastLookup._fetchedAt)
+    + ' — ' + bannedCount + ' already banned, ' + scannedCount + ' seen in the current scan';
+}
+
+function claimsDomainLabel(r) {
+  if (!r.nip05) {
+    return 'listed, claims nothing';
+  }
+  var at = r.nip05.lastIndexOf('@');
+  var claimedDomain = at === -1 ? r.nip05 : r.nip05.slice(at + 1);
+  return r.claims_domain ? 'listed, claims this domain' : ('listed, but claims ' + claimedDomain);
+}
+
+function renderRoster() {
+  renderProvenance();
+  var all = (lastLookup && lastLookup.results) || [];
+  var sorted = s86SortRows(all, SORT_COMPARATORS[sortField], sortDir);
+  var truncation = s86TruncateForRender(sorted, RENDER_MAX_CLIENT);
+  currentRenderedRows = truncation.shown;
+
+  selectAll.checked = false;
+  listEl.textContent = '';
+  currentRenderedRows.forEach(function (r) {
+    var li = document.createElement('li');
+    li.setAttribute('data-pubkey', r.pubkey);
+
+    var isSelf = r.pubkey === adminPubkey;
+    if (r.banned) {
+      li.appendChild(document.createTextNode('(banned) '));
+    } else if (!isSelf) {
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = r.pubkey;
+      checkbox.className = 'roster-checkbox';
+      li.appendChild(checkbox);
+      li.appendChild(document.createTextNode(' '));
+    }
+
+    var localPart = localPartByPubkey[r.pubkey];
+    if (localPart) {
+      li.appendChild(s86El('b', localPart + ' '));
+    }
+    li.appendChild(s86El('span', r.npub + ' '));
+
+    if (r.name) {
+      li.appendChild(document.createTextNode('— '));
+      li.appendChild(s86El('span', r.name + ' '));
+    }
+    if (r.nip05) {
+      li.appendChild(s86El('span', r.nip05 + ' '));
+    }
+    if (r.banned && r.ban_reason) {
+      li.appendChild(document.createTextNode('— '));
+      li.appendChild(s86El('span', r.ban_reason + ' '));
+    }
+    if (r.scan_count !== null && r.scan_count !== undefined) {
+      li.appendChild(document.createTextNode('— ' + r.scan_count + ' events '));
+    }
+    li.appendChild(document.createTextNode('— ' + claimsDomainLabel(r)));
+
+    listEl.appendChild(li);
+  });
+
+  if (truncation.truncatedCount > 0) {
+    truncatedLine.textContent = 'showing top ' + RENDER_MAX_CLIENT + ' of ' + truncation.totalCount + ' — filter to narrow';
+  } else {
+    truncatedLine.textContent = '';
+  }
+
+  s86ApplyFilter(filterInput, listEl);
+  s86UpdateSelectedCount(listEl, 'roster-checkbox', selectedCount, [copyPurgeBtn]);
+}
+
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () {
+      loadBanned().then(function () {
+        renderRecords();
+        if (lastLookup && lastLookup.results && lastLookup.results.length > 0) {
+          runLookup(lastLookup.results.map(function (r) { return r.pubkey; }), lastLookup._singleEntry);
+        }
+      });
+    },
+    onError: setStatus
+  });
+}
+
+function loadBanned() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      lastBanned = data.banned;
+      bannedPubkeys = {};
+      lastBanned.forEach(function (b) { bannedPubkeys[b.pubkey] = true; });
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  renderRecords();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+
+var params = new URLSearchParams(window.location.search);
+var prefillDomain = params.get('d') || '';
+if (prefillDomain) {
+  domainInput.value = prefillDomain;
+}
+
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
+commandBlockContainer.appendChild(s86BuildCommandGenerator({ domain: prefillDomain }));
+
+s86WireFilter(filterInput, listEl);
+filterInput.addEventListener('input', function () {
+  s86UpdateSelectedCount(listEl, 'roster-checkbox', selectedCount, [copyPurgeBtn]);
+});
+s86WireSelectAll(selectAll, listEl, 'roster-checkbox', selectedCount, [copyPurgeBtn]);
+s86WireCopyPurge(copyPurgeBtn, purgePre, listEl, 'roster-checkbox');
+
+banBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  var checkboxes = listEl.querySelectorAll('.roster-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  if (selected.length === 0) {
+    setStatus('nothing selected');
+    return;
+  }
+  var reason = banReason.value;
+  var entries = selected.map(function (pk) { return { pubkey: pk, reason: reason }; });
+  var byPubkey = {};
+  ((lastLookup && lastLookup.results) || []).forEach(function (r) { byPubkey[r.pubkey] = r; });
+
+  s86SignAndPost('/api/ban', { entries: entries })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('ban failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('banned ' + result.body.added.length + ' pubkey(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      for (var i = 0; i < result.body.added.length; i++) {
+        var pk = result.body.added[i];
+        var r = byPubkey[pk];
+        s86AddRecord({
+          type: 'ban',
+          at: Date.now(),
+          entries: [{ pubkey: pk, npub: r ? r.npub : null, name: r ? r.name : null, reason: reason }]
+        });
+      }
+      return loadBanned().then(function () {
+        renderRecords();
+        if (lastLookup && lastLookup.results && lastLookup.results.length > 0) {
+          runLookup(lastLookup.results.map(function (r) { return r.pubkey; }), lastLookup._singleEntry);
+        }
+      });
+    })
+    .catch(function () {
+      setStatus('ban failed');
+    });
+});
+
+loadBanned();
+</script>
+</body>
+</html>

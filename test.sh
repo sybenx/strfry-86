@@ -834,6 +834,130 @@ server86.compute_profile = _orig_compute_profile
 server86.resolve_profiles = _orig_resolve_profiles
 
 
+# --- Phase 5: POST /api/pubkeys/lookup (server86.py) ----------------------
+
+# validate_pubkeys_lookup_request bounds
+pubkeys, domain, err = server86.validate_pubkeys_lookup_request(
+    {"pubkeys": ["a" * 64, "b" * 64], "domain": "example.com"})
+check(pubkeys == ["a" * 64, "b" * 64] and domain == "example.com" and err is None,
+      "validate_pubkeys_lookup_request accepts a well-formed request")
+
+_, _, err = server86.validate_pubkeys_lookup_request({"pubkeys": [], "domain": "example.com"})
+check(err is not None, "validate_pubkeys_lookup_request rejects an empty pubkeys list")
+
+_, _, err = server86.validate_pubkeys_lookup_request({"pubkeys": ["not-hex"], "domain": "example.com"})
+check(err is not None, "validate_pubkeys_lookup_request rejects a malformed pubkey rather than skipping it")
+
+_, _, err = server86.validate_pubkeys_lookup_request(
+    {"pubkeys": ["a" * 64] * (server86.DOMAIN_LOOKUP_MAX + 1), "domain": "example.com"})
+check(err is not None, "validate_pubkeys_lookup_request rejects a body over DOMAIN_LOOKUP_MAX outright, never truncates")
+
+pubkeys_at_max, _, err = server86.validate_pubkeys_lookup_request(
+    {"pubkeys": ["a" * 64] * server86.DOMAIN_LOOKUP_MAX, "domain": "example.com"})
+check(err is None and len(pubkeys_at_max) == server86.DOMAIN_LOOKUP_MAX,
+      "validate_pubkeys_lookup_request accepts a body at exactly DOMAIN_LOOKUP_MAX")
+
+_, _, err = server86.validate_pubkeys_lookup_request({"pubkeys": ["a" * 64], "domain": ""})
+check(err is not None, "validate_pubkeys_lookup_request rejects an empty domain")
+
+# compute_pubkeys_lookup: claims_domain cross-check, ban status, scan_count
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({}, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+
+pk_claims = "7" * 64
+pk_stale = "8" * 64
+pk_no_nip05 = "9" * 64
+
+_orig_resolve_profiles2 = server86.resolve_profiles
+server86.resolve_profiles = lambda pks: {
+    pk_claims: {"name": "alice", "nip05": "alice@example.com"},
+    pk_stale: {"name": "bob", "nip05": "bob@other-domain.com"},
+    pk_no_nip05: {"name": "carol", "nip05": None},
+}
+
+with server86._authors_lock:
+    server86._authors_cache = dict(server86._authors_cache)
+    server86._authors_cache["authors"] = [{"pubkey": pk_claims, "count": 17}]
+
+result = server86.compute_pubkeys_lookup([pk_claims, pk_stale, pk_no_nip05], "example.com")
+by_pk = {r["pubkey"]: r for r in result["results"]}
+check(result["domain"] == "example.com", "compute_pubkeys_lookup echoes the domain verbatim")
+check(by_pk[pk_claims]["claims_domain"] is True,
+      "compute_pubkeys_lookup sets claims_domain True when the kind-0 nip05 ends in @<domain>")
+check(by_pk[pk_stale]["claims_domain"] is False,
+      "compute_pubkeys_lookup sets claims_domain False for a nip05 claiming a DIFFERENT domain (stale roster entry)")
+check(by_pk[pk_no_nip05]["claims_domain"] is False,
+      "compute_pubkeys_lookup sets claims_domain False when there is no nip05 at all")
+check(by_pk[pk_claims]["scan_count"] == 17,
+      "compute_pubkeys_lookup reports scan_count from the author-scan cache when the pubkey appears there")
+check(by_pk[pk_stale]["scan_count"] is None,
+      "compute_pubkeys_lookup reports scan_count null for a pubkey absent from the author-scan cache")
+check(all(r["banned"] is False for r in result["results"]),
+      "compute_pubkeys_lookup reports banned:false for pubkeys with no blacklist entry")
+
+# a pubkey banned WITH a stored name should win over local resolution,
+# exactly as resolve_profiles() already guarantees elsewhere
+pk_banned = "a" * 63 + "1"
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({pk_banned: {"banned_at": 1, "report_event_id": None, "reason": "spam",
+                           "report_type": "manual", "name": "eve", "nip05": "eve@example.com",
+                           "name_checked_at": 1}}, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+server86.resolve_profiles = _orig_resolve_profiles2  # use the real one now — it reads the blacklist directly
+
+result2 = server86.compute_pubkeys_lookup([pk_banned], "example.com")
+row = result2["results"][0]
+check(row["banned"] is True and row["ban_reason"] == "spam",
+      "compute_pubkeys_lookup reports banned:true and ban_reason for a banned pubkey")
+check(row["name"] == "eve" and row["claims_domain"] is True,
+      "compute_pubkeys_lookup resolves name/nip05 for a banned pubkey from blacklist.json, not a fresh scan")
+
+server86.resolve_profiles = _orig_resolve_profiles2
+
+
+# --- static route table: query strings never affect routing --------------
+# CLAUDE.md requires this exact check: /profile and /profile?npub=<anything>
+# (including a value containing '../') must serve identical bytes, since
+# the path is matched before the query string is ever inspected. Spins up
+# a real (ephemeral, in-process) HTTP server rather than re-deriving the
+# claim with urlparse directly — this exercises server86's actual do_GET,
+# not a reimplementation of it.
+
+import threading as _threading
+import urllib.request as _urllib_request
+from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
+
+_httpd = _ThreadingHTTPServer(("127.0.0.1", 0), server86.Handler)
+_httpd.strfry86_config = {"admin_pubkey_hex": "a" * 64, "port": 0, "bind": "127.0.0.1"}
+_httpd_thread = _threading.Thread(target=_httpd.serve_forever, daemon=True)
+_httpd_thread.start()
+_base_url = f"http://127.0.0.1:{_httpd.server_address[1]}"
+
+
+def _get_bytes(path):
+    with _urllib_request.urlopen(_base_url + path, timeout=5) as resp:
+        return resp.status, resp.read()
+
+
+try:
+    for route, label in (("/profile", "profile.html"), ("/domain", "domain.html")):
+        status_plain, body_plain = _get_bytes(route)
+        status_query, body_query = _get_bytes(route + "?d=../../../../etc/passwd&npub=../../../../etc/passwd")
+        check(status_plain == 200 and status_query == 200 and body_plain == body_query,
+              f"static route {route} serves IDENTICAL bytes with and without a query string containing '../' ({label})")
+finally:
+    _httpd.shutdown()
+    _httpd_thread.join(timeout=5)
+
+
 # --- AUTHOR_SCAN_KINDS gap check (requires a live strfry database) --------
 
 strfry_bin = server86.get_strfry_bin()

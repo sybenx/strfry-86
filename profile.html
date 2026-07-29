@@ -154,7 +154,7 @@ function runProfilePage() {
     profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 
     commandBlockContainer.textContent = '';
-    commandBlockContainer.appendChild(s86BuildCommandBlock(p.npub));
+    commandBlockContainer.appendChild(s86BuildCommandGenerator({ pubkey: p.npub }));
   }
 
   function renderBanStatus() {

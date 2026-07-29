@@ -1,9 +1,12 @@
 # Implementation phases: async scanning, persisted caches, profile/domain pages
 
-Tracks rollout of the CLAUDE.md update committed at `f078edb` ("async
-scanning, persisted caches, profile/domain pages"). Not a deployable file —
-not in `manifest.json`, not in the bundle, purely a repo-local roadmap so
-implementation can resume across sessions without re-deriving the plan.
+**All 5 phases below are landed — this document is now a historical record
+of how the CLAUDE.md rewrite in `f078edb` was rolled out, not a to-do
+list.** Kept (not deleted) because the "Design decisions worth
+remembering" and "Live testing" sections below still explain WHY several
+non-obvious choices were made, including one real bug found and fixed via
+testing against a real strfry binary. Not a deployable file — not in
+`manifest.json`, not in the bundle.
 
 **To check what's landed**: `git log --oneline` and look for which of
 `lib86/namecache.py`, `recipients-cache.json`-related code,
@@ -175,13 +178,70 @@ bypass the mtime-equality check too, not just the throttle — one line in
 each file. This is the kind of bug that specifically needed a real
 filesystem under a real container to surface at all.
 
-- [ ] **Phase 5 — `domain.html` + command generator.**
+- [x] **Phase 5 — `domain.html` + command generator. This was the last
+  planned phase — all five are now landed.**
   `POST /api/pubkeys/lookup` (`DOMAIN_LOOKUP_MAX`, `claims_domain`
   cross-check). New page: client-side `.well-known/nostr.json` fetch +
   paste fallback, roster list, sort, bulk ban. Command generator
   (`<select>` of intents + one conditional input + one `<pre>`) replaces
   the static command-block list in `common86.js` — last, because it
   depends on Phase 2's endpoints for the subscriber-exempt purge variant.
+
+  *Landed*: `compute_pubkeys_lookup()` reuses `resolve_profiles()`
+  unchanged (a banned pubkey's stored name still wins over a fresh local
+  scan, same as everywhere else), sliced to `NAME_RESOLVE_MAX` for the
+  batched kind-0 resolution while still returning a full row per posted
+  pubkey. `validate_pubkeys_lookup_request()` rejects a body over
+  `DOMAIN_LOOKUP_MAX` or containing any malformed pubkey outright — never
+  truncates, never skips a row.
+
+  The command generator (`s86BuildCommandGenerator` in `common86.js`,
+  replacing `s86BuildCommandBlock`) implements all seven intents from
+  CLAUDE.md's table. Two design calls worth recording:
+  - The whole-database report, per-author kind tally, and DM-inbox audit
+    intents pipe `strfry scan` through **python3**, not `jq` or an awk
+    one-liner — python3 is a hard requirement of this entire project
+    (server86.py/plugin86.py both run on it inside the operator's own
+    container), so it's guaranteed present in a way `jq` is not, and a
+    proper JSON parse doesn't break the moment `content` contains an
+    embedded quote the way naive `awk -F'"'` splitting would.
+  - The gift-wrap purge intent is the one place the generator does
+    something beyond rendering text: it fetches `GET /api/recipients` and
+    `GET /api/subscribers` (public reads) on construction, and offers
+    inline "scan now" buttons (real NIP-98 POSTs, real polling) when
+    either cache is missing or the subscriber cache is over 7 days old.
+    This still isn't a violation of "nothing here is executed" — that
+    rule is about the RENDERED commands, never about Phase 2's
+    already-existing, already-legitimate admin-triggered scans that
+    happen to feed this one intent's parameters.
+
+  Found one real bug via manual testing before it shipped: the
+  recipients/subscribers "scan now" buttons' failure path called the
+  poll-until-idle callback regardless of whether the triggering POST
+  actually succeeded — a failed auth (or any POST error) silently
+  produced no feedback at all, indistinguishable from the click not
+  registering. Fixed by threading the error through to the button instead
+  of swallowing it.
+
+  Live-verified against a real dockurr/strfry container (same throwaway
+  signer as Phase 1-4's testing): `compute_pubkeys_lookup()` against
+  three real pubkeys — one with a real kind-0 claiming the domain
+  (`claims_domain: true`), one with no kind-0 at all, one claiming a
+  DIFFERENT domain (correctly `false`, the "stale roster entry" case)
+  — and the generated `kinds_by_author` python3 pipeline actually piped
+  through a real `strfry scan` and produced the right per-kind tally.
+
+  Also closed a test.sh gap that had been open since Phase 4 shipped
+  `profile.html`: CLAUDE.md's test.sh requirements explicitly call for
+  asserting that the static route table serves IDENTICAL bytes for a
+  route with and without a query string containing `../` (path traversal
+  is impossible by construction here, since the query string is stripped
+  before matching — but that claim had never actually been exercised).
+  Added by spinning up a real, ephemeral, in-process `ThreadingHTTPServer`
+  running the genuine `Handler` class — the one place in this suite that
+  does that, everywhere else tests call functions directly — because the
+  claim is specifically about `do_GET`'s own behavior, not something a
+  reimplementation with `urlparse` could prove.
 
 ## Design decisions worth remembering (Phase 1)
 

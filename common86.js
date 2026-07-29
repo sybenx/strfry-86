@@ -459,45 +459,398 @@ function s86WireCopyPurge(buttonEl, preEl, listEl, checkboxClass) {
 // Nothing here is executed and nothing here is fetched — every command is
 // plain copyable text. Identical on both pages.
 
-// initialValue optionally pre-fills the pubkey input (profile.html opens
-// this already knowing its one subject) — every other caller omits it.
-function s86BuildCommandBlock(initialValue) {
+// --- command generator ---------------------------------------------------
+// ONE <select> of intents, ONE input that appears only when the selected
+// intent needs one, ONE <pre> holding the rendered command, ONE copy
+// button. Replaces a wall of static <pre>s nobody read. Nothing here is
+// executed, nothing is fetched by pressing anything in it, no output ever
+// returns to the page — the terminal is where this project sends
+// everything it refuses to do itself. The one exception is the gift-wrap
+// purge intent's own "scan recipients"/"scan subscribers" buttons, which
+// are the SAME admin-triggered async scans Phase 2 already built — a
+// legitimate server action feeding parameters INTO a rendered command,
+// never the rendered command itself.
+//
+// A pubkey is decoded and re-encoded to canonical hex before it reaches
+// the <pre>; a domain is hostname-validated; days is a plain positive
+// integer. Nothing here executes, but a tool that renders whatever it's
+// handed teaches a habit that's wrong everywhere else in this project.
+
+var S86_GIFTWRAP_PURGE_DEFAULT_DAYS = 90;
+var S86_SUBSCRIBER_CACHE_STALE_SECONDS = 7 * 24 * 3600;
+var S86_GIFTWRAP_PURGE_CHUNK_SIZE = 200;
+var S86_STRFRY_CONFIG_FLAG = '--config /config/strfry.conf';
+
+function s86ValidateDomainInput(raw) {
+  raw = (raw || '').trim();
+  if (!raw) {
+    return null;
+  }
+  var value = raw.indexOf('://') === -1 ? 'http://' + raw : raw;
+  try {
+    var u = new URL(value);
+    return u.hostname ? u.hostname.toLowerCase() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Returns {ok, value}. Empty input is valid (defaults to
+// S86_GIFTWRAP_PURGE_DEFAULT_DAYS); anything present that isn't a
+// positive integer is rejected outright rather than silently coerced.
+function s86ValidateDaysInput(raw) {
+  raw = (raw || '').trim();
+  if (!raw) {
+    return { ok: true, value: S86_GIFTWRAP_PURGE_DEFAULT_DAYS };
+  }
+  if (!/^[0-9]+$/.test(raw)) {
+    return { ok: false, value: null };
+  }
+  var n = parseInt(raw, 10);
+  return n > 0 ? { ok: true, value: n } : { ok: false, value: null };
+}
+
+// A small json-lines tally, written in python3 rather than jq/awk because
+// python3 is a hard requirement of this whole project (server86.py and
+// plugin86.py both run on it inside the operator's own container), so it
+// is guaranteed present — unlike jq, and unlike an awk one-liner naive
+// quote-splitting would need, which breaks the moment `content` contains
+// an internal quote.
+function s86PyKindTallyScript(withAuthorsAndGiftwrapShare) {
+  var lines = [
+    'import sys, json',
+    'total = 0',
+    'kinds = {}',
+    withAuthorsAndGiftwrapShare ? 'authors = set()' : null,
+    withAuthorsAndGiftwrapShare ? 'giftwraps = 0' : null,
+    'for line in sys.stdin:',
+    '    line = line.strip()',
+    '    if not line:',
+    '        continue',
+    '    try:',
+    '        e = json.loads(line)',
+    '    except ValueError:',
+    '        continue',
+    '    total += 1',
+    '    k = e.get("kind")',
+    '    kinds[k] = kinds.get(k, 0) + 1',
+    withAuthorsAndGiftwrapShare ? '    authors.add(e.get("pubkey"))' : null,
+    withAuthorsAndGiftwrapShare ? '    if k == 1059:' : null,
+    withAuthorsAndGiftwrapShare ? '        giftwraps += 1' : null,
+    withAuthorsAndGiftwrapShare ? 'print("total events:", total)' : null,
+    withAuthorsAndGiftwrapShare ? 'print("distinct authors:", len(authors))' : null,
+    withAuthorsAndGiftwrapShare ? 'print("gift-wrap share: %.1f%%" % (giftwraps / total * 100 if total else 0))' : null,
+    'print("kind histogram:")',
+    'for k, c in sorted(kinds.items(), key=lambda kv: -kv[1]):',
+    '    print("  kind", k, ":", c)',
+  ].filter(function (l) { return l !== null; });
+  return lines.join('\n');
+}
+
+function s86RenderDeleteWithCountFirst(filterObj) {
+  var filterJson = JSON.stringify(filterObj);
+  return [
+    "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '" + filterJson + "'  # read this count BEFORE deleting",
+    "strfry " + S86_STRFRY_CONFIG_FLAG + " delete --filter '" + filterJson + "'",
+  ].join('\n');
+}
+
+// Both GET /api/recipients and GET /api/subscribers are unauthenticated
+// public reads (same stance as GET /api/authors — only the scan-
+// triggering POST costs a NIP-98 signature), so fetching them here on
+// construction is harmless even for a not-yet-logged-in visitor; the
+// generator itself stays hidden behind each page's own admin gate.
+function s86WireGiftwrapPurgeSources(onUpdate) {
+  var recipientsCache = null;
+  var subscribersCache = null;
+
+  function refresh(endpoint, setter) {
+    return fetch(endpoint)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        setter(data);
+        if (onUpdate) {
+          onUpdate();
+        }
+        return data;
+      });
+  }
+  function refreshRecipients() { return refresh('/api/recipients', function (d) { recipientsCache = d; }); }
+  function refreshSubscribers() { return refresh('/api/subscribers', function (d) { subscribersCache = d; }); }
+
+  function pollUntilIdle(refreshFn, cb) {
+    refreshFn().then(function (data) {
+      if (data.status === 'running') {
+        setTimeout(function () { pollUntilIdle(refreshFn, cb); }, 3000);
+      } else if (cb) {
+        cb();
+      }
+    });
+  }
+
+  refreshRecipients();
+  refreshSubscribers();
+
+  // cb(errorMessageOrNull) — a failed POST (bad auth, network error) must
+  // still re-enable the calling button and say WHY, rather than silently
+  // doing nothing indistinguishable from a click that didn't register.
+  function startScan(endpoint, refreshFn, cb) {
+    s86SignAndPost(endpoint, {})
+      .then(function (result) {
+        if (!result.ok) {
+          if (cb) cb('scan failed: ' + s86ErrMsg(result));
+          return;
+        }
+        pollUntilIdle(refreshFn, function () { if (cb) cb(null); });
+      })
+      .catch(function () {
+        if (cb) cb('scan failed');
+      });
+  }
+
+  return {
+    getRecipientsCache: function () { return recipientsCache; },
+    getSubscribersCache: function () { return subscribersCache; },
+    onScanRecipients: function (cb) { startScan('/api/recipients', refreshRecipients, cb); },
+    onScanSubscribers: function (cb) { startScan('/api/subscribers', refreshSubscribers, cb); },
+  };
+}
+
+function s86BuildCommandGenerator(options) {
+  options = options || {};
+
+  var container = document.createElement('div');
   var details = document.createElement('details');
   details.appendChild(s86El('summary', 'terminal commands'));
 
-  var inputP = document.createElement('p');
-  inputP.appendChild(document.createTextNode('pubkey for the commands below (npub or hex): '));
+  ['--config is mandatory or strfry reads the wrong database.',
+   '--count returns a number without streaming event bodies, which is why counting is seconds and the histogram is minutes.',
+   'scan reads and delete destroys while taking the SAME filter syntax, so any filter can and should be tested with scan --count before being run with delete.',
+   'a filter is one shell argument in single quotes, so its inner quotes are never escaped.'
+  ].forEach(function (line) { details.appendChild(s86El('p', line)); });
+
+  var select = document.createElement('select');
+  var intents = [
+    { key: 'count_all', label: 'Count all events', input: null },
+    { key: 'whole_db_report', label: 'Whole-database report: total, kind histogram, author count, gift-wrap share (~9 min)', input: null },
+    { key: 'kinds_by_author', label: 'Event kinds by author', input: 'pubkey' },
+    { key: 'delete_by_author', label: 'Delete all events by author', input: 'pubkey' },
+    { key: 'giftwrap_purge', label: 'Gift-wrap retention purge', input: 'days' },
+    { key: 'dm_inbox_list', label: 'Who lists this relay as their DM inbox', input: null },
+    { key: 'fetch_domain', label: "Fetch a domain's nostr.json", input: 'domain' },
+  ];
+  intents.forEach(function (intent) {
+    var opt = document.createElement('option');
+    opt.value = intent.key;
+    opt.textContent = intent.label;
+    select.appendChild(opt);
+  });
+  if (options.pubkey) {
+    select.value = 'kinds_by_author';
+  } else if (options.domain) {
+    select.value = 'fetch_domain';
+  }
+  var selectRow = document.createElement('p');
+  selectRow.appendChild(select);
+  details.appendChild(selectRow);
+
+  var inputRow = document.createElement('p');
+  var inputLabel = document.createElement('span');
   var input = document.createElement('input');
   input.type = 'text';
-  input.placeholder = 'npub or hex';
-  if (initialValue) {
-    input.value = initialValue;
+  inputRow.appendChild(inputLabel);
+  inputRow.appendChild(input);
+  details.appendChild(inputRow);
+
+  var extraEl = document.createElement('div');
+  details.appendChild(extraEl);
+
+  var pre = document.createElement('pre');
+  details.appendChild(pre);
+
+  var copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', function () {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(pre.textContent).catch(function () {});
+    }
+  });
+  details.appendChild(copyBtn);
+
+  // Wired once, unconditionally — the two GETs are public reads and this
+  // just keeps the generator's own data current; onUpdate re-renders IF
+  // the purge intent happens to be the one currently selected, so a fetch
+  // resolving shortly after the intent was picked doesn't get stranded.
+  var purgeSources = s86WireGiftwrapPurgeSources(function () {
+    if (currentIntent().key === 'giftwrap_purge') {
+      renderGiftwrapPurge();
+    }
+  });
+
+  function currentIntent() {
+    return intents.filter(function (i) { return i.key === select.value; })[0];
   }
-  inputP.appendChild(input);
-  details.appendChild(inputP);
 
-  var totalPre = s86El('pre', "strfry scan --count '{}'  # total events on this relay");
-  details.appendChild(totalPre);
+  function renderGiftwrapPurge() {
+    var daysCheck = s86ValidateDaysInput(input.value);
+    extraEl.textContent = '';
+    if (!daysCheck.ok) {
+      pre.textContent = 'enter a positive whole number of days above';
+      return;
+    }
+    var days = daysCheck.value;
+    var cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+    var blanket = s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff });
 
-  var countPre = document.createElement('pre');
-  var purgePre = document.createElement('pre');
-  details.appendChild(countPre);
-  details.appendChild(purgePre);
+    var recipients = purgeSources.getRecipientsCache();
+    var subscribers = purgeSources.getSubscribersCache();
+    var subsFresh = subscribers && subscribers.scanned_at
+      && (Math.floor(Date.now() / 1000) - subscribers.scanned_at) <= S86_SUBSCRIBER_CACHE_STALE_SECONDS;
+    var recipientsAvailable = recipients && recipients.scanned_at;
+
+    var notice = document.createElement('p');
+    if (!recipientsAvailable || !subsFresh) {
+      var reason = !recipients || !recipients.scanned_at
+        ? 'no recipient scan has been run yet'
+        : (!subscribers || !subscribers.scanned_at
+          ? 'no subscriber scan has been run yet'
+          : 'the subscriber scan is more than 7 days old');
+      notice.textContent = 'subscriber-exempt form unavailable: ' + reason + '. Showing the blanket form only — it purges EVERY subscriber\'s gift wraps too.';
+      extraEl.appendChild(notice);
+
+      var scanErrorLine = document.createElement('p');
+      extraEl.appendChild(scanErrorLine);
+
+      if (!recipients || !recipients.scanned_at) {
+        var rBtn = document.createElement('button');
+        rBtn.type = 'button';
+        rBtn.textContent = 'scan recipients now (a few minutes)';
+        rBtn.addEventListener('click', function () {
+          rBtn.disabled = true;
+          purgeSources.onScanRecipients(function (err) {
+            if (err) {
+              scanErrorLine.textContent = err;
+              rBtn.disabled = false;
+              return;
+            }
+            renderGiftwrapPurge();
+          });
+        });
+        extraEl.appendChild(rBtn);
+      }
+      if (!subscribers || !subscribers.scanned_at || !subsFresh) {
+        var sBtn = document.createElement('button');
+        sBtn.type = 'button';
+        sBtn.textContent = 'scan subscribers now';
+        sBtn.addEventListener('click', function () {
+          sBtn.disabled = true;
+          purgeSources.onScanSubscribers(function (err) {
+            if (err) {
+              scanErrorLine.textContent = err;
+              sBtn.disabled = false;
+              return;
+            }
+            renderGiftwrapPurge();
+          });
+        });
+        extraEl.appendChild(sBtn);
+      }
+
+      pre.textContent = blanket;
+      return;
+    }
+
+    var subscriberPubkeys = {};
+    (subscribers.subscribers || []).forEach(function (s) { subscriberPubkeys[s.pubkey] = true; });
+    var exempt = (recipients.recipients || [])
+      .map(function (r) { return r.pubkey; })
+      .filter(function (pk) { return !subscriberPubkeys[pk]; });
+
+    notice.textContent = 'subscriber-exempt form (excludes ' + Object.keys(subscriberPubkeys).length + ' DM-inbox subscriber(s)):';
+    extraEl.appendChild(notice);
+
+    var chunks = [];
+    for (var i = 0; i < exempt.length; i += S86_GIFTWRAP_PURGE_CHUNK_SIZE) {
+      chunks.push(exempt.slice(i, i + S86_GIFTWRAP_PURGE_CHUNK_SIZE));
+    }
+    var exemptCommands = chunks.length === 0
+      ? [s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff })]
+      : chunks.map(function (chunk) {
+        return s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff, '#p': chunk });
+      });
+
+    pre.textContent = exemptCommands.join('\n\n')
+      + '\n\n# blanket form below — deletes ALL gift wraps in the window, subscribers included:\n\n'
+      + blanket;
+  }
 
   function render() {
-    var hex = s86PubkeyInputToHex(input.value);
-    if (hex) {
-      countPre.textContent = "strfry scan --count '" + JSON.stringify({ authors: [hex] }) + "'  # events by this pubkey";
-      purgePre.textContent = "strfry delete --filter '" + JSON.stringify({ authors: [hex] }) + "'  # delete this pubkey's events (irreversible)";
-    } else {
-      countPre.textContent = "strfry scan --count '{\"authors\":[\"<hex>\"]}'  # events by this pubkey — enter a pubkey above";
-      purgePre.textContent = "strfry delete --filter '{\"authors\":[\"<hex>\"]}'  # delete this pubkey's events — enter a pubkey above";
+    var intent = currentIntent();
+    inputRow.style.display = intent.input ? '' : 'none';
+    extraEl.textContent = '';
+    input.placeholder = '';
+
+    if (intent.input === 'pubkey') {
+      inputLabel.textContent = 'pubkey (npub or hex): ';
+      input.placeholder = 'npub or hex';
+    } else if (intent.input === 'domain') {
+      inputLabel.textContent = 'domain: ';
+      input.placeholder = 'example.com';
+    } else if (intent.input === 'days') {
+      inputLabel.textContent = 'days (default ' + S86_GIFTWRAP_PURGE_DEFAULT_DAYS + '): ';
+      input.placeholder = String(S86_GIFTWRAP_PURGE_DEFAULT_DAYS);
+    }
+
+    if (intent.key === 'count_all') {
+      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '{}'";
+    } else if (intent.key === 'whole_db_report') {
+      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '{}' | python3 -c '\n" + s86PyKindTallyScript(true) + "\n'";
+    } else if (intent.key === 'kinds_by_author') {
+      var hex = s86PubkeyInputToHex(input.value);
+      if (!hex) {
+        pre.textContent = 'enter a pubkey above';
+      } else {
+        pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript(false) + "\n'";
+      }
+    } else if (intent.key === 'delete_by_author') {
+      var hex2 = s86PubkeyInputToHex(input.value);
+      pre.textContent = hex2 ? s86RenderDeleteWithCountFirst({ authors: [hex2] }) : 'enter a pubkey above';
+    } else if (intent.key === 'giftwrap_purge') {
+      renderGiftwrapPurge();
+    } else if (intent.key === 'dm_inbox_list') {
+      pre.textContent = "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ kinds: [10050] }) + "' | python3 -c '\n"
+        + 'import sys, json\n'
+        + 'for line in sys.stdin:\n'
+        + '    line = line.strip()\n'
+        + '    if not line:\n'
+        + '        continue\n'
+        + '    try:\n'
+        + '        e = json.loads(line)\n'
+        + '    except ValueError:\n'
+        + '        continue\n'
+        + '    for tag in e.get("tags", []):\n'
+        + '        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "relay":\n'
+        + '            print(e.get("pubkey"), tag[1])\n'
+        + "'  # pubkey, relay-tag pairs — check manually against this relay's own URL";
+    } else if (intent.key === 'fetch_domain') {
+      var domain = s86ValidateDomainInput(input.value);
+      pre.textContent = domain ? ('curl -s https://' + domain + '/.well-known/nostr.json') : 'enter a domain above';
     }
   }
+
+  select.addEventListener('change', render);
   input.addEventListener('input', render);
+
+  if (options.pubkey) {
+    input.value = options.pubkey;
+  } else if (options.domain) {
+    input.value = options.domain;
+  }
   render();
 
-  return details;
+  container.appendChild(details);
+  return container;
 }
 
 // --- external name resolution (wss://purplepag.es -> POST /api/names) ---

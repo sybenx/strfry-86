@@ -9,6 +9,7 @@ Routes:
   GET  /                  -> bans.html (public ban list)
   GET  /authors           -> authors.html (admin-only active-author page)
   GET  /profile           -> profile.html (admin-only single-pubkey detail page)
+  GET  /domain            -> domain.html (admin-only nip-05 domain roster page)
   GET  /common86.js       -> shared client JS for all pages
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
@@ -21,6 +22,7 @@ Routes:
   POST /api/ban           -> NIP-98 authenticated manual ban
   POST /api/reason        -> NIP-98 authenticated: bulk-edit reason on existing bans
   POST /api/profile       -> NIP-98 authenticated: everything known about one pubkey
+  POST /api/pubkeys/lookup -> NIP-98 authenticated: what's known about a domain's roster
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
 """
 
@@ -60,6 +62,7 @@ STATIC_ROUTES = {
     "/": ("bans.html", "text/html; charset=utf-8"),
     "/authors": ("authors.html", "text/html; charset=utf-8"),
     "/profile": ("profile.html", "text/html; charset=utf-8"),
+    "/domain": ("domain.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
 }
 
@@ -1259,6 +1262,72 @@ def build_profile_response(pubkey_hex):
     return result
 
 
+# --- domain roster lookup ---------------------------------------------------
+
+def validate_pubkeys_lookup_request(body):
+    """Return (pubkeys, domain, error) for a POST /api/pubkeys/lookup
+    body. A body over DOMAIN_LOOKUP_MAX is rejected outright — never
+    silently truncated, since the admin is about to bulk-act on this
+    list. Any malformed pubkey is rejected the same way rather than
+    skipped: a roster row that vanished between fetch and render is worse
+    than an error."""
+    pubkeys = body.get("pubkeys")
+    domain = body.get("domain")
+    if not isinstance(pubkeys, list) or len(pubkeys) == 0:
+        return None, None, "malformed pubkeys list"
+    if len(pubkeys) > DOMAIN_LOOKUP_MAX:
+        return None, None, f"too many pubkeys (max {DOMAIN_LOOKUP_MAX})"
+    if not all(is_hex64(pk) for pk in pubkeys):
+        return None, None, "malformed pubkey in list"
+    if not isinstance(domain, str) or not domain.strip():
+        return None, None, "malformed domain"
+    return pubkeys, domain.strip(), None
+
+
+def compute_pubkeys_lookup(pubkeys, domain):
+    """Answers 'what do you know about these pubkeys' for a domain roster
+    the browser already fetched. The posted list IS the authors bound:
+    one batched local kind-0 scan (via the shared resolve_profiles(), so
+    a banned pubkey's stored name still wins over a fresh scan) capped at
+    NAME_RESOLVE_MAX, everything else a dict lookup against the
+    blacklist and the author-scan cache. No scan beyond that one batch."""
+    blacklist_data = blacklist.load()
+    with _authors_lock:
+        scan_counts = {a["pubkey"]: a.get("count") for a in _authors_cache.get("authors", [])}
+
+    try:
+        profiles = resolve_profiles(pubkeys[:NAME_RESOLVE_MAX])
+    except Exception as e:
+        log(f"server86: pubkeys/lookup name resolution failed: {e}")
+        profiles = {}
+
+    domain_suffix = "@" + domain.lower()
+    results = []
+    for pk in pubkeys:
+        try:
+            npub = bech32.npub_encode(pk)
+        except (ValueError, TypeError):
+            continue
+        entry = blacklist_data.get(pk)
+        profile = profiles.get(pk) or {}
+        nip05 = profile.get("nip05")
+        results.append({
+            "pubkey": pk, "npub": npub,
+            "name": profile.get("name"), "nip05": nip05,
+            "banned": entry is not None,
+            "ban_reason": entry.get("reason") if entry else None,
+            "scan_count": scan_counts.get(pk),
+            # A comparison of two unverified claims, never proof of
+            # anything: true when this pubkey's OWN kind-0 nip05 ends in
+            # @<domain>, the cross-check that flags a stale roster entry
+            # (listed but doesn't claim it back) versus an impersonator
+            # (claims it but the roster doesn't list them — invisible
+            # here by construction; see the author list's nip05 filter).
+            "claims_domain": bool(nip05) and nip05.lower().endswith(domain_suffix),
+        })
+    return {"domain": domain, "results": results}
+
+
 def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
     """Return (ok, error_message). `now` defaults to the real current time;
     a test harness may inject a fixed value to isolate the freshness check
@@ -1462,6 +1531,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in (
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
+            "/api/pubkeys/lookup",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -1531,6 +1601,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "malformed pubkey"})
                 return
             self._send_json(200, build_profile_response(pubkey_hex))
+            return
+
+        if path == "/api/pubkeys/lookup":
+            pubkeys, domain, err = validate_pubkeys_lookup_request(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            self._send_json(200, compute_pubkeys_lookup(pubkeys, domain))
             return
 
         if path == "/api/names":

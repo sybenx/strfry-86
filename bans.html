@@ -265,7 +265,7 @@ function onLogin() {
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 
 profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
-commandBlockContainer.appendChild(s86BuildCommandBlock());
+commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 s86WireFilter(filterInput, listEl);
 s86WireSelectAll(selectAll, listEl, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
