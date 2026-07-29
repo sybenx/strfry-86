@@ -1108,15 +1108,18 @@ function s86BuildRecordDetailList(entries) {
   return ul;
 }
 
-// Inline "set reason" row for a ban/report record line: one text input
-// (prefilled with the current reason, empty if none) and one button,
-// disabled while the input is empty — same disable rule as the bulk-reason
-// row on bans.html, since an empty reason submitted from a row with no
-// checkbox concept would otherwise silently no-op. Posts /api/reason in
-// 'replace' mode for exactly the pubkeys this record concerns (the single
-// subject, or the whole bulk-ban group sharing one reason input already),
-// then records a normal 'reason' undo entry — reusing the existing
-// mechanism rather than inventing a second way to undo a reason change.
+// Inline "set reason" row, shared by record lines (bans.html, authors.html,
+// domain.html — always called with currentReason: '', since that row is
+// for typing a fresh reason and prefilling it from history invited setting
+// the same one back) and profile.html's ban-status editor (which passes
+// the pubkey's actual current reason, since there the row IS the "edit the
+// reason on file" control). One text input and one button, disabled while
+// the input is empty — same disable rule as the bulk-reason row on
+// bans.html, since an empty reason submitted from a row with no checkbox
+// concept would otherwise silently no-op. Posts /api/reason in 'replace'
+// mode for exactly the pubkeys this call concerns, then records a normal
+// 'reason' undo entry — reusing the existing mechanism rather than
+// inventing a second way to undo a reason change.
 function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
   var p = document.createElement('p');
 
@@ -1410,9 +1413,13 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
     if (l.kind === 'stored') {
       var record = l.ref;
       var canUndo = !(record.type === 'reason' && !record.entries);
+      // currentReason is always blank here, never the reason the ban was
+      // made with — this row is for typing a NEW reason, and prefilling
+      // it from history invited setting the same reason back rather than
+      // deliberately choosing one.
       var reasonEdit = record.type === 'ban' ? {
         pubkeys: record.entries.map(function (e) { return e.pubkey; }),
-        currentReason: (record.entries[0] && record.entries[0].reason) || '',
+        currentReason: '',
         callbacks: callbacks
       } : null;
       var line = s86BuildRecordLine(
@@ -1442,7 +1449,9 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
           s86DismissReport(l.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);
         },
-        { pubkeys: [ban.pubkey], currentReason: ban.reason || '', callbacks: callbacks }
+        // Blank for the same reason as the ban-record row above — this
+        // is for entering a fresh reason, not editing the one on file.
+        { pubkeys: [ban.pubkey], currentReason: '', callbacks: callbacks }
       );
       container.appendChild(line);
     }
