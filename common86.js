@@ -950,27 +950,62 @@ function s86ResolveNamesExternally(pubkeys, callbacks) {
 
 // --- record lines -------------------------------------------------------
 // A persistent log of admin actions. Element order within a line is fixed:
-// the ↩ dismiss button LEFTMOST, then the label, then Undo RIGHTMOST — the
-// two buttons are not equally consequential (↩ only touches localStorage,
-// Undo changes server state), so the dangerous one sits isolated at the end
-// and the harmless one absorbs mis-taps. The label supplies the separation
-// (the locked CSS block permits no spacing rules), so it must never be empty.
+// the ↩ dismiss button LEFTMOST, then the label, then the Undo button, then
+// the full npub as plain text LAST. The npub wraps onto its own line — that
+// wrap is the design. This keeps ↩ and Undo apart with the label between
+// them and leaves Undo flanked by inert text on both sides, rather than
+// sitting adjacent to the next record's ↩ across the line break.
+//
+// Label shape: the display name in <b> when known, the nip05 as plain text
+// after it when known, and neither when unknown — in which case the
+// trailing npub is the only identifier, a perfectly acceptable resting
+// state. The label supplies the separation (the locked CSS block permits no
+// spacing rules), so it must never be empty.
+//
+// A ban or unban action covering 2+ pubkeys renders ONE grouped line instead
+// of one per pubkey. Since which pubkey the trailing npub would name is
+// ambiguous there, that slot is replaced by a ▸/▾ expand arrow — the one
+// case where a record line has a third control — which toggles a nested
+// per-pubkey detail list (name/nip05/npub) below the line. A bulk ban's
+// single shared reason renders in the summary itself, since one reason
+// input covers the whole batch.
 //
 // At most the 20 newest lines of all four kinds (ban, unban, reason,
 // report) combined are ever rendered; older ones are dropped from view
 // and, for stored records, deleted from localStorage outright.
 
-function s86RecordLabel(record) {
+// Returns {verb, name, nip05, suffix, npub, entries} — never a string, so
+// the caller can build <b>/text nodes per the untrusted-string rule instead
+// of merging attacker-influenced text into one opaque string. `entries` is
+// only set for a 2+-pubkey ban/unban record, where it feeds the expand-arrow
+// detail list in place of the (ambiguous, therefore omitted) single trailing
+// npub.
+function s86RecordLabelParts(record) {
   if (record.type === 'reason') {
-    return 'set reason on ' + record.count + ' ban' + (record.count === 1 ? '' : 's')
-      + (record.entries ? '' : ' — undo unavailable');
+    return {
+      verb: 'set reason on ' + record.count + ' ban' + (record.count === 1 ? '' : 's')
+        + (record.entries ? '' : ' — undo unavailable'),
+      name: null, nip05: null, suffix: null, npub: null, entries: null
+    };
   }
   var verb = record.type === 'ban' ? 'banned' : 'unbanned';
   if (record.entries.length === 1) {
     var e = record.entries[0];
-    return verb + ' ' + (e.name ? e.name + ' ' : '') + (e.npub || e.pubkey);
+    return { verb: verb, name: e.name || null, nip05: e.nip05 || null, suffix: null, npub: e.npub || e.pubkey, entries: null };
   }
-  return verb + ' ' + record.entries.length + ' pubkeys';
+  // A bulk ban has exactly one reason input for the whole batch, so every
+  // entry carries the same value — show it once in the summary rather than
+  // per row. Bulk unban has no analogous action-level reason: each entry's
+  // `reason` there is the ORIGINAL ban reason, kept only so Undo can re-ban
+  // with it, and belongs in the detail rows, not the summary.
+  var suffix = null;
+  if (record.type === 'ban') {
+    var reason = record.entries[0] && record.entries[0].reason;
+    if (reason) {
+      suffix = ' — ' + reason;
+    }
+  }
+  return { verb: verb + ' ' + record.entries.length + ' pubkeys', name: null, nip05: null, suffix: suffix, npub: null, entries: record.entries };
 }
 
 function s86AddRecord(record) {
@@ -993,11 +1028,63 @@ function s86DismissReport(id) {
   s86SaveStored(S86_DISMISSED_REPORTS_KEY, ids, S86_MAX_DISMISSED);
 }
 
+// Builds the label span from structured parts: createElement/textContent
+// only, per the untrusted-string rule — name, nip05, and report type are
+// all attacker-influenced.
+function s86BuildLabelSpan(parts) {
+  var label = document.createElement('span');
+  label.appendChild(document.createTextNode(parts.verb));
+  if (parts.name) {
+    label.appendChild(document.createTextNode(' '));
+    var b = document.createElement('b');
+    b.textContent = parts.name;
+    label.appendChild(b);
+  }
+  if (parts.nip05) {
+    label.appendChild(document.createTextNode(' '));
+    label.appendChild(document.createTextNode(parts.nip05));
+  }
+  if (parts.suffix) {
+    label.appendChild(document.createTextNode(parts.suffix));
+  }
+  return label;
+}
+
+// One row per pubkey for a multi-entry record's expand-arrow detail list:
+// name in <b> when known, nip05 as plain text after it, then the npub —
+// the same shape and the same createElement/textContent-only rule as every
+// other record line, since name/nip05 are attacker-influenced.
+function s86BuildRecordDetailList(entries) {
+  var ul = document.createElement('ul');
+  entries.forEach(function (e) {
+    var li = document.createElement('li');
+    if (e.name) {
+      var b = document.createElement('b');
+      b.textContent = e.name;
+      li.appendChild(b);
+      li.appendChild(document.createTextNode(' '));
+    }
+    if (e.nip05) {
+      li.appendChild(document.createTextNode(e.nip05 + ' '));
+    }
+    li.appendChild(document.createTextNode(e.npub || e.pubkey));
+    ul.appendChild(li);
+  });
+  return ul;
+}
+
+// parts: {verb, name, nip05, suffix, npub, entries} — see
+// s86RecordLabelParts. npub is omitted (no trailing element at all) when
+// null. `entries` (2+ pubkeys) replaces that omitted npub with a third
+// control, a ▸/▾ expand arrow revealing a detail list — the one exception
+// to a record line's normal two-touch-target rule.
+//
 // onUndo is optional — a null/undefined onUndo (the reason-record "undo
 // unavailable" case, once its snapshot exceeds S86_REASON_UNDO_MAX) omits
 // the Undo button entirely rather than rendering one that can't work. A
 // truncated undo is worse than none.
-function s86BuildRecordLine(labelText, onUndo, onDismiss) {
+function s86BuildRecordLine(parts, onUndo, onDismiss) {
+  var wrap = document.createElement('div');
   var line = document.createElement('p');
 
   var dismissBtn = document.createElement('button');
@@ -1009,9 +1096,7 @@ function s86BuildRecordLine(labelText, onUndo, onDismiss) {
   line.appendChild(dismissBtn);
   line.appendChild(document.createTextNode(' '));
 
-  var label = document.createElement('span');
-  label.textContent = labelText;
-  line.appendChild(label);
+  line.appendChild(s86BuildLabelSpan(parts));
 
   if (onUndo) {
     line.appendChild(document.createTextNode(' '));
@@ -1024,7 +1109,35 @@ function s86BuildRecordLine(labelText, onUndo, onDismiss) {
     line.appendChild(undoBtn);
   }
 
-  return line;
+  if (parts.npub) {
+    line.appendChild(document.createTextNode(' '));
+    line.appendChild(document.createTextNode(parts.npub));
+  }
+
+  wrap.appendChild(line);
+
+  if (parts.entries && parts.entries.length > 1) {
+    var expandBtn = document.createElement('button');
+    expandBtn.type = 'button';
+    expandBtn.textContent = '▸';
+    expandBtn.title = 'show pubkeys';
+    expandBtn.setAttribute('aria-label', 'show pubkeys');
+    line.appendChild(document.createTextNode(' '));
+    line.appendChild(expandBtn);
+
+    var detail = s86BuildRecordDetailList(parts.entries);
+    detail.style.display = 'none';
+    expandBtn.addEventListener('click', function () {
+      var expanded = detail.style.display !== 'none';
+      detail.style.display = expanded ? 'none' : '';
+      expandBtn.textContent = expanded ? '▸' : '▾';
+      expandBtn.title = expanded ? 'show pubkeys' : 'hide pubkeys';
+      expandBtn.setAttribute('aria-label', expandBtn.title);
+    });
+    wrap.appendChild(detail);
+  }
+
+  return wrap;
 }
 
 // A reason-record undo restores each pubkey's PRIOR reason, which can
@@ -1189,7 +1302,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
       var record = l.ref;
       var canUndo = !(record.type === 'reason' && !record.entries);
       var line = s86BuildRecordLine(
-        s86RecordLabel(record),
+        s86RecordLabelParts(record),
         canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
         function () {
           s86RemoveStoredRecord(record.id);
@@ -1199,10 +1312,16 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
       container.appendChild(line);
     } else {
       var ban = l.ref;
-      var labelText = 'reported ' + (ban.name ? ban.name + ' ' : '') + ban.npub
-        + (ban.report_type ? ' — ' + ban.report_type : '');
+      var parts = {
+        verb: 'reported',
+        name: ban.name || null,
+        nip05: ban.nip05 || null,
+        suffix: ban.report_type ? ' — ' + ban.report_type : null,
+        npub: ban.npub,
+        entries: null
+      };
       var line = s86BuildRecordLine(
-        labelText,
+        parts,
         function (btn) { s86UndoReportBan(ban.pubkey, btn, callbacks); },
         function () {
           s86DismissReport(l.id);

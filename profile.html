@@ -199,7 +199,7 @@ function runProfilePage() {
           s86AddRecord({
             type: 'unban',
             at: Date.now(),
-            entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, reason: profileData.ban ? profileData.ban.reason : '' }]
+            entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, nip05: profileData.nip05, reason: profileData.ban ? profileData.ban.reason : '' }]
           });
           setStatus('unbanned');
           fetchProfile();
@@ -219,7 +219,7 @@ function runProfilePage() {
             s86AddRecord({
               type: 'ban',
               at: Date.now(),
-              entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, reason: reason }]
+              entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, nip05: profileData.nip05, reason: reason }]
             });
           }
           fetchProfile();

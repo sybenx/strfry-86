@@ -486,14 +486,12 @@ banBtn.addEventListener('click', function () {
       }
       setStatus('banned ' + result.body.added.length + ' pubkey(s)'
         + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
-      for (var i = 0; i < result.body.added.length; i++) {
-        var pk = result.body.added[i];
+      var added = result.body.added.map(function (pk) {
         var a = byPubkey[pk];
-        s86AddRecord({
-          type: 'ban',
-          at: Date.now(),
-          entries: [{ pubkey: pk, npub: a ? a.npub : null, name: a ? a.name : null, reason: reason }]
-        });
+        return { pubkey: pk, npub: a ? a.npub : null, name: a ? a.name : null, nip05: a ? a.nip05 : null, reason: reason };
+      });
+      if (added.length > 0) {
+        s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
       }
       return loadBanned().then(function () {
         renderRecords();

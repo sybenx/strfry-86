@@ -296,6 +296,7 @@ unbanBtn.addEventListener('click', function () {
       pubkey: selected[i],
       npub: ban ? ban.npub : null,
       name: ban ? ban.name : null,
+      nip05: ban ? ban.nip05 : null,
       reason: ban ? ban.reason : ''
     };
   }
@@ -313,7 +314,7 @@ unbanBtn.addEventListener('click', function () {
           type: 'unban',
           at: Date.now(),
           entries: removed.map(function (pk) {
-            return entriesByPk[pk] || { pubkey: pk, npub: null, name: null, reason: '' };
+            return entriesByPk[pk] || { pubkey: pk, npub: null, name: null, nip05: null, reason: '' };
           })
         });
       }
@@ -348,14 +349,12 @@ banForm.addEventListener('submit', function (evt) {
       banInput.value = '';
       banReason.value = '';
       return loadBans().then(function () {
-        for (var i = 0; i < result.body.added.length; i++) {
-          var pk = result.body.added[i];
+        var added = result.body.added.map(function (pk) {
           var ban = lastBanned.find(function (b) { return b.pubkey === pk; });
-          s86AddRecord({
-            type: 'ban',
-            at: Date.now(),
-            entries: [{ pubkey: pk, npub: ban ? ban.npub : null, name: ban ? ban.name : null, reason: reason }]
-          });
+          return { pubkey: pk, npub: ban ? ban.npub : null, name: ban ? ban.name : null, nip05: ban ? ban.nip05 : null, reason: reason };
+        });
+        if (added.length > 0) {
+          s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
         }
         renderRecords();
       });
