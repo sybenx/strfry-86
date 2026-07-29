@@ -28,6 +28,7 @@ li { overflow-wrap: anywhere; }
     <input id="reason-input" type="text" placeholder="reason (optional)">
     <button id="ban-toggle-btn" type="button"></button>
   </p>
+  <div id="reason-edit-container"></div>
 
   <div id="profile-fields"></div>
 
@@ -67,6 +68,7 @@ var banStatusLine = document.getElementById('ban-status-line');
 var banControls = document.getElementById('ban-controls');
 var reasonInput = document.getElementById('reason-input');
 var banToggleBtn = document.getElementById('ban-toggle-btn');
+var reasonEditContainer = document.getElementById('reason-edit-container');
 var profileFieldsEl = document.getElementById('profile-fields');
 var countsLine = document.getElementById('counts-line');
 var kindsLine = document.getElementById('kinds-line');
@@ -176,6 +178,7 @@ function runProfilePage() {
       banStatusLine.textContent = 'not banned';
     }
 
+    reasonEditContainer.textContent = '';
     if (!isAdmin) {
       banControls.style.display = 'none';
       return;
@@ -183,6 +186,18 @@ function runProfilePage() {
     banControls.style.display = '';
     reasonInput.style.display = p.banned ? 'none' : '';
     banToggleBtn.textContent = p.banned ? 'Unban' : 'Ban';
+
+    // Reuse the same inline reason row the record lines use — same
+    // /api/reason call, same reason-record undo — rather than a second
+    // way to edit a reason. Only shown once banned; the reason-input
+    // above already covers setting one at ban time.
+    if (p.banned) {
+      reasonEditContainer.appendChild(s86BuildReasonEditRow(
+        [pubkeyHex],
+        (p.ban && p.ban.reason) || '',
+        { onChanged: fetchProfile, onError: setStatus }
+      ));
+    }
   }
 
   banToggleBtn.addEventListener('click', function () {

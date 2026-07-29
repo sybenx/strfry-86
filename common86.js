@@ -168,18 +168,25 @@ function s86PubkeyInputToHex(raw) {
 }
 
 // --- profile entry field -------------------------------------------------
-// One <input type="search"> + "View profile" button, present near-
-// identically directly above the command generator on every admin page.
-// A typed/pasted entry rather than a link on every row — that is what
-// keeps npubs copyable plain text everywhere else instead of turning each
-// one into a touch target. Invalid input sets a plain status line and
-// navigates nowhere; Enter in the field submits it same as the button.
+// One <input type="search"> + "Go" button, present near-identically
+// directly above the command generator on every admin page. A typed/pasted
+// entry rather than a link on every row — that is what keeps npubs
+// copyable plain text everywhere else instead of turning each one into a
+// touch target. Invalid input sets a plain status line and navigates
+// nowhere; Enter in the field submits it same as the button.
+//
+// A pubkey (npub or hex) wins first attempt — s86PubkeyInputToHex is
+// checked before domain validation, so a bare 64-hex string is never
+// mistaken for a hostname. Anything else is tried as a domain via the same
+// s86ValidateDomainInput used by the command generator's "fetch domain"
+// intent, so "asdf.com" typed here lands on that domain's own roster page
+// instead of erroring.
 function s86BuildProfileEntryField(statusEl) {
   var p = document.createElement('p');
 
   var input = document.createElement('input');
   input.type = 'search';
-  input.placeholder = 'npub or hex — view a pubkey\'s profile';
+  input.placeholder = 'npub, hex, or domain';
   // size is an HTML attribute, not a CSS rule, so it doesn't touch the
   // locked per-page <style> block — plain enough for the placeholder to
   // read in full instead of clipping at the browser default ~20 chars.
@@ -187,15 +194,20 @@ function s86BuildProfileEntryField(statusEl) {
 
   var btn = document.createElement('button');
   btn.type = 'button';
-  btn.textContent = 'View profile';
+  btn.textContent = 'Go';
 
   function go() {
     var hex = s86PubkeyInputToHex(input.value);
-    if (!hex) {
-      statusEl.textContent = 'enter a valid npub or hex pubkey';
+    if (hex) {
+      window.location.href = '/profile?hex=' + hex;
       return;
     }
-    window.location.href = '/profile?hex=' + hex;
+    var domain = s86ValidateDomainInput(input.value);
+    if (domain) {
+      window.location.href = '/domain?d=' + encodeURIComponent(domain);
+      return;
+    }
+    statusEl.textContent = 'enter a valid npub, hex pubkey, or domain';
   }
 
   btn.addEventListener('click', go);
