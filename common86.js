@@ -10,6 +10,7 @@ var S86_RECORDS_KEY = 'strfry86_records';
 var S86_DISMISSED_REPORTS_KEY = 'strfry86_dismissed_reports';
 var S86_MAX_RECORDS_STORED = 200;
 var S86_MAX_RECORDS_RENDERED = 20;
+var S86_RECORDS_INLINE = 3;
 var S86_MAX_DISMISSED = 1000;
 var S86_REASON_UNDO_MAX = 50;
 
@@ -1409,7 +1410,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
     s86SaveStored(S86_RECORDS_KEY, stored, S86_MAX_RECORDS_STORED);
   }
 
-  rendered.forEach(function (l) {
+  var lineEls = rendered.map(function (l) {
     if (l.kind === 'stored') {
       var record = l.ref;
       var canUndo = !(record.type === 'reason' && !record.entries);
@@ -1422,7 +1423,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         currentReason: '',
         callbacks: callbacks
       } : null;
-      var line = s86BuildRecordLine(
+      return s86BuildRecordLine(
         s86RecordLabelParts(record),
         canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
         function () {
@@ -1431,7 +1432,6 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         },
         reasonEdit
       );
-      container.appendChild(line);
     } else {
       var ban = l.ref;
       var parts = {
@@ -1442,7 +1442,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         npub: ban.npub,
         entries: null
       };
-      var line = s86BuildRecordLine(
+      return s86BuildRecordLine(
         parts,
         function (btn) { s86UndoReportBan(ban.pubkey, btn, callbacks); },
         function () {
@@ -1453,7 +1453,28 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         // is for entering a fresh reason, not editing the one on file.
         { pubkeys: [ban.pubkey], currentReason: '', callbacks: callbacks }
       );
-      container.appendChild(line);
     }
   });
+
+  // Newest S86_RECORDS_INLINE lines sit outside any disclosure, always
+  // visible — the rest go behind a <details> so a busy admin isn't
+  // greeted by twenty lines of history above the controls they came for.
+  // Nothing here changes what's stored or the S86_MAX_RECORDS_RENDERED
+  // cap above; this only changes how the already-capped set is drawn.
+  lineEls.slice(0, S86_RECORDS_INLINE).forEach(function (el) {
+    container.appendChild(el);
+  });
+
+  var older = lineEls.slice(S86_RECORDS_INLINE);
+  if (older.length > 0) {
+    var details = document.createElement('details');
+    var summary = document.createElement('summary');
+    summary.textContent = 'recent activity (' + older.length + ' older) ▸';
+    details.appendChild(summary);
+    older.forEach(function (el) { details.appendChild(el); });
+    details.addEventListener('toggle', function () {
+      summary.textContent = 'recent activity (' + older.length + ' older) ' + (details.open ? '▾' : '▸');
+    });
+    container.appendChild(details);
+  }
 }
