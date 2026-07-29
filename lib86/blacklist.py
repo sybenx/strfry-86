@@ -23,6 +23,8 @@ import json
 import os
 import time
 
+from lib86 import namecache
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BLACKLIST_PATH = os.path.join(BASE_DIR, "blacklist.json")
 
@@ -79,7 +81,11 @@ def add(pubkey_hex, banned_at, report_event_id, reason, report_type=None,
         name=None, nip05=None, name_checked_at=None, admin_pubkey_hex=None):
     """Add/refresh a ban entry. No-op returning False if pubkey_hex is the admin.
     A fresh ban always starts with name/nip05/name_checked_at null — a
-    pubkey earns a new external lookup only after it's banned again."""
+    pubkey earns a new external lookup only after it's banned again.
+    A pubkey's name lives in blacklist.json once banned, never both
+    places, so any names.json entry for it is dropped here — the single
+    enforcement site regardless of whether the ban came from plugin86.py's
+    hot path or server86.py's /api/ban."""
     global _cache, _cache_mtime
     if admin_pubkey_hex is not None and pubkey_hex == admin_pubkey_hex:
         return False
@@ -100,6 +106,7 @@ def add(pubkey_hex, banned_at, report_event_id, reason, report_type=None,
         _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
     except OSError:
         _cache_mtime = None
+    namecache.drop(pubkey_hex)
     return True
 
 

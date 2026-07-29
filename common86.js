@@ -281,11 +281,21 @@ function s86WireFilter(filterInput, listEl) {
   });
 }
 
-// --- select-all + live count -------------------------------------------------
+// --- select-visible + live count ---------------------------------------
+// Labelled "Select visible" everywhere, never "Select all" — the control
+// has always been filter-scoped, so the old label was lying by omission
+// on a control that can mass-unban.
 
 function s86UpdateSelectedCount(listEl, checkboxClass, countEl, extraButtons) {
   var n = listEl.querySelectorAll('.' + checkboxClass + ':checked').length;
-  countEl.textContent = n > 0 ? n + ' selected' : '';
+  var shown = 0;
+  var items = listEl.children;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].style.display !== 'none') {
+      shown++;
+    }
+  }
+  countEl.textContent = n > 0 ? n + ' selected of ' + shown + ' shown' : '';
   (extraButtons || []).forEach(function (btn) {
     btn.disabled = n === 0;
   });
@@ -305,6 +315,77 @@ function s86WireSelectAll(selectAllEl, listEl, checkboxClass, countEl, extraButt
   listEl.addEventListener('change', function () {
     s86UpdateSelectedCount(listEl, checkboxClass, countEl, extraButtons);
   });
+}
+
+// --- sort row -------------------------------------------------------------
+// A plain row of <button>s: "sort: <field> · <field> · …", the active one
+// bold with a trailing arrow, a second click on the active field reversing
+// direction. Shared because the rules are the same everywhere a list has
+// more than one meaningful order: re-sort clears the checked set and resets
+// select-visible (a selection carried across a re-order is the mass-unban
+// failure mode in its purest form), and the caller must re-apply the filter
+// after re-sorting — this helper only builds the control and returns the
+// sorted array, it does not touch the DOM list itself.
+
+function s86BuildSortRow(fields, initialField, initialDir, onChange) {
+  var p = document.createElement('p');
+  p.appendChild(document.createTextNode('sort: '));
+  var state = { field: initialField, dir: initialDir };
+  var buttons = {};
+
+  function relabel() {
+    fields.forEach(function (f) {
+      var btn = buttons[f.key];
+      btn.textContent = '';
+      if (f.key === state.field) {
+        var b = document.createElement('b');
+        b.textContent = f.label + (state.dir === 'asc' ? ' ↑' : ' ↓');
+        btn.appendChild(b);
+      } else {
+        btn.textContent = f.label;
+      }
+    });
+  }
+
+  fields.forEach(function (f, i) {
+    if (i > 0) {
+      p.appendChild(document.createTextNode(' · '));
+    }
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.addEventListener('click', function () {
+      if (state.field === f.key) {
+        state.dir = state.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.field = f.key;
+        state.dir = f.dir || 'desc';
+      }
+      relabel();
+      onChange(state.field, state.dir);
+    });
+    buttons[f.key] = btn;
+    p.appendChild(btn);
+  });
+
+  relabel();
+  return p;
+}
+
+// cmpFn(a, b) returns ascending order; dir flips it when 'desc'.
+function s86SortRows(rows, cmpFn, dir) {
+  var sorted = rows.slice().sort(cmpFn);
+  return dir === 'asc' ? sorted : sorted.reverse();
+}
+
+// --- render truncation ---------------------------------------------------
+// No list renders more than `max` rows — applied AFTER sort and filter,
+// never before, so filtering always searches the full result set.
+
+function s86TruncateForRender(rows, max) {
+  if (rows.length <= max) {
+    return { shown: rows, truncatedCount: 0, totalCount: rows.length };
+  }
+  return { shown: rows.slice(0, max), truncatedCount: rows.length - max, totalCount: rows.length };
 }
 
 // --- copy purge command -------------------------------------------------
@@ -370,6 +451,101 @@ function s86BuildCommandBlock() {
   render();
 
   return details;
+}
+
+// --- external name resolution (wss://purplepag.es -> POST /api/names) ---
+// Shared by bans.html (automatic, self-extinguishing set) and authors.html
+// (button-triggered, bounded to visible rows) — see each page for when it
+// fires. Moved here the moment a second page needed it, per the rule that
+// duplicated client code is how a fix lands in one page and not the other.
+
+// Collects raw, unparsed EVENT payloads for the caller to verify
+// server-side — no page trusts or parses profile content itself.
+// `connected` distinguishes "relay reachable, query completed" (EOSE or
+// the 5s timeout) from "never connected" — only the latter triggers the
+// damus.io fallback, per spec.
+function s86QueryRelayForNames(url, pubkeys, done) {
+  var settled = false;
+  var connected = false;
+  var events = [];
+  var ws;
+
+  function finish(ok) {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    try { ws.close(); } catch (e) {}
+    done(events, ok);
+  }
+
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    finish(false);
+    return;
+  }
+
+  var timeout = setTimeout(function () { finish(connected); }, 5000);
+
+  ws.addEventListener('open', function () {
+    connected = true;
+    ws.send(JSON.stringify(['REQ', 'strfry86names', { kinds: [0], authors: pubkeys }]));
+  });
+
+  ws.addEventListener('message', function (evt) {
+    var msg;
+    try { msg = JSON.parse(evt.data); } catch (e) { return; }
+    if (!Array.isArray(msg)) {
+      return;
+    }
+    if (msg[0] === 'EVENT' && msg[2]) {
+      events.push(msg[2]);
+    } else if (msg[0] === 'EOSE') {
+      clearTimeout(timeout);
+      finish(true);
+    }
+  });
+
+  ws.addEventListener('error', function () { clearTimeout(timeout); finish(connected); });
+  ws.addEventListener('close', function () { clearTimeout(timeout); finish(connected); });
+}
+
+// Query purplepag.es, falling back to relay.damus.io on a CONNECT failure
+// only, then POST whatever came back (even nothing) to /api/names.
+// callbacks: {onDone(ok), onError(msg)}. `onDone(false)` means neither
+// relay could be reached — the caller should stamp nothing client-side
+// either and just let the pubkeys stay eligible for the next attempt.
+function s86ResolveNamesExternally(pubkeys, callbacks) {
+  function post(events) {
+    s86SignAndPost('/api/names', { queried: pubkeys, events: events })
+      .then(function (result) {
+        if (!result.ok) {
+          if (callbacks.onError) callbacks.onError('name lookup failed: ' + s86ErrMsg(result));
+          if (callbacks.onDone) callbacks.onDone(false);
+          return;
+        }
+        if (callbacks.onDone) callbacks.onDone(true);
+      })
+      .catch(function () {
+        if (callbacks.onError) callbacks.onError('name lookup failed');
+        if (callbacks.onDone) callbacks.onDone(false);
+      });
+  }
+
+  s86QueryRelayForNames('wss://purplepag.es', pubkeys, function (events, connected) {
+    if (connected) {
+      post(events);
+      return;
+    }
+    s86QueryRelayForNames('wss://relay.damus.io', pubkeys, function (events2, connected2) {
+      if (connected2) {
+        post(events2);
+      } else if (callbacks.onDone) {
+        callbacks.onDone(false);
+      }
+    });
+  });
 }
 
 // --- record lines -------------------------------------------------------

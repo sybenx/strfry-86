@@ -425,6 +425,126 @@ CRYPTO_FAIL_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^FAIL: ')"
 FAILURES=$((FAILURES + CRYPTO_FAIL_COUNT))
 rm -f "$CRYPTO_TEST_SCRIPT"
 
+# --- async author-scan bounds (server86.py) ---------------------------------
+# Every one of these is a silent failure if it stops holding: a bad `mode`
+# must never fall back to a default, the request must never be able to
+# supply a raw limit/kinds filter, and /api/names' widened accept-bound
+# must only ever come from server-held state (banned ∪ author-scan cache).
+
+BOUNDS_TEST_SCRIPT="$(mktemp)"
+cat > "$BOUNDS_TEST_SCRIPT" <<'PYEOF'
+import json
+import os
+import sys
+
+REPO_ROOT = sys.argv[1]
+sys.path.insert(0, REPO_ROOT)
+import server86  # noqa: E402
+
+results = []
+
+
+def check(ok, name, detail=None):
+    results.append((ok, name, detail))
+
+
+# --- validate_authors_scan_mode -----------------------------------------
+
+mode, err = server86.validate_authors_scan_mode({"mode": "recent"})
+check(mode == "recent" and err is None, "validate_authors_scan_mode accepts 'recent'")
+
+mode, err = server86.validate_authors_scan_mode({"mode": "full"})
+check(mode == "full" and err is None, "validate_authors_scan_mode accepts 'full'")
+
+mode, err = server86.validate_authors_scan_mode({})
+check(mode is None and err is not None, "validate_authors_scan_mode rejects a missing mode")
+
+mode, err = server86.validate_authors_scan_mode({"mode": "bogus"})
+check(mode is None and err is not None, "validate_authors_scan_mode rejects an unrecognized mode name")
+
+mode, err = server86.validate_authors_scan_mode({"mode": "recent", "limit": 250000})
+check(mode is None and err is not None, "validate_authors_scan_mode rejects a request-supplied limit")
+
+mode, err = server86.validate_authors_scan_mode({"mode": "recent", "kinds": [1, 2]})
+check(mode is None and err is not None, "validate_authors_scan_mode rejects a request-supplied kinds array")
+
+
+# --- authors_scan_pubkeys / /api/names widened accept-bound --------------
+
+check(server86.authors_scan_pubkeys() == set(), "authors_scan_pubkeys is empty before any scan has run")
+
+with open(os.path.join(REPO_ROOT, "tests", "kind0-fixture.json")) as f:
+    kind0_fixture = json.load(f)
+real_pubkey = kind0_fixture["valid"]["pubkey"]
+
+with server86._authors_lock:
+    server86._authors_cache = dict(server86._authors_cache)
+    server86._authors_cache["authors"] = [{"pubkey": real_pubkey, "npub": "npub1fake", "count": 3}]
+
+check(real_pubkey in server86.authors_scan_pubkeys(),
+      "authors_scan_pubkeys reflects a pubkey present in the author-scan cache")
+
+# The accept-bound is a union of banned pubkeys and author-scan-cache
+# pubkeys, assembled exactly as the /api/names handler assembles it —
+# never a value taken from the request. With no bans in this process,
+# the only reason this validly-signed event should be accepted is that
+# its pubkey is in the author-scan cache.
+acceptable = set() | server86.authors_scan_pubkeys()
+verified = server86.verify_kind0_event(kind0_fixture["valid"], {real_pubkey}, acceptable)
+check(verified is not None,
+      "verify_kind0_event accepts a validly-signed kind-0 for a pubkey that is only in the "
+      "author-scan cache, not banned")
+
+
+# --- AUTHOR_SCAN_KINDS gap check (requires a live strfry database) --------
+
+strfry_bin = server86.get_strfry_bin()
+if strfry_bin is None:
+    print(f"SKIP: AUTHOR_SCAN_KINDS gap check (no strfry binary found; tried PATH and "
+          f"{', '.join(server86.STRFRY_BIN_CANDIDATES)})")
+else:
+    try:
+        import subprocess
+
+        def count(filter_obj):
+            argv = [strfry_bin, "--config", server86.STRFRY_CONF_PATH, "scan", "--count",
+                    json.dumps(filter_obj, separators=(",", ":"))]
+            result = subprocess.run(argv, cwd=server86.get_relay_cwd(), capture_output=True,
+                                     timeout=server86.SCAN_TIMEOUT)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace")[-300:])
+            lines = [ln.strip() for ln in result.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+            return int(lines[-1])
+
+        total = count({})
+        allowlisted = count({"kinds": list(server86.AUTHOR_SCAN_KINDS)})
+        giftwraps = count({"kinds": [1059]})
+        non_giftwrap = total - giftwraps
+        gap = non_giftwrap - allowlisted
+        gap_pct = (gap / non_giftwrap * 100) if non_giftwrap else 0.0
+        ok = gap_pct <= 2.0
+        check(ok, f"AUTHOR_SCAN_KINDS gap check ({gap} missing of {non_giftwrap} non-giftwrap events, {gap_pct:.2f}%)",
+              None if ok else "allowlist is stale — extend AUTHOR_SCAN_KINDS (see CLAUDE.md 'Auditing the allowlist')")
+    except Exception as e:
+        check(False, "AUTHOR_SCAN_KINDS gap check", f"error running against live db: {type(e).__name__}: {e}")
+
+
+for ok, name, detail in results:
+    if ok:
+        print(f"PASS: {name}")
+    else:
+        line = f"FAIL: {name}"
+        if detail:
+            line += f" ({detail})"
+        print(line)
+PYEOF
+
+BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT")"
+echo "$BOUNDS_OUTPUT"
+BOUNDS_FAIL_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^FAIL: ')"
+FAILURES=$((FAILURES + BOUNDS_FAIL_COUNT))
+rm -f "$BOUNDS_TEST_SCRIPT"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "ALL TESTS PASSED"

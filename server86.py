@@ -33,10 +33,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from lib86 import bech32, bip340, blacklist  # noqa: E402
+from lib86 import bech32, bip340, blacklist, namecache  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 STRFRY_CONF_PATH = "/config/strfry.conf"
+AUTHORS_CACHE_PATH = os.path.join(SCRIPT_DIR, "authors-cache.json")
 # dockurr/strfry ships the binary at /app/strfry, which is NOT on PATH for a
 # detached process; the official image installs to /usr/local/bin.
 STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry")
@@ -54,17 +55,44 @@ STATIC_ROUTES = {
 NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
 NAME_CACHE_TTL = 24 * 3600
-STRFRY_SCAN_TIMEOUT = 5
 
-# The most recent N events define the author-scan window. A constant limit
-# is one of exactly two bounding mechanisms this project allows for a scan
-# (the other being an explicit `authors` list) — never since/until alone.
-AUTHOR_SCAN_LIMIT = 20000
-# Overall wall-clock budget for reading the scan's output, checked between
-# lines, so a degraded strfry can't hang a request indefinitely.
-AUTHOR_SCAN_TIMEOUT = 60
+# --- bounds --------------------------------------------------------------
+# Every bound in the project, in one block, so the bounded-scan rule can be
+# audited by reading this block alone. Every scan is bounded by either a
+# constant `limit` (never a value taken from a request) or an explicit
+# `authors` list assembled from data server86 already holds — nothing else
+# counts as a bound, per the hard constraint in CLAUDE.md.
 
-_name_cache = {}  # pubkey_hex -> ({"name": str_or_None, "nip05": str_or_None}, checked_at)
+AUTHOR_SCAN_KINDS = (
+    # Every kind EXCEPT 1059 (gift wraps: single-use keys, structurally
+    # unbannable, and 88% of events on the reference relay). See CLAUDE.md
+    # "Auditing the allowlist" for how this tuple is checked for drift
+    # against a live relay — test.sh runs that check when one is reachable.
+    0, 1, 3, 4, 5, 6, 7, 21, 42, 321, 445, 1000, 1018, 1040, 1111, 1311, 1337,
+    1618, 1619, 1984, 1985, 2003, 4000, 4244, 5300, 6300, 7000, 9735, 10002,
+    10050, 30000, 30023, 30078, 30166, 30383, 30800, 34236, 36787, 420001,
+)
+AUTHOR_SCAN_FULL_LIMIT = 1500000  # named separately: saturation at this value ends completeness
+AUTHOR_SCAN_MODES = {
+    # Selectable by NAME only; a request never supplies a filter, a limit,
+    # or a kinds array — see the mode validation in do_POST.
+    "recent": {"limit": 20000},                                              # all kinds, newest 20k, ~3s
+    "full": {"kinds": AUTHOR_SCAN_KINDS, "limit": AUTHOR_SCAN_FULL_LIMIT},    # every moderation-kind event, ~137s measured
+}
+AUTHOR_SCAN_DEADLINE = 240      # seconds; a FAILURE timeout for the deep scans, not a bound
+REASON_MAX_LEN = 500            # characters accepted for a ban reason
+REASON_UNDO_MAX = 50            # entries whose prior reasons are snapshotted for undo
+RECIPIENT_SCAN_LIMIT = 250000   # newest kind-1059 events tallied for storage accounting
+SUBSCRIBER_SCAN_LIMIT = 50000   # kind-10050/10002 events searched for this relay's own URL
+SCAN_TIMEOUT = 10               # seconds; every other scan subprocess
+REPORT_SCAN_LIMIT = 5000        # kind-1984 events read to build the reports-against tally
+NAME_RESOLVE_MAX = 500          # pubkeys per batched kind-0 lookup
+NAME_CACHE_MAX = 20000          # entries retained in names.json
+PROFILE_EVENT_LIMIT = 500       # events read for one pubkey's kind tally
+PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
+PROFILE_REPORT_LIMIT = 100      # kind-1984 events read for reports against one pubkey
+DOMAIN_LOOKUP_MAX = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
+RENDER_MAX = 500                # list rows rendered client-side before truncation
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
@@ -72,18 +100,12 @@ _strfry_bin_checked = False
 _relay_cwd_pid = None
 _relay_cwd_path = None
 
-# The author list is never recomputed on a timer or because it went stale —
-# only POST /api/authors/scan (an explicit admin button press) changes it.
+# The author list is never recomputed on a timer or because it went stale
+# — only POST /api/authors/scan (an explicit admin button press) starts a
+# scan, which then runs in a background thread so the request never blocks.
 _authors_lock = threading.Lock()
-_authors_cache = {
-    "scanned_at": None,
-    "events_read": 0,
-    "span_start": None,
-    "span_end": None,
-    "warning": None,
-    "authors": [],
-}
-_authors_computing = False
+_authors_job = {"status": "idle", "mode": None, "started_at": None, "progress": None}
+# _authors_cache is initialized after _load_authors_cache() is defined below.
 
 CONTACT_APPEAL_CHECK_INTERVAL = 1.0
 _contact_appeal_cache = ""
@@ -270,7 +292,7 @@ def _run_strfry(filter_obj, timeout):
     return result.stdout
 
 
-def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
+def run_strfry_scan(filter_obj, timeout=SCAN_TIMEOUT):
     """Run `strfry scan <filter>` and return a list of parsed event dicts.
     Used only for small, already-bounded scans (an explicit `authors` list)
     where holding the full result in memory is fine."""
@@ -286,13 +308,16 @@ def run_strfry_scan(filter_obj, timeout=STRFRY_SCAN_TIMEOUT):
     return events
 
 
-def run_strfry_scan_streaming(filter_obj, on_event, timeout):
+def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
     """Run `strfry scan <filter>` and call on_event(parsed_dict) for each
     line as it arrives, never holding more than one parsed event at a time
     (used for the `limit`-bounded author scan, which can return up to
-    AUTHOR_SCAN_LIMIT full event bodies — too much to buffer as a list).
-    Returns the number of events read. Raises on failure (missing binary,
-    non-zero exit, or exceeding the wall-clock budget)."""
+    AUTHOR_SCAN_FULL_LIMIT full event bodies — too much to buffer as a
+    list). If given, on_progress(count) is called every 500 events, not
+    every one, so a long scan's background thread doesn't contend the
+    status lock a polling GET also reads on every request. Returns the
+    number of events read. Raises on failure (missing binary, non-zero
+    exit, or exceeding the wall-clock budget)."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
     argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json]
@@ -334,6 +359,8 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout):
                 continue
             on_event(event)
             count += 1
+            if on_progress is not None and count % 500 == 0:
+                on_progress(count)
     finally:
         try:
             proc.stdout.close()
@@ -383,24 +410,35 @@ def resolve_profiles(pubkeys):
 
 def _resolve_profiles_locally(pubkeys):
     """Resolve names/nip05 from the LOCAL strfry database only, querying
-    uncached (or stale-miss) pubkeys in one batched scan bounded by an
-    explicit `authors` list. Both fields come from the same kind-0 event;
-    the nip05 string is displayed as-is, never verified (verification would
-    need outbound HTTP to arbitrary domains). Local results live only in
-    the in-memory cache below — never written to blacklist.json, since the
-    local database is already the source of truth for them."""
+    uncached (or stale local-miss) pubkeys in one batched scan bounded by
+    an explicit `authors` list. Both fields come from the same kind-0
+    event; the nip05 string is displayed as-is, never verified
+    (verification would need outbound HTTP to arbitrary domains). Results
+    persist in names.json (lib86/namecache.py) rather than in memory only,
+    so they survive server86 restarts — never written to blacklist.json,
+    since these pubkeys aren't (necessarily) banned.
+
+    A cached `source: "external"` entry (hit or miss) is treated as final
+    and never re-attempted locally: if a purplepag.es-backed lookup found
+    nothing, the profile is presumed absent everywhere, not just here.
+    Only `source: "local"` full misses older than NAME_CACHE_TTL are
+    eligible for another local scan attempt — the local database keeps
+    changing in a way an external miss never un-misses."""
     now = time.time()
-    miss = {"name": None, "nip05": None}
-    to_query = [
+    cached = namecache.get_many(pubkeys)
+    to_query = {
         pk for pk in pubkeys
-        if pk not in _name_cache or (
-            _name_cache[pk][0] == miss and now - _name_cache[pk][1] >= NAME_CACHE_TTL
+        if pk not in cached or (
+            not cached[pk].get("name") and not cached[pk].get("nip05")
+            and cached[pk].get("source") == "local"
+            and now - (cached[pk].get("checked_at") or 0) >= NAME_CACHE_TTL
         )
-    ]
+    }
 
     if to_query:
+        results = {}
         try:
-            events = run_strfry_scan({"kinds": [0], "authors": to_query})
+            events = run_strfry_scan({"kinds": [0], "authors": list(to_query)})
             found = set()
             for ev in events:
                 try:
@@ -410,31 +448,42 @@ def _resolve_profiles_locally(pubkeys):
                     pk = ev.get("pubkey")
                 except Exception:
                     continue
-                if pk in to_query:
-                    _name_cache[pk] = (
-                        {"name": _clean_profile_field(name), "nip05": _clean_profile_field(nip05)},
-                        now,
-                    )
+                if pk in to_query and pk not in found:
+                    results[pk] = {"name": _clean_profile_field(name), "nip05": _clean_profile_field(nip05)}
                     found.add(pk)
             for pk in to_query:
                 if pk not in found:
-                    _name_cache[pk] = (dict(miss), now)
+                    results[pk] = {"name": None, "nip05": None}
         except Exception as e:
             log(f"server86: strfry scan failed: {e}")
             for pk in to_query:
-                if pk not in _name_cache:
-                    _name_cache[pk] = (dict(miss), now)
+                results[pk] = {"name": None, "nip05": None}
+        namecache.set_local(results, now, max_entries=NAME_CACHE_MAX)
+        for pk, hit in results.items():
+            cached[pk] = {"name": hit["name"], "nip05": hit["nip05"], "checked_at": now, "source": "local"}
 
-    return {pk: _name_cache[pk][0] for pk in pubkeys}
+    miss = {"name": None, "nip05": None}
+    return {pk: ({"name": cached[pk]["name"], "nip05": cached[pk]["nip05"]} if pk in cached else miss) for pk in pubkeys}
 
 
-def compute_authors():
-    """One bounded scan of the most recent AUTHOR_SCAN_LIMIT events, tallied
-    per author while streaming — no list of event bodies is ever held in
+def compute_authors(mode, progress_cb=None):
+    """One bounded scan of AUTHOR_SCAN_MODES[mode], tallied per author and
+    per kind while streaming — no list of event bodies is ever held in
     full. Depends on NIP-01 `limit` returning the newest matching events
     first, as documented; verify that against the deployed strfry version
-    before relying on it."""
-    tally = {}  # pubkey -> {"count": int, "last_seen": int}
+    before relying on it.
+
+    A second, independent scan tallies DISTINCT reporters per pubkey from
+    recent kind-1984 reports — never itself grounds for a ban, a signal to
+    look at. If it fails, `reporters` is null for every author (never a
+    misleading 0) and the default sort falls back to event count alone;
+    the main author list still succeeds. Neither scan touches purplepag.es
+    or writes to blacklist.json — both are paid for by the same admin
+    press."""
+    filter_obj = dict(AUTHOR_SCAN_MODES[mode])
+    limit = filter_obj["limit"]
+    tally = {}  # pubkey -> {"count": int, "last_seen": int, "kind": int_or_None}
+    kind_counts = {}
     span = {"start": None, "end": None}
 
     def on_event(ev):
@@ -442,91 +491,235 @@ def compute_authors():
             return
         pk = ev.get("pubkey")
         created_at = ev.get("created_at")
+        kind = ev.get("kind")
         if not isinstance(pk, str) or not isinstance(created_at, int):
             return
         entry = tally.get(pk)
         if entry is None:
-            tally[pk] = {"count": 1, "last_seen": created_at}
+            tally[pk] = {"count": 1, "last_seen": created_at, "kind": kind if isinstance(kind, int) else None}
         else:
             entry["count"] += 1
             if created_at > entry["last_seen"]:
                 entry["last_seen"] = created_at
+                entry["kind"] = kind if isinstance(kind, int) else None
+        if isinstance(kind, int):
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
         if span["start"] is None or created_at < span["start"]:
             span["start"] = created_at
         if span["end"] is None or created_at > span["end"]:
             span["end"] = created_at
 
-    events_read = run_strfry_scan_streaming(
-        {"limit": AUTHOR_SCAN_LIMIT}, on_event, timeout=AUTHOR_SCAN_TIMEOUT
-    )
+    events_read = run_strfry_scan_streaming(filter_obj, on_event, timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb)
+    saturated = events_read >= limit
 
-    pubkeys = list(tally.keys())
+    singleton_kinds = {}
+    for entry in tally.values():
+        if entry["count"] == 1 and entry["kind"] is not None:
+            singleton_kinds[entry["kind"]] = singleton_kinds.get(entry["kind"], 0) + 1
+
+    reporters_by_pubkey = {}
+    reports_ok = True
+    reports_scanned = 0
+    reports_saturated = False
     try:
-        profiles = resolve_profiles(pubkeys)
+        report_events = run_strfry_scan({"kinds": [1984], "limit": REPORT_SCAN_LIMIT}, timeout=SCAN_TIMEOUT)
+        reports_scanned = len(report_events)
+        reports_saturated = reports_scanned >= REPORT_SCAN_LIMIT
+        for ev in report_events:
+            reporter = ev.get("pubkey")
+            tags = ev.get("tags")
+            if not isinstance(reporter, str) or not isinstance(tags, list):
+                continue
+            for tag in tags:
+                if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p" and isinstance(tag[1], str):
+                    reporters_by_pubkey.setdefault(tag[1], set()).add(reporter)
+    except Exception as e:
+        log(f"server86: reports tally failed: {e}")
+        reports_ok = False
+
+    all_pubkeys = set(tally.keys())
+    if reports_ok:
+        all_pubkeys |= set(reporters_by_pubkey.keys())
+
+    rows = []
+    for pk in all_pubkeys:
+        try:
+            npub = bech32.npub_encode(pk)
+        except (ValueError, TypeError):
+            continue
+        entry = tally.get(pk, {"count": 0, "last_seen": None})
+        reporters = len(reporters_by_pubkey.get(pk, ())) if reports_ok else None
+        rows.append({
+            "pubkey": pk, "npub": npub,
+            "count": entry["count"], "last_seen": entry["last_seen"],
+            "reporters": reporters,
+        })
+    if reports_ok:
+        rows.sort(key=lambda a: (a["reporters"] or 0, a["count"]), reverse=True)
+    else:
+        rows.sort(key=lambda a: a["count"], reverse=True)
+
+    # Names: batched, capped at NAME_RESOLVE_MAX, taken from the top of
+    # the ranking above. Single-event authors are skipped entirely — on a
+    # real relay they are overwhelmingly gift-wrap-adjacent throwaway
+    # keys with no kind-0 to find, and resolving them would spend the
+    # whole cap on the least useful rows.
+    to_resolve = [r["pubkey"] for r in rows if r["count"] != 1][:NAME_RESOLVE_MAX]
+    try:
+        profiles = resolve_profiles(to_resolve)
     except Exception as e:
         log(f"server86: author name resolution failed: {e}")
         profiles = {}
 
     authors = []
-    for pk, entry in tally.items():
-        try:
-            npub = bech32.npub_encode(pk)
-        except (ValueError, TypeError):
-            continue
-        profile = profiles.get(pk) or {}
+    for r in rows:
+        profile = profiles.get(r["pubkey"]) or {}
         authors.append({
-            "pubkey": pk,
-            "npub": npub,
-            "name": profile.get("name"),
-            "nip05": profile.get("nip05"),
-            "count": entry["count"],
-            "last_seen": entry["last_seen"],
+            "pubkey": r["pubkey"], "npub": r["npub"],
+            "name": profile.get("name"), "nip05": profile.get("nip05"),
+            "count": r["count"], "last_seen": r["last_seen"],
+            "reporters": r["reporters"],
         })
-    authors.sort(key=lambda a: a["count"], reverse=True)
 
     return {
         "scanned_at": int(time.time()),
+        "mode": mode,
+        "limit": limit,
+        "saturated": saturated,
         "events_read": events_read,
         "span_start": span["start"],
         "span_end": span["end"],
-        "warning": None,
+        "kinds": kind_counts,
+        "singleton_kinds": singleton_kinds,
+        "reports_saturated": reports_saturated,
+        "reports_scanned": reports_scanned,
+        "warning": None if reports_ok else "reports tally failed — sorting by event count only",
         "authors": authors,
     }
 
 
-def get_authors_cache():
-    with _authors_lock:
-        return _authors_cache
+def _empty_authors_result():
+    return {
+        "scanned_at": None, "mode": None, "limit": None, "saturated": False,
+        "events_read": 0, "span_start": None, "span_end": None,
+        "kinds": {}, "singleton_kinds": {},
+        "reports_saturated": False, "reports_scanned": 0,
+        "warning": None, "authors": [],
+    }
 
 
-def run_authors_scan():
-    """Run exactly one author scan, single-flight: a scan already in
-    progress returns the existing cache with a warning rather than starting
-    a second one. On failure the previous cache survives untouched and the
-    returned copy carries a warning naming the exception."""
-    global _authors_cache, _authors_computing
-    with _authors_lock:
-        if _authors_computing:
-            report = dict(_authors_cache)
-            report["warning"] = "a scan is already in progress — showing the previous result"
-            return report
-        _authors_computing = True
+def _load_authors_cache():
+    try:
+        with open(AUTHORS_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return _empty_authors_result()
+
+
+def _save_authors_cache(result):
+    """authors-cache.json is a DERIVED cache — never in the manifest, never
+    operator-owned, safe to delete at any time, rewritten wholesale. It
+    exists because the updater kills and respawns server86 on every
+    update, and an in-memory-only ~2-minute scan result would otherwise
+    vanish on a schedule the operator doesn't control."""
+    tmp_path = AUTHORS_CACHE_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, AUTHORS_CACHE_PATH)
+
+
+_authors_cache = _load_authors_cache()
+
+
+def _run_authors_scan_job(mode):
+    global _authors_cache
+
+    def progress_cb(count):
+        with _authors_lock:
+            _authors_job["progress"] = count
 
     try:
-        report = compute_authors()
+        result = compute_authors(mode, progress_cb=progress_cb)
     except Exception as e:
         warning = f"author scan failed: {type(e).__name__}: {e}"[:600]
         log(f"server86: {warning}")
         with _authors_lock:
-            _authors_computing = False
             stale = dict(_authors_cache)
-        stale["warning"] = warning
-        return stale
+            stale["warning"] = warning
+            _authors_cache = stale
+            _authors_job["status"] = "idle"
+            _authors_job["progress"] = None
+        return
+
+    try:
+        _save_authors_cache(result)
+    except OSError as e:
+        log(f"server86: failed to persist authors-cache.json: {e}")
 
     with _authors_lock:
-        _authors_cache = report
-        _authors_computing = False
-    return report
+        _authors_cache = result
+        _authors_job["status"] = "idle"
+        _authors_job["progress"] = None
+
+
+def start_authors_scan(mode):
+    """Start one bounded author scan in a background thread if none is
+    already running — never blocks the request. A POST while one is
+    already running returns the SAME status shape the original POST
+    returned rather than a 409, so POST-then-GET from the same client
+    never observes a state its own POST couldn't have produced."""
+    with _authors_lock:
+        if _authors_job["status"] == "running":
+            return dict(_authors_job)
+        _authors_job["status"] = "running"
+        _authors_job["mode"] = mode
+        _authors_job["started_at"] = int(time.time())
+        _authors_job["progress"] = 0
+        status = dict(_authors_job)
+
+    thread = threading.Thread(target=_run_authors_scan_job, args=(mode,), daemon=True)
+    thread.start()
+    return status
+
+
+def get_authors_status():
+    """GET /api/authors: never scans, never starts one. Merges the live
+    job status over the last persisted result, so `status`/`progress`
+    always reflect what's happening now and every other field reflects
+    the last completed scan (or the never-scanned skeleton)."""
+    with _authors_lock:
+        status = dict(_authors_job)
+        cached = dict(_authors_cache)
+    cached.update(status)
+    return cached
+
+
+def authors_scan_pubkeys():
+    """The set of pubkeys currently in the author-scan cache — the second
+    half of /api/names' accept-bound (banned OR in this set), and never
+    itself a scan."""
+    with _authors_lock:
+        cached = _authors_cache
+    return {a["pubkey"] for a in cached.get("authors", [])}
+
+
+def validate_authors_scan_mode(body):
+    """Return (mode, error) for a POST /api/authors/scan body. `mode`
+    selects a named constant filter; the request may never supply a
+    filter, a limit, or a kinds array directly — a name indexing a table
+    readable in the source is auditable, a caller-supplied number or
+    filter is not. On success `error` is None and `mode` is a key of
+    AUTHOR_SCAN_MODES; on failure `mode` is None."""
+    if "limit" in body or "kinds" in body:
+        return None, "limit/kinds may not be supplied by the request"
+    mode = body.get("mode")
+    if mode not in AUTHOR_SCAN_MODES:
+        return None, "unrecognized mode"
+    return mode, None
 
 
 def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
@@ -714,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/authors":
-            self._send_json(200, get_authors_cache())
+            self._send_json(200, get_authors_status())
             return
 
         self._send_json(404, {"error": "not found"})
@@ -749,8 +942,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/authors/scan":
-            report = run_authors_scan()
-            self._send_json(200, report)
+            mode, err = validate_authors_scan_mode(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            status = start_authors_scan(mode)
+            self._send_json(202, status)
             return
 
         if path == "/api/names":
@@ -762,12 +959,15 @@ class Handler(BaseHTTPRequestHandler):
 
             queried = [pk for pk in queried_raw if is_hex64(pk)]
             queried_set = set(queried)
-            banned_pubkeys = set(blacklist.load().keys())
+            # The accept-bound is "banned OR present in the current
+            # author-scan cache" — still a bound assembled from server-held
+            # state, never an arbitrary client-supplied pubkey.
+            acceptable_pubkeys = set(blacklist.load().keys()) | authors_scan_pubkeys()
 
             hits = {}
             newest_created_at = {}
             for ev in events_raw:
-                verified = verify_kind0_event(ev, queried_set, banned_pubkeys)
+                verified = verify_kind0_event(ev, queried_set, acceptable_pubkeys)
                 if verified is None:
                     continue
                 pubkey, created_at, name, nip05 = verified
@@ -776,7 +976,19 @@ class Handler(BaseHTTPRequestHandler):
                 newest_created_at[pubkey] = created_at
                 hits[pubkey] = {"name": name, "nip05": nip05}
 
-            stamped = blacklist.set_names(hits, queried, now=int(time.time()))
+            # Storage routes by ban status, never by request: re-check
+            # fresh, right before writing — the lookup took seconds and
+            # the admin may have banned or unbanned someone meanwhile.
+            now = int(time.time())
+            fresh_banned = set(blacklist.load().keys())
+            banned_queried = [pk for pk in queried if pk in fresh_banned]
+            cache_queried = [pk for pk in queried if pk not in fresh_banned]
+            banned_hits = {pk: h for pk, h in hits.items() if pk in fresh_banned}
+            cache_hits = {pk: h for pk, h in hits.items() if pk not in fresh_banned}
+
+            stamped = blacklist.set_names(banned_hits, banned_queried, now=now)
+            stamped += namecache.set_external(cache_hits, cache_queried, now=now, max_entries=NAME_CACHE_MAX)
+
             stamped_set = set(stamped)
             named = sorted(pk for pk in hits if pk in stamped_set)
             self._send_json(200, {"ok": True, "named": named, "stamped": len(stamped)})

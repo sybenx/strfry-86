@@ -29,7 +29,7 @@ li { overflow-wrap: anywhere; }
 <p>These npubs are banned from this relay.</p>
 <p id="appeal-line" style="display:none"></p>
 <p><input id="filter-input" type="search" placeholder="filter bans"></p>
-<label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select all</label>
+<label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select visible</label>
 <button id="unban-btn" type="button" style="display:none">Unban selected</button>
 <button id="copy-purge-btn" type="button" style="display:none" disabled>Copy purge command</button>
 <b id="selected-count"></b>
@@ -190,32 +190,22 @@ function maybeResolveNamesExternally() {
   nameResolutionInFlight = true;
   pubkeys.forEach(function (pk) { attemptedThisSession.add(pk); });
 
-  function finish(events, connected) {
-    if (!connected) {
-      // Neither relay could be reached — POST nothing, stamp nothing.
-      // The next admin page load simply tries again.
-      nameResolutionInFlight = false;
-      return;
-    }
-    s86SignAndPost('/api/names', { queried: pubkeys, events: events })
-      .then(function () {
-        return loadBans();
-      })
-      .then(function () {
+  s86ResolveNamesExternally(pubkeys, {
+    onDone: function (posted) {
+      if (!posted) {
+        // Neither relay could be reached, or the POST itself failed —
+        // stamp nothing. The next admin page load simply tries again.
+        nameResolutionInFlight = false;
+        return;
+      }
+      loadBans().then(function () {
         renderNameStatusLine();
         nameResolutionInFlight = false;
-      })
-      .catch(function () {
-        nameResolutionInFlight = false;
       });
-  }
-
-  queryRelayForNames('wss://purplepag.es', pubkeys, function (events, connected) {
-    if (connected) {
-      finish(events, true);
-      return;
+    },
+    onError: function () {
+      nameResolutionInFlight = false;
     }
-    queryRelayForNames('wss://relay.damus.io', pubkeys, finish);
   });
 }
 
@@ -233,58 +223,6 @@ function renderNameStatusLine() {
   });
   nameStatusEl.textContent = 'resolved ' + n + ' locally, ' + m + ' via purplepag.es, ' + k + ' unresolved';
   nameStatusEl.style.display = '';
-}
-
-// Collects raw, unparsed EVENT payloads for the caller to verify
-// server-side — this page never trusts or parses profile content itself.
-// `connected` distinguishes "relay reachable, query completed" (EOSE or
-// the 5s timeout) from "never connected" — only the latter triggers the
-// damus.io fallback, per spec.
-function queryRelayForNames(url, pubkeys, done) {
-  var settled = false;
-  var connected = false;
-  var events = [];
-  var ws;
-
-  function finish(ok) {
-    if (settled) {
-      return;
-    }
-    settled = true;
-    try { ws.close(); } catch (e) {}
-    done(events, ok);
-  }
-
-  try {
-    ws = new WebSocket(url);
-  } catch (e) {
-    finish(false);
-    return;
-  }
-
-  var timeout = setTimeout(function () { finish(connected); }, 5000);
-
-  ws.addEventListener('open', function () {
-    connected = true;
-    ws.send(JSON.stringify(['REQ', 'strfry86names', { kinds: [0], authors: pubkeys }]));
-  });
-
-  ws.addEventListener('message', function (evt) {
-    var msg;
-    try { msg = JSON.parse(evt.data); } catch (e) { return; }
-    if (!Array.isArray(msg)) {
-      return;
-    }
-    if (msg[0] === 'EVENT' && msg[2]) {
-      events.push(msg[2]);
-    } else if (msg[0] === 'EOSE') {
-      clearTimeout(timeout);
-      finish(true);
-    }
-  });
-
-  ws.addEventListener('error', function () { clearTimeout(timeout); finish(connected); });
-  ws.addEventListener('close', function () { clearTimeout(timeout); finish(connected); });
 }
 
 // --- login ---------------------------------------------------------------

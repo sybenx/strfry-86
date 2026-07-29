@@ -19,25 +19,41 @@ li { overflow-wrap: anywhere; }
   <div id="command-block-container"></div>
   <div id="records-list"></div>
   <p>
-    <button id="scan-btn" type="button">scan recent activity (reads the most recent 20000 events)</button>
+    <label><input type="radio" name="scan-mode" value="recent" checked> recent activity (newest 20,000 events, all kinds)</label><br>
+    <label><input type="radio" name="scan-mode" value="full"> full author list (every note, reaction, report and profile — excludes DMs, ~2 minutes)</label>
   </p>
+  <p><button id="scan-btn" type="button">scan recent activity (newest 20,000 events)</button></p>
   <p id="provenance-line"></p>
-  <p><input id="filter-input" type="search" placeholder="filter authors"></p>
-  <label id="select-all-label"><input id="select-all" type="checkbox"> Select all</label>
+  <div id="composition-line"></div>
+  <p><input id="filter-input" type="search" placeholder="filter authors — name, nip05, or npub"></p>
+  <label><input id="hide-singletons" type="checkbox" checked> hide single-event authors</label>
+  <p id="hidden-singletons-line"></p>
+  <div id="sort-row"></div>
+  <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
   <button id="ban-btn" type="button">Ban selected</button>
   <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
   <input id="ban-reason" type="text" placeholder="reason (optional)">
   <b id="selected-count"></b>
   <pre id="purge-pre" style="display:none"></pre>
+  <p id="truncated-line"></p>
+  <button id="lookup-names-btn" type="button" style="display:none"></button>
   <ul id="author-list"></ul>
 </div>
 <script src="/common86.js"></script>
 <script>
 var adminPubkey = null;
 var isAdmin = false;
-var lastAuthors = [];
+var lastAuthorsResult = null;   // raw GET /api/authors response
+var currentRenderedRows = [];   // rows actually in the DOM right now, same order as listEl.children
 var lastBanned = [];
 var bannedPubkeys = {};
+var pollTimer = null;
+var attemptedThisSession = new Set();
+var nameResolutionInFlight = false;
+
+var sortField = 'reports';
+var sortDir = 'desc';
+var RENDER_MAX_CLIENT = 500;
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
@@ -46,39 +62,159 @@ var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var scanBtn = document.getElementById('scan-btn');
 var provenanceLine = document.getElementById('provenance-line');
+var compositionLine = document.getElementById('composition-line');
 var filterInput = document.getElementById('filter-input');
+var hideSingletonsBox = document.getElementById('hide-singletons');
+var hiddenSingletonsLine = document.getElementById('hidden-singletons-line');
+var sortRowEl = document.getElementById('sort-row');
 var selectAll = document.getElementById('select-all');
 var banBtn = document.getElementById('ban-btn');
 var copyPurgeBtn = document.getElementById('copy-purge-btn');
 var banReason = document.getElementById('ban-reason');
 var selectedCount = document.getElementById('selected-count');
 var purgePre = document.getElementById('purge-pre');
+var truncatedLine = document.getElementById('truncated-line');
+var lookupNamesBtn = document.getElementById('lookup-names-btn');
 var listEl = document.getElementById('author-list');
 
 function setStatus(text) {
   statusEl.textContent = text;
 }
 
+function scanModeSelected() {
+  return document.querySelector('input[name="scan-mode"]:checked').value;
+}
+
+function updateScanButtonLabel() {
+  scanBtn.textContent = scanModeSelected() === 'full'
+    ? 'build full author list (~2 minutes — you can close this tab)'
+    : 'scan recent activity (newest 20,000 events)';
+}
+document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) {
+  r.addEventListener('change', updateScanButtonLabel);
+});
+
+// --- provenance / composition ---------------------------------------------
+
 function renderProvenance(data) {
   if (!data || data.scanned_at === null || data.scanned_at === undefined) {
     provenanceLine.textContent = '';
     return;
   }
-  provenanceLine.textContent = data.events_read + ' events, '
+  var text = data.events_read + ' events, '
     + s86FormatDate(data.span_start) + ' → ' + s86FormatDate(data.span_end) + ', '
     + data.authors.length + ' authors — scanned ' + s86FormatDate(data.scanned_at);
+  if (data.saturated) {
+    text += data.mode === 'full'
+      ? ' — SATURATED: relay has outgrown the full-list limit, this is a window, not a complete list'
+      : ' — window limit reached';
+  }
   if (data.warning) {
-    provenanceLine.textContent += ' (' + data.warning + ')';
+    text += ' (' + data.warning + ')';
+  }
+  provenanceLine.textContent = text;
+}
+
+var KNOWN_KINDS = { 0: 'profile', 1: 'note', 1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt' };
+function kindLabel(kind) {
+  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+}
+
+function renderComposition(data) {
+  compositionLine.textContent = '';
+  if (!data || !data.authors || data.authors.length === 0) {
+    return;
+  }
+  var totalAuthors = data.authors.length;
+  var singletonEntries = Object.keys(data.singleton_kinds || {}).map(function (k) {
+    return [parseInt(k, 10), data.singleton_kinds[k]];
+  }).sort(function (a, b) { return b[1] - a[1]; });
+  var singletonTotal = singletonEntries.reduce(function (sum, e) { return sum + e[1]; }, 0);
+  var multiAuthors = totalAuthors - singletonTotal;
+  var multiEvents = Math.max(0, data.events_read - singletonTotal);
+
+  var kindEntries = Object.keys(data.kinds || {}).map(function (k) {
+    return [parseInt(k, 10), data.kinds[k]];
+  }).sort(function (a, b) { return b[1] - a[1]; });
+
+  if (kindEntries.length) {
+    compositionLine.appendChild(s86El('p', 'top kinds: '
+      + kindEntries.slice(0, 8).map(function (e) { return kindLabel(e[0]) + ': ' + e[1]; }).join(', ')));
+  }
+  if (singletonTotal > 0) {
+    compositionLine.appendChild(s86El('p', singletonTotal + ' of ' + totalAuthors + ' authors posted exactly 1 event; of those, '
+      + singletonEntries.slice(0, 5).map(function (e) { return e[1] + ' were kind ' + kindLabel(e[0]); }).join(', ')));
+  }
+  compositionLine.appendChild(s86El('p', multiEvents + ' events from ' + multiAuthors + ' authors who posted more than once'));
+
+  if (data.reports_saturated) {
+    compositionLine.appendChild(s86El('p', 'report tally is a FLOOR — the 5,000-event cap was reached and older reports were not counted'));
   }
 }
 
-function renderAuthors(authors) {
-  lastAuthors = authors;
+// --- sort -------------------------------------------------------------
+
+var SORT_COMPARATORS = {
+  reports: function (a, b) { return (a.reporters || 0) - (b.reporters || 0) || (a.count - b.count); },
+  events: function (a, b) { return a.count - b.count; },
+  name: function (a, b) {
+    var an = a.name || '', bn = b.name || '';
+    if (!an && !bn) { return 0; }
+    if (!an) { return 1; }
+    if (!bn) { return -1; }
+    return an < bn ? -1 : (an > bn ? 1 : 0);
+  },
+  last_seen: function (a, b) { return (a.last_seen || 0) - (b.last_seen || 0); }
+};
+
+sortRowEl.appendChild(s86BuildSortRow(
+  [
+    { key: 'reports', label: 'reports', dir: 'desc' },
+    { key: 'events', label: 'events', dir: 'desc' },
+    { key: 'name', label: 'name', dir: 'asc' },
+    { key: 'last_seen', label: 'last seen', dir: 'desc' }
+  ],
+  sortField, sortDir,
+  function (field, dir) {
+    sortField = field;
+    sortDir = dir;
+    renderAuthors();
+  }
+));
+
+// --- rendering ----------------------------------------------------------
+
+function renderAuthors() {
+  if (!lastAuthorsResult) {
+    return;
+  }
+  var all = lastAuthorsResult.authors || [];
+  var sorted = s86SortRows(all, SORT_COMPARATORS[sortField], sortDir);
+
+  var hiddenCount = 0;
+  var visible = sorted;
+  if (hideSingletonsBox.checked) {
+    visible = sorted.filter(function (a) { return a.count !== 1; });
+    hiddenCount = sorted.length - visible.length;
+  }
+  if (hiddenCount > 0) {
+    var byKind = (lastAuthorsResult.singleton_kinds || {});
+    var parts = Object.keys(byKind).map(function (k) { return [parseInt(k, 10), byKind[k]]; })
+      .sort(function (a, b) { return b[1] - a[1]; })
+      .map(function (e) { return kindLabel(e[0]) + ': ' + e[1]; });
+    hiddenSingletonsLine.textContent = 'hiding ' + hiddenCount + ' single-event authors — ' + parts.join(', ');
+  } else {
+    hiddenSingletonsLine.textContent = '';
+  }
+
+  var truncation = s86TruncateForRender(visible, RENDER_MAX_CLIENT);
+  currentRenderedRows = truncation.shown;
+
   selectAll.checked = false;
   listEl.textContent = '';
-  for (var i = 0; i < authors.length; i++) {
-    var a = authors[i];
+  currentRenderedRows.forEach(function (a) {
     var li = document.createElement('li');
+    li.setAttribute('data-pubkey', a.pubkey);
 
     var alreadyBanned = !!bannedPubkeys[a.pubkey];
     var isSelf = a.pubkey === adminPubkey;
@@ -103,18 +239,29 @@ function renderAuthors(authors) {
       li.appendChild(s86El('span', a.nip05 + ' '));
     }
 
-    li.appendChild(s86NpubLink(a.npub));
-    li.appendChild(document.createTextNode(' — ' + a.count + ' events — '));
+    li.appendChild(s86El('span', a.npub + ' '));
+    li.appendChild(document.createTextNode('— ' + a.count + ' events'));
+    if (a.reporters) {
+      li.appendChild(document.createTextNode(' — reported by ' + a.reporters));
+    }
+    li.appendChild(document.createTextNode(' — '));
 
     var lastSeenEl = document.createElement('i');
     lastSeenEl.textContent = s86FormatDate(a.last_seen);
     li.appendChild(lastSeenEl);
 
     listEl.appendChild(li);
+  });
+
+  if (truncation.truncatedCount > 0) {
+    truncatedLine.textContent = 'showing top ' + RENDER_MAX_CLIENT + ' of ' + truncation.totalCount + ' — filter to narrow';
+  } else {
+    truncatedLine.textContent = '';
   }
 
   s86ApplyFilter(filterInput, listEl);
   s86UpdateSelectedCount(listEl, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+  updateLookupNamesButton();
 }
 
 function renderRecords() {
@@ -122,19 +269,125 @@ function renderRecords() {
     onChanged: function () {
       loadBanned().then(function () {
         renderRecords();
-        renderAuthors(lastAuthors);
+        renderAuthors();
       });
     },
     onError: setStatus
   });
 }
 
+// --- look up names for the N shown (button-triggered, bounded to what's
+// on screen — never automatic, unlike bans.html: this set does not
+// self-extinguish, so automatic here would mean a bulk query of the
+// relay's author graph on every scan). ------------------------------------
+
+function unresolvedVisiblePubkeys() {
+  var out = [];
+  var items = listEl.children;
+  for (var i = 0; i < items.length && i < currentRenderedRows.length; i++) {
+    if (items[i].style.display === 'none') {
+      continue;
+    }
+    var a = currentRenderedRows[i];
+    if (a.count !== 1 && !a.name && !a.nip05 && !attemptedThisSession.has(a.pubkey)) {
+      out.push(a.pubkey);
+    }
+  }
+  return out;
+}
+
+function updateLookupNamesButton() {
+  if (!isAdmin) {
+    lookupNamesBtn.style.display = 'none';
+    return;
+  }
+  var pubkeys = unresolvedVisiblePubkeys();
+  if (pubkeys.length === 0) {
+    lookupNamesBtn.style.display = 'none';
+    return;
+  }
+  lookupNamesBtn.style.display = '';
+  lookupNamesBtn.textContent = 'look up names for the ' + pubkeys.length + ' shown without one (queries wss://purplepag.es)';
+}
+
+lookupNamesBtn.addEventListener('click', function () {
+  if (!isAdmin || nameResolutionInFlight) {
+    return;
+  }
+  var pubkeys = unresolvedVisiblePubkeys();
+  if (pubkeys.length === 0) {
+    return;
+  }
+  nameResolutionInFlight = true;
+  lookupNamesBtn.disabled = true;
+  pubkeys.forEach(function (pk) { attemptedThisSession.add(pk); });
+
+  s86ResolveNamesExternally(pubkeys, {
+    onDone: function () {
+      nameResolutionInFlight = false;
+      lookupNamesBtn.disabled = false;
+      loadAuthorsCache();
+    },
+    onError: function (msg) {
+      nameResolutionInFlight = false;
+      lookupNamesBtn.disabled = false;
+      setStatus(msg);
+    }
+  });
+});
+
+// --- polling ------------------------------------------------------------
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function applyAuthorsStatus(data) {
+  lastAuthorsResult = data;
+  var running = data.status === 'running';
+  document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) { r.disabled = running; });
+  scanBtn.disabled = running;
+  if (running) {
+    provenanceLine.textContent = 'scanning… ' + (data.progress || 0) + ' events read';
+    compositionLine.textContent = '';
+  } else {
+    renderProvenance(data);
+    renderComposition(data);
+    renderAuthors();
+  }
+}
+
+function pollAuthorsStatus() {
+  fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      applyAuthorsStatus(data);
+      if (data.status === 'running') {
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      } else {
+        stopPolling();
+      }
+    })
+    .catch(function () {
+      // The scan is server-side and unaffected by the browser; keep
+      // polling rather than declaring failure.
+      setStatus('connection lost — still scanning');
+      pollTimer = setTimeout(pollAuthorsStatus, 3000);
+    });
+}
+
 function loadAuthorsCache() {
   return fetch('/api/authors')
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      renderProvenance(data);
-      renderAuthors(data.authors || []);
+      applyAuthorsStatus(data);
+      if (data.status === 'running') {
+        stopPolling();
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      }
     })
     .catch(function () {
       setStatus('failed to load author list');
@@ -171,28 +424,35 @@ s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 commandBlockContainer.appendChild(s86BuildCommandBlock());
 
 s86WireFilter(filterInput, listEl);
+filterInput.addEventListener('input', function () {
+  s86UpdateSelectedCount(listEl, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+  updateLookupNamesButton();
+});
+hideSingletonsBox.addEventListener('change', renderAuthors);
 s86WireSelectAll(selectAll, listEl, 'author-checkbox', selectedCount, [copyPurgeBtn]);
 s86WireCopyPurge(copyPurgeBtn, purgePre, listEl, 'author-checkbox');
+
+updateScanButtonLabel();
 
 scanBtn.addEventListener('click', function () {
   if (!isAdmin) {
     return;
   }
-  scanBtn.disabled = true;
-  setStatus('scanning…');
-  s86SignAndPost('/api/authors/scan', {})
+  var mode = scanModeSelected();
+  s86SignAndPost('/api/authors/scan', { mode: mode })
     .then(function (result) {
-      scanBtn.disabled = false;
       if (!result.ok) {
         setStatus('scan failed: ' + s86ErrMsg(result));
         return;
       }
       setStatus('');
-      renderProvenance(result.body);
-      renderAuthors(result.body.authors || []);
+      applyAuthorsStatus(result.body);
+      if (result.body.status === 'running') {
+        stopPolling();
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      }
     })
     .catch(function () {
-      scanBtn.disabled = false;
       setStatus('scan failed');
     });
 });
@@ -212,6 +472,8 @@ banBtn.addEventListener('click', function () {
   }
   var reason = banReason.value;
   var entries = selected.map(function (pk) { return { pubkey: pk, reason: reason }; });
+  var byPubkey = {};
+  (lastAuthorsResult ? lastAuthorsResult.authors : []).forEach(function (a) { byPubkey[a.pubkey] = a; });
 
   s86SignAndPost('/api/ban', { entries: entries })
     .then(function (result) {
@@ -223,7 +485,7 @@ banBtn.addEventListener('click', function () {
         + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
       for (var i = 0; i < result.body.added.length; i++) {
         var pk = result.body.added[i];
-        var a = lastAuthors.find(function (x) { return x.pubkey === pk; });
+        var a = byPubkey[pk];
         s86AddRecord({
           type: 'ban',
           at: Date.now(),
@@ -232,7 +494,7 @@ banBtn.addEventListener('click', function () {
       }
       return loadBanned().then(function () {
         renderRecords();
-        renderAuthors(lastAuthors);
+        renderAuthors();
       });
     })
     .catch(function () {

@@ -91,7 +91,11 @@ Logged in as admin, the ban list page also shows a ban form: paste one or more n
 
 ## Finding active authors
 
-The `/authors` page (linked from the ban list) is admin-only. Click "scan recent activity" to read the relay's most recent 20,000 events and see who's posting the most — sorted by count, with each author's most recent event time. Check the ones you want, optionally add a reason, and "Ban selected" bans them the same way the manual ban form does. It's one bounded scan per press: nothing scans on page load or on a timer, and reloading the page just re-shows the last scan's result without re-scanning.
+The `/authors` page (linked from the ban list) is admin-only. It offers two scan depths: **recent activity** (the newest 20,000 events, all kinds, a few seconds) and **full author list** (every note, reaction, report, and profile — every kind except gift-wrap DMs, which use a fresh single-use key per message and so can't usefully be banned — roughly two minutes on a large relay). Either way, single-event authors are hidden by default (that's almost always gift wraps or one-off deletion requests, not moderation targets); uncheck the box to see them. Check the authors you want, optionally add a reason, and "Ban selected" bans them the same way the manual ban form does.
+
+Both scans run in the background and the page just polls for the result — closing the tab mid-scan loses nothing, and a page reload picks the poll back up rather than starting a fresh scan. **This means your reverse proxy or tunnel needs its read timeout raised to at least 300 seconds; Cloudflare's free tier cannot host this page at all**, since its 100-second request cap isn't configurable — direct binding, a tailnet, or self-managed nginx all work fine. Nothing scans on page load, on login, or on a timer — only the scan button starts one, and the result is saved to disk (`authors-cache.json`) so it survives the updater restarting the admin page on every update.
+
+## No charts or statistics
 
 ## No charts or statistics
 
