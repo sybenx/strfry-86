@@ -89,6 +89,14 @@ Names are resolved first from the local relay database. For a banned user whose 
 
 Logged in as admin, the ban list page also shows a ban form: paste one or more npubs or hex pubkeys (space or comma separated), an optional reason, and click "Ban". This is the same trust root as reporting — authorized per-request with NIP-98, no sessions.
 
+## Bulk-editing ban reasons
+
+Reports from jumble (and most clients) never carry a reason — jumble sends the report *type* (spam, nudity, malware, etc.) but an empty content field, so a kind-1984-triggered ban's `reason` is blank by default. To build your own taxonomy: filter the ban list to the pubkeys you want, "Select visible", type a reason in the row below the selected count, and click "Replace reason" (overwrites) or "Append to reason" (joins onto whatever's there with " — "). **The reason is public** — it renders on the ban list for logged-out visitors, same as everything else there — and the control says so next to the input. Each bulk edit leaves one record line ("set reason on N bans") with Undo, same as a ban or unban; above 50 pubkeys in one edit, the snapshot needed for Undo isn't kept and the line says "undo unavailable" instead of offering an undo that could only restore some of them.
+
+## Looking up one pubkey
+
+Every page has a "View profile" box (enter an npub or hex pubkey) that opens `/profile?hex=<hex>` — everything server86 knows about that one account, on one page: ban status with a Ban/Unban button, its kind-0 profile fields, lifetime event count plus a breakdown of its most recent 500 events by kind, reports filed against it, and its 20 most recent events (truncated) so you can tell spam from a busy human without leaving for njump. `about`/`website`/`picture`/`lud16` are always shown as plain text, never as a clickable link or a loaded image — an account under investigation shouldn't be able to make your browser fetch a URL of its choosing. Admin-only, same as the author list.
+
 ## Finding active authors
 
 The `/authors` page (linked from the ban list) is admin-only. It offers two scan depths: **recent activity** (the newest 20,000 events, all kinds, a few seconds) and **full author list** (every note, reaction, report, and profile — every kind except gift-wrap DMs, which use a fresh single-use key per message and so can't usefully be banned — roughly two minutes on a large relay). Either way, single-event authors are hidden by default (that's almost always gift wraps or one-off deletion requests, not moderation targets); uncheck the box to see them. Check the authors you want, optionally add a reason, and "Ban selected" bans them the same way the manual ban form does.

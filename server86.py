@@ -8,7 +8,8 @@ spawns from the plugin are harmless.
 Routes:
   GET  /                  -> bans.html (public ban list)
   GET  /authors           -> authors.html (admin-only active-author page)
-  GET  /common86.js       -> shared client JS for both pages
+  GET  /profile           -> profile.html (admin-only single-pubkey detail page)
+  GET  /common86.js       -> shared client JS for all pages
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
   POST /api/authors/scan  -> NIP-98 authenticated: run exactly one bounded scan
@@ -18,6 +19,8 @@ Routes:
   POST /api/subscribers   -> NIP-98 authenticated: run exactly one bounded scan
   POST /api/unban         -> NIP-98 authenticated unban
   POST /api/ban           -> NIP-98 authenticated manual ban
+  POST /api/reason        -> NIP-98 authenticated: bulk-edit reason on existing bans
+  POST /api/profile       -> NIP-98 authenticated: everything known about one pubkey
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
 """
 
@@ -56,6 +59,7 @@ STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfr
 STATIC_ROUTES = {
     "/": ("bans.html", "text/html; charset=utf-8"),
     "/authors": ("authors.html", "text/html; charset=utf-8"),
+    "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
 }
 
@@ -313,6 +317,31 @@ def run_strfry_scan(filter_obj, timeout=SCAN_TIMEOUT):
         except ValueError:
             continue
     return events
+
+
+def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
+    """Run `strfry scan --count <filter>` and return the integer count.
+    `--count` walks the index without streaming bodies, so it is cheap
+    even for a filter matching many events — used for /api/profile's
+    lifetime total, the one number in this project that covers the whole
+    database for a single pubkey. Raises on failure (missing binary,
+    timeout, non-zero exit, or non-numeric output) exactly like the
+    body-streaming scans; treat non-numeric output as a scan failure
+    rather than parsing it loosely, per CLAUDE.md's strfry scan execution
+    rules."""
+    strfry_bin = require_strfry_bin()
+    filter_json = json.dumps(filter_obj, separators=(",", ":"))
+    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", "--count", filter_json]
+    result = subprocess.run(argv, cwd=get_relay_cwd(), capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f"strfry scan --count exited {result.returncode}: {stderr_tail(result.stderr)}")
+    lines = [ln.strip() for ln in result.stdout.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError("strfry scan --count produced no output")
+    try:
+        return int(lines[-1])
+    except ValueError:
+        raise RuntimeError(f"strfry scan --count returned non-numeric output: {lines[-1]!r}")
 
 
 def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
@@ -1048,6 +1077,188 @@ def validate_authors_scan_mode(body):
     return mode, None
 
 
+def validate_reason_request(body):
+    """Return (pubkeys, reason, mode, error) for a POST /api/reason body.
+    On success `error` is None; on failure the first three are None. A
+    reason over REASON_MAX_LEN is rejected outright, never truncated."""
+    pubkeys = body.get("pubkeys")
+    reason = body.get("reason")
+    mode = body.get("mode")
+    if not isinstance(pubkeys, list) or not all(is_hex64(pk) for pk in pubkeys):
+        return None, None, None, "malformed pubkeys list"
+    if not isinstance(reason, str) or len(reason) > REASON_MAX_LEN:
+        return None, None, None, "reason missing or exceeds REASON_MAX_LEN"
+    if mode not in ("replace", "append"):
+        return None, None, None, "mode must be 'replace' or 'append'"
+    return pubkeys, reason, mode, None
+
+
+# --- single-pubkey profile -------------------------------------------------
+
+def _report_type_for_target(tags, target_pubkey):
+    """Same dual lookup plugin86.py's hot path uses when a report names
+    multiple pubkeys: `target_pubkey`'s own `p` tag third element if
+    present, else the first `e`/`a` tag's third element, else None.
+    Duplicated here rather than shared via lib86 — plugin86.py's hot path
+    is the most sensitive file in this project, and this is three lines,
+    not worth the risk of touching it for a read-only admin page."""
+    if not isinstance(tags, list):
+        return None
+    fallback = None
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 3 and tag[0] in ("e", "a") and isinstance(tag[2], str):
+            fallback = tag[2]
+            break
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p" and tag[1] == target_pubkey:
+            if len(tag) >= 3 and isinstance(tag[2], str):
+                return tag[2]
+            return fallback
+    return fallback
+
+
+def compute_profile(pubkey_hex):
+    """Everything server86 can say about ONE pubkey from the local
+    database: three subprocesses, each bounded by the single author or by
+    a constant. Admin-only because it scans; needs no button, because
+    opening /profile?npub=... IS the deliberate act. A failure in any one
+    subscan is reported in `warning` rather than failing the whole
+    response — the other two are still worth showing."""
+    warnings = []
+
+    try:
+        total_events = run_strfry_count({"authors": [pubkey_hex]}, timeout=SCAN_TIMEOUT)
+    except Exception as e:
+        log(f"server86: profile lifetime count failed for {pubkey_hex}: {e}")
+        total_events = None
+        warnings.append("lifetime event count failed")
+
+    kinds = {}
+    kinds_saturated = False
+    previews = []
+    profile_fields = None
+    try:
+        events = run_strfry_scan({"authors": [pubkey_hex], "limit": PROFILE_EVENT_LIMIT}, timeout=SCAN_TIMEOUT)
+        # `limit` returns the newest matching events first (verified —
+        # see CLAUDE.md's "strfry scan execution rules"), but sort
+        # explicitly anyway so this doesn't depend on strfry's own
+        # ordering staying newest-first within one response.
+        events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
+        kinds_saturated = len(events) >= PROFILE_EVENT_LIMIT
+        for ev in events:
+            kind = ev.get("kind")
+            if not isinstance(kind, int):
+                continue
+            kinds[kind] = kinds.get(kind, 0) + 1
+            if kind == 0 and profile_fields is None:
+                try:
+                    content = json.loads(ev.get("content", "{}"))
+                except ValueError:
+                    content = {}
+                if not isinstance(content, dict):
+                    content = {}
+                profile_fields = {
+                    "about": _clean_profile_field(content.get("about")),
+                    "picture": _clean_profile_field(content.get("picture")),
+                    "website": _clean_profile_field(content.get("website")),
+                    "lud16": _clean_profile_field(content.get("lud16")),
+                }
+        for ev in events[:PROFILE_PREVIEW_MAX]:
+            content = ev.get("content")
+            previews.append({
+                "kind": ev.get("kind"),
+                "created_at": ev.get("created_at"),
+                "content": (content if isinstance(content, str) else "")[:280],
+            })
+    except Exception as e:
+        log(f"server86: profile event scan failed for {pubkey_hex}: {e}")
+        warnings.append("recent event scan failed")
+
+    reports = []
+    reports_saturated = False
+    try:
+        report_events = run_strfry_scan(
+            {"kinds": [1984], "#p": [pubkey_hex], "limit": PROFILE_REPORT_LIMIT}, timeout=SCAN_TIMEOUT
+        )
+        report_events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
+        reports_saturated = len(report_events) >= PROFILE_REPORT_LIMIT
+        for ev in report_events:
+            reporter = ev.get("pubkey")
+            if not isinstance(reporter, str):
+                continue
+            try:
+                reporter_npub = bech32.npub_encode(reporter)
+            except (ValueError, TypeError):
+                continue
+            content = ev.get("content")
+            reports.append({
+                "reporter": reporter,
+                "reporter_npub": reporter_npub,
+                "report_type": _report_type_for_target(ev.get("tags"), pubkey_hex),
+                "content": content if isinstance(content, str) else "",
+                "created_at": ev.get("created_at"),
+            })
+    except Exception as e:
+        log(f"server86: profile reports-against scan failed for {pubkey_hex}: {e}")
+        warnings.append("reports-against scan failed")
+
+    return {
+        "total_events": total_events,
+        "kinds": kinds,
+        "kinds_window": PROFILE_EVENT_LIMIT,
+        "kinds_saturated": kinds_saturated,
+        "profile": profile_fields,
+        "previews": previews,
+        "reports": reports,
+        "reports_saturated": reports_saturated,
+        "warning": "; ".join(warnings) if warnings else None,
+    }
+
+
+def build_profile_response(pubkey_hex):
+    """Assemble the full POST /api/profile response: the three bounded
+    scans from compute_profile() plus everything server86 already holds
+    in memory with no scan at all — ban status, name/nip05, and this
+    pubkey's rank in the last author-scan cache, if it appears there."""
+    blacklist_data = blacklist.load()
+    ban_entry = blacklist_data.get(pubkey_hex)
+    banned = ban_entry is not None
+
+    try:
+        npub = bech32.npub_encode(pubkey_hex)
+    except (ValueError, TypeError):
+        npub = None
+
+    try:
+        resolved = resolve_profiles([pubkey_hex]).get(pubkey_hex) or {}
+    except Exception as e:
+        log(f"server86: profile name resolution failed for {pubkey_hex}: {e}")
+        resolved = {}
+
+    scan_rank = None
+    scan_count = None
+    with _authors_lock:
+        cached_authors = list(_authors_cache.get("authors", []))
+    for i, a in enumerate(cached_authors):
+        if a.get("pubkey") == pubkey_hex:
+            scan_rank = i + 1
+            scan_count = a.get("count")
+            break
+
+    result = compute_profile(pubkey_hex)
+    result.update({
+        "pubkey": pubkey_hex,
+        "npub": npub,
+        "name": resolved.get("name"),
+        "nip05": resolved.get("nip05"),
+        "banned": banned,
+        "ban": dict(ban_entry) if ban_entry else None,
+        "scan_rank": scan_rank,
+        "scan_count": scan_count,
+    })
+    return result
+
+
 def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
     """Return (ok, error_message). `now` defaults to the real current time;
     a test harness may inject a fixed value to isolate the freshness check
@@ -1250,7 +1461,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path not in (
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
-            "/api/recipients", "/api/subscribers",
+            "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -1295,6 +1506,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/subscribers":
             status = start_subscribers_scan()
             self._send_json(202, status)
+            return
+
+        if path == "/api/reason":
+            pubkeys, reason, mode, err = validate_reason_request(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            updated, skipped = blacklist.set_reasons(pubkeys, reason, mode, now=int(time.time()))
+            self._send_json(200, {"ok": True, "updated": updated, "skipped": skipped})
+            return
+
+        if path == "/api/profile":
+            raw_pk = body.get("pubkey")
+            pubkey_hex = None
+            if is_hex64(raw_pk):
+                pubkey_hex = raw_pk
+            elif isinstance(raw_pk, str):
+                try:
+                    pubkey_hex = bech32.npub_decode(raw_pk)
+                except (ValueError, TypeError):
+                    pubkey_hex = None
+            if not is_hex64(pubkey_hex):
+                self._send_json(400, {"error": "malformed pubkey"})
+                return
+            self._send_json(200, build_profile_response(pubkey_hex))
             return
 
         if path == "/api/names":

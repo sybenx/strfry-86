@@ -16,6 +16,7 @@ li { overflow-wrap: anywhere; }
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
+  <div id="profile-entry-container"></div>
   <div id="command-block-container"></div>
   <div id="records-list"></div>
   <p>
@@ -58,6 +59,7 @@ var RENDER_MAX_CLIENT = 500;
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
 var adminSection = document.getElementById('admin-section');
+var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var scanBtn = document.getElementById('scan-btn');
@@ -421,6 +423,7 @@ function onLogin() {
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 commandBlockContainer.appendChild(s86BuildCommandBlock());
 
 s86WireFilter(filterInput, listEl);

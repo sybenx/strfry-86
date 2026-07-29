@@ -11,6 +11,7 @@ var S86_DISMISSED_REPORTS_KEY = 'strfry86_dismissed_reports';
 var S86_MAX_RECORDS_STORED = 200;
 var S86_MAX_RECORDS_RENDERED = 20;
 var S86_MAX_DISMISSED = 1000;
+var S86_REASON_UNDO_MAX = 50;
 
 // --- localStorage helpers ---------------------------------------------------
 
@@ -160,6 +161,47 @@ function s86PubkeyInputToHex(raw) {
     return s86NpubToHex(raw);
   }
   return null;
+}
+
+// --- profile entry field -------------------------------------------------
+// One <input type="search"> + "View profile" button, present near-
+// identically directly above the command generator on every admin page.
+// A typed/pasted entry rather than a link on every row — that is what
+// keeps npubs copyable plain text everywhere else instead of turning each
+// one into a touch target. Invalid input sets a plain status line and
+// navigates nowhere; Enter in the field submits it same as the button.
+function s86BuildProfileEntryField(statusEl) {
+  var p = document.createElement('p');
+
+  var input = document.createElement('input');
+  input.type = 'search';
+  input.placeholder = 'npub or hex — view a pubkey\'s profile';
+
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = 'View profile';
+
+  function go() {
+    var hex = s86PubkeyInputToHex(input.value);
+    if (!hex) {
+      statusEl.textContent = 'enter a valid npub or hex pubkey';
+      return;
+    }
+    window.location.href = '/profile?hex=' + hex;
+  }
+
+  btn.addEventListener('click', go);
+  input.addEventListener('keydown', function (evt) {
+    if (evt.key === 'Enter') {
+      evt.preventDefault();
+      go();
+    }
+  });
+
+  p.appendChild(input);
+  p.appendChild(document.createTextNode(' '));
+  p.appendChild(btn);
+  return p;
 }
 
 // --- login (NIP-07, remembered in localStorage) -----------------------------
@@ -417,7 +459,9 @@ function s86WireCopyPurge(buttonEl, preEl, listEl, checkboxClass) {
 // Nothing here is executed and nothing here is fetched — every command is
 // plain copyable text. Identical on both pages.
 
-function s86BuildCommandBlock() {
+// initialValue optionally pre-fills the pubkey input (profile.html opens
+// this already knowing its one subject) — every other caller omits it.
+function s86BuildCommandBlock(initialValue) {
   var details = document.createElement('details');
   details.appendChild(s86El('summary', 'terminal commands'));
 
@@ -426,6 +470,9 @@ function s86BuildCommandBlock() {
   var input = document.createElement('input');
   input.type = 'text';
   input.placeholder = 'npub or hex';
+  if (initialValue) {
+    input.value = initialValue;
+  }
   inputP.appendChild(input);
   details.appendChild(inputP);
 
@@ -556,11 +603,15 @@ function s86ResolveNamesExternally(pubkeys, callbacks) {
 // and the harmless one absorbs mis-taps. The label supplies the separation
 // (the locked CSS block permits no spacing rules), so it must never be empty.
 //
-// At most the 20 newest lines of all three kinds combined are ever rendered;
-// older ones are dropped from view and, for stored ban/unban records, deleted
-// from localStorage outright.
+// At most the 20 newest lines of all four kinds (ban, unban, reason,
+// report) combined are ever rendered; older ones are dropped from view
+// and, for stored records, deleted from localStorage outright.
 
 function s86RecordLabel(record) {
+  if (record.type === 'reason') {
+    return 'set reason on ' + record.count + ' ban' + (record.count === 1 ? '' : 's')
+      + (record.entries ? '' : ' — undo unavailable');
+  }
   var verb = record.type === 'ban' ? 'banned' : 'unbanned';
   if (record.entries.length === 1) {
     var e = record.entries[0];
@@ -589,12 +640,18 @@ function s86DismissReport(id) {
   s86SaveStored(S86_DISMISSED_REPORTS_KEY, ids, S86_MAX_DISMISSED);
 }
 
+// onUndo is optional — a null/undefined onUndo (the reason-record "undo
+// unavailable" case, once its snapshot exceeds S86_REASON_UNDO_MAX) omits
+// the Undo button entirely rather than rendering one that can't work. A
+// truncated undo is worse than none.
 function s86BuildRecordLine(labelText, onUndo, onDismiss) {
   var line = document.createElement('p');
 
   var dismissBtn = document.createElement('button');
   dismissBtn.type = 'button';
   dismissBtn.textContent = '↩';
+  dismissBtn.title = 'dismiss';
+  dismissBtn.setAttribute('aria-label', 'dismiss');
   dismissBtn.addEventListener('click', onDismiss);
   line.appendChild(dismissBtn);
   line.appendChild(document.createTextNode(' '));
@@ -602,19 +659,79 @@ function s86BuildRecordLine(labelText, onUndo, onDismiss) {
   var label = document.createElement('span');
   label.textContent = labelText;
   line.appendChild(label);
-  line.appendChild(document.createTextNode(' '));
 
-  var undoBtn = document.createElement('button');
-  undoBtn.type = 'button';
-  undoBtn.textContent = 'Undo';
-  undoBtn.addEventListener('click', function () { onUndo(undoBtn); });
-  line.appendChild(undoBtn);
+  if (onUndo) {
+    line.appendChild(document.createTextNode(' '));
+    var undoBtn = document.createElement('button');
+    undoBtn.type = 'button';
+    undoBtn.textContent = 'Undo';
+    undoBtn.title = 'undo';
+    undoBtn.setAttribute('aria-label', 'undo');
+    undoBtn.addEventListener('click', function () { onUndo(undoBtn); });
+    line.appendChild(undoBtn);
+  }
 
   return line;
 }
 
+// A reason-record undo restores each pubkey's PRIOR reason, which can
+// differ from one pubkey to the next within the same bulk edit — one
+// /api/reason call only ever sets one reason string, so this groups the
+// snapshot by old_reason and issues one 'replace' POST per distinct
+// value, sequentially (never in parallel, so a failed group doesn't race
+// a later one signing over it).
+function s86UndoReasonRecord(record, btn, callbacks) {
+  var groups = {};
+  var order = [];
+  record.entries.forEach(function (e) {
+    var key = e.old_reason || '';
+    if (!groups[key]) {
+      groups[key] = [];
+      order.push(key);
+    }
+    groups[key].push(e.pubkey);
+  });
+
+  var chain = Promise.resolve();
+  var failed = false;
+  order.forEach(function (reason) {
+    chain = chain.then(function () {
+      if (failed) {
+        return;
+      }
+      return s86SignAndPost('/api/reason', { pubkeys: groups[reason], reason: reason, mode: 'replace' })
+        .then(function (result) {
+          if (!result.ok) {
+            failed = true;
+            if (callbacks.onError) callbacks.onError('undo failed: ' + s86ErrMsg(result));
+          }
+        });
+    });
+  });
+
+  chain
+    .then(function () {
+      btn.disabled = false;
+      if (failed) {
+        return;
+      }
+      s86RemoveStoredRecord(record.id);
+      if (callbacks.onChanged) callbacks.onChanged();
+    })
+    .catch(function () {
+      btn.disabled = false;
+      if (callbacks.onError) callbacks.onError('undo failed');
+    });
+}
+
 function s86UndoStoredRecord(record, btn, callbacks) {
   btn.disabled = true;
+
+  if (record.type === 'reason') {
+    s86UndoReasonRecord(record, btn, callbacks);
+    return;
+  }
+
   var req;
   if (record.type === 'ban') {
     req = s86SignAndPost('/api/unban', { pubkeys: record.entries.map(function (e) { return e.pubkey; }) });
@@ -670,7 +787,19 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
 
   var lines = [];
   stored.forEach(function (r) {
-    if (!r || !Array.isArray(r.entries) || r.entries.length === 0) {
+    // A reason record whose snapshot exceeded S86_REASON_UNDO_MAX stores
+    // entries: null deliberately (see s86UndoReasonRecord) — it still
+    // renders, just without an Undo button, so it needs its own bare
+    // "has a record at all" check rather than the entries-array check
+    // every other stored kind uses.
+    if (!r) {
+      return;
+    }
+    if (r.type === 'reason') {
+      if (typeof r.count !== 'number' || r.count <= 0) {
+        return;
+      }
+    } else if (!Array.isArray(r.entries) || r.entries.length === 0) {
       return;
     }
     lines.push({ sortAt: r.at || 0, kind: 'stored', ref: r });
@@ -705,9 +834,10 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
   rendered.forEach(function (l) {
     if (l.kind === 'stored') {
       var record = l.ref;
+      var canUndo = !(record.type === 'reason' && !record.entries);
       var line = s86BuildRecordLine(
         s86RecordLabel(record),
-        function (btn) { s86UndoStoredRecord(record, btn, callbacks); },
+        canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
         function () {
           s86RemoveStoredRecord(record.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);

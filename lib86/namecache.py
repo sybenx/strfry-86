@@ -52,6 +52,12 @@ def _read_file():
 
 
 def _refresh(force=False):
+    """force=True must mean 'read from disk NOW, unconditionally' — not
+    merely 'skip the once-per-second throttle'. See lib86/blacklist.py's
+    _refresh() for why: two close-enough writes can share an mtime on
+    some filesystems, and every force=True caller here is a
+    reload-fresh-before-write path that must not let an mtime-equality
+    skip serve stale data."""
     global _cache, _cache_mtime, _last_checked
     now = time.monotonic()
     if not force and _last_checked is not None and (now - _last_checked) < _MIN_CHECK_INTERVAL:
@@ -61,7 +67,7 @@ def _refresh(force=False):
         mtime = os.stat(NAMES_PATH).st_mtime
     except OSError:
         mtime = None
-    if mtime != _cache_mtime:
+    if force or mtime != _cache_mtime:
         _cache = _read_file()
         _cache_mtime = mtime
 

@@ -31,6 +31,7 @@ DEPLOYABLE_FILES = [
     "server86.py",
     "bans.html",
     "authors.html",
+    "profile.html",
     "common86.js",
     "lib86/__init__.py",
     "lib86/bip340.py",

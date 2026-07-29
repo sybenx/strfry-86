@@ -647,6 +647,193 @@ server86.run_strfry_scan_streaming = _orig_streaming
 server86.resolve_profiles = _orig_resolve_profiles
 
 
+# --- Phase 3: POST /api/reason (server86.py + lib86/blacklist.py) --------
+# blacklist.py's BASE_DIR is derived from the FILE's own path, not cwd, so
+# it always resolves to the real repo's blacklist.json unless redirected —
+# every check here does that first, so this test run can never touch the
+# repo's own blacklist.json.
+
+server86.blacklist.BLACKLIST_PATH = os.path.join(_cache_tmpdir, "blacklist.json")
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+
+# validate_reason_request bounds
+pubkeys, reason, mode, err = server86.validate_reason_request(
+    {"pubkeys": ["a" * 64], "reason": "spam", "mode": "replace"})
+check(pubkeys == ["a" * 64] and reason == "spam" and mode == "replace" and err is None,
+      "validate_reason_request accepts a well-formed replace request")
+
+_, _, _, err = server86.validate_reason_request({"pubkeys": ["not-hex"], "reason": "x", "mode": "replace"})
+check(err is not None, "validate_reason_request rejects a malformed pubkey")
+
+_, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "x" * (server86.REASON_MAX_LEN + 1), "mode": "replace"})
+check(err is not None, "validate_reason_request rejects a reason longer than REASON_MAX_LEN")
+
+_, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "x", "mode": "delete"})
+check(err is not None, "validate_reason_request rejects a mode other than replace/append")
+
+_, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "", "mode": "replace"})
+check(err is None, "validate_reason_request accepts an empty reason (clearing is valid)")
+
+# blacklist.set_reasons: skip-not-banned, replace, append-onto-empty,
+# append-onto-existing, and edits reason and nothing else
+pk_untouched = "1" * 64
+pk_empty = "2" * 64
+pk_existing = "3" * 64
+seed = {
+    pk_empty: {"banned_at": 100, "report_event_id": None, "reason": "",
+               "report_type": "manual", "name": None, "nip05": None, "name_checked_at": None},
+    pk_existing: {"banned_at": 200, "report_event_id": "deadbeef", "reason": "first reason",
+                  "report_type": "spam", "name": "alice", "nip05": None, "name_checked_at": None},
+}
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump(seed, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+
+not_banned = "4" * 64
+updated, skipped = server86.blacklist.set_reasons([not_banned, pk_empty, pk_existing], "spam report", "append", now=1)
+check(skipped == [not_banned], "set_reasons SKIPS a pubkey that isn't currently banned, never creates one")
+by_pk = {u["pubkey"]: u for u in updated}
+check(by_pk[pk_empty]["old_reason"] == "" and by_pk[pk_empty]["new_reason"] == "spam report",
+      "set_reasons append onto an EMPTY existing reason behaves as replace (no ' — ' joiner)")
+check(by_pk[pk_existing]["old_reason"] == "first reason" and by_pk[pk_existing]["new_reason"] == "first reason — spam report",
+      "set_reasons append onto a non-empty reason joins with ' — '")
+
+on_disk = json.load(open(server86.blacklist.BLACKLIST_PATH))
+check(on_disk[pk_existing]["reason"] == "first reason — spam report", "set_reasons persists the new reason to disk")
+check(on_disk[pk_existing]["report_type"] == "spam" and on_disk[pk_existing]["report_event_id"] == "deadbeef"
+      and on_disk[pk_existing]["banned_at"] == 200 and on_disk[pk_existing]["name"] == "alice",
+      "set_reasons edits `reason` and NOTHING else — report_type/report_event_id/banned_at/name untouched")
+
+updated2, _ = server86.blacklist.set_reasons([pk_existing], "overwritten", "replace", now=2)
+check(updated2[0]["old_reason"] == "first reason — spam report" and updated2[0]["new_reason"] == "overwritten",
+      "set_reasons replace mode overwrites regardless of what the existing reason was")
+
+# reload-fresh-before-write: an external write between load and call must
+# be what 'append' joins against, never a value cached before the call
+server86.blacklist.load()  # populate the in-memory cache with "overwritten"
+external = json.load(open(server86.blacklist.BLACKLIST_PATH))
+external[pk_existing]["reason"] = "changed out from under the cache"
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump(external, f)
+updated3, _ = server86.blacklist.set_reasons([pk_existing], "appended after race", "append", now=3)
+check(updated3[0]["old_reason"] == "changed out from under the cache",
+      "set_reasons reloads blacklist.json from disk before writing, so append joins the CURRENT reason, not a stale cache")
+
+
+# --- Phase 4: POST /api/profile (server86.py) -----------------------------
+
+# run_strfry_count: parses --count's numeric stdout, raises rather than
+# parsing loosely on non-zero exit or non-numeric output
+import subprocess as _subprocess
+
+
+class _FakeCompleted:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = b""
+
+
+_orig_subprocess_run = _subprocess.run
+_orig_require_strfry_bin = server86.require_strfry_bin
+_orig_get_relay_cwd = server86.get_relay_cwd
+server86.require_strfry_bin = lambda: "/fake/strfry"
+server86.get_relay_cwd = lambda: "/tmp"
+
+_subprocess.run = lambda argv, **kw: _FakeCompleted(0, b"42\n")
+check(server86.run_strfry_count({"authors": ["a" * 64]}) == 42,
+      "run_strfry_count parses --count's numeric stdout")
+
+_subprocess.run = lambda argv, **kw: _FakeCompleted(0, b"not-a-number\n")
+try:
+    server86.run_strfry_count({"authors": ["a" * 64]})
+    check(False, "run_strfry_count raises on non-numeric --count output")
+except RuntimeError:
+    check(True, "run_strfry_count raises on non-numeric --count output")
+
+_subprocess.run = lambda argv, **kw: _FakeCompleted(1, b"")
+try:
+    server86.run_strfry_count({"authors": ["a" * 64]})
+    check(False, "run_strfry_count raises on non-zero exit")
+except RuntimeError:
+    check(True, "run_strfry_count raises on non-zero exit")
+
+_subprocess.run = _orig_subprocess_run
+server86.require_strfry_bin = _orig_require_strfry_bin
+server86.get_relay_cwd = _orig_get_relay_cwd
+
+# _report_type_for_target: same dual lookup as plugin86.py's hot path,
+# scoped to the ONE p-tag naming the target pubkey in a multi-target report
+target = "e" * 64
+other = "f" * 64
+check(server86._report_type_for_target([["p", target, "spam"]], target) == "spam",
+      "_report_type_for_target reads the target's own p-tag third element")
+check(server86._report_type_for_target([["e", "someid", "malware"], ["p", target]], target) == "malware",
+      "_report_type_for_target falls back to the e-tag's third element when the p-tag has none")
+check(server86._report_type_for_target([["p", other, "spam"], ["p", target]], target) is None,
+      "_report_type_for_target never returns another p-tag's type for a DIFFERENT target pubkey")
+check(server86._report_type_for_target([["p", target]], target) is None,
+      "_report_type_for_target returns None when neither the p-tag nor any e/a tag carries a type")
+check(server86._report_type_for_target(None, target) is None,
+      "_report_type_for_target tolerates malformed (non-list) tags")
+
+# build_profile_response: assembles ban status / name / scan-rank from
+# in-memory state, with NO scan of its own — compute_profile is mocked out
+# so this only exercises the assembly logic. blacklist.BLACKLIST_PATH is
+# still redirected to _cache_tmpdir from the /api/reason tests above.
+profile_target = "5" * 64
+banned_target = "6" * 64
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({
+        banned_target: {"banned_at": 500, "report_event_id": None, "reason": "spam",
+                        "report_type": "manual", "name": None, "nip05": None, "name_checked_at": None},
+    }, f)
+# build_profile_response calls blacklist.load(), a non-forced refresh —
+# unlike set_reasons() it does NOT bypass the once-per-second mtime-check
+# throttle, so _last_checked must be cleared too or this reload is
+# silently skipped this soon after the set_reasons() calls above.
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+
+_orig_compute_profile = server86.compute_profile
+_orig_resolve_profiles = server86.resolve_profiles
+server86.compute_profile = lambda pk: {"total_events": 7, "kinds": {}, "kinds_window": 500,
+                                        "kinds_saturated": False, "profile": None, "previews": [],
+                                        "reports": [], "reports_saturated": False, "warning": None}
+server86.resolve_profiles = lambda pks: {pks[0]: {"name": "alice", "nip05": "alice@example.com"}}
+
+with server86._authors_lock:
+    server86._authors_cache = dict(server86._authors_cache)
+    server86._authors_cache["authors"] = [
+        {"pubkey": "9" * 64, "count": 100},
+        {"pubkey": profile_target, "count": 42},
+    ]
+
+resp = server86.build_profile_response(profile_target)
+check(resp["pubkey"] == profile_target and resp["npub"] == server86.bech32.npub_encode(profile_target),
+      "build_profile_response includes the requested pubkey and its npub")
+check(resp["name"] == "alice" and resp["nip05"] == "alice@example.com",
+      "build_profile_response resolves name/nip05 via resolve_profiles()")
+check(resp["banned"] is False and resp["ban"] is None,
+      "build_profile_response reports banned:false / ban:null for a non-banned pubkey")
+check(resp["scan_rank"] == 2 and resp["scan_count"] == 42,
+      "build_profile_response finds this pubkey's 1-indexed rank and count in the author-scan cache")
+check(resp["total_events"] == 7, "build_profile_response merges compute_profile()'s scan fields into the response")
+
+resp2 = server86.build_profile_response(banned_target)
+check(resp2["banned"] is True and resp2["ban"]["reason"] == "spam" and resp2["ban"]["report_type"] == "manual",
+      "build_profile_response includes the full blacklist entry when banned")
+check(resp2["scan_rank"] is None and resp2["scan_count"] is None,
+      "build_profile_response reports scan_rank/scan_count null for a pubkey absent from the author-scan cache")
+
+server86.compute_profile = _orig_compute_profile
+server86.resolve_profiles = _orig_resolve_profiles
+
+
 # --- AUTHOR_SCAN_KINDS gap check (requires a live strfry database) --------
 
 strfry_bin = server86.get_strfry_bin()

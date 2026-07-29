@@ -16,6 +16,7 @@ li { overflow-wrap: anywhere; }
 <button id="login-btn" type="button">Login with extension</button>
 <p id="status"></p>
 <p id="name-status-line" style="display:none"></p>
+<div id="profile-entry-container" style="display:none"></div>
 <div id="command-block-container" style="display:none"></div>
 <div id="admin-controls" style="display:none">
   <h2>Ban a pubkey</h2>
@@ -33,6 +34,11 @@ li { overflow-wrap: anywhere; }
 <button id="unban-btn" type="button" style="display:none">Unban selected</button>
 <button id="copy-purge-btn" type="button" style="display:none" disabled>Copy purge command</button>
 <b id="selected-count"></b>
+<p id="bulk-reason-row" style="display:none">
+  <input id="bulk-reason-input" type="text" placeholder="reason for the selected bans — shown publicly" maxlength="500">
+  <button id="bulk-reason-replace-btn" type="button" disabled>Replace reason</button>
+  <button id="bulk-reason-append-btn" type="button" disabled>Append to reason</button>
+</p>
 <pre id="purge-pre" style="display:none"></pre>
 <ul id="ban-list"></ul>
 <script src="/common86.js"></script>
@@ -46,6 +52,7 @@ var attemptedThisSession = new Set();
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
 var nameStatusEl = document.getElementById('name-status-line');
+var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var adminControls = document.getElementById('admin-controls');
 var appealEl = document.getElementById('appeal-line');
@@ -61,9 +68,24 @@ var selectAllLabel = document.getElementById('select-all-label');
 var selectAll = document.getElementById('select-all');
 var recordsList = document.getElementById('records-list');
 var selectedCount = document.getElementById('selected-count');
+var bulkReasonRow = document.getElementById('bulk-reason-row');
+var bulkReasonInput = document.getElementById('bulk-reason-input');
+var bulkReasonReplaceBtn = document.getElementById('bulk-reason-replace-btn');
+var bulkReasonAppendBtn = document.getElementById('bulk-reason-append-btn');
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+// Disabled with nothing checked OR an empty reason — both conditions
+// matter independently, so this can't reuse s86UpdateSelectedCount's
+// checked-count-only disable rule.
+function updateBulkReasonButtons() {
+  var n = listEl.querySelectorAll('.ban-checkbox:checked').length;
+  var hasReason = bulkReasonInput.value.trim().length > 0;
+  var disabled = n === 0 || !hasReason;
+  bulkReasonReplaceBtn.disabled = disabled;
+  bulkReasonAppendBtn.disabled = disabled;
 }
 
 function renderBans(banned) {
@@ -117,6 +139,7 @@ function renderBans(banned) {
 
   s86ApplyFilter(filterInput, listEl);
   s86UpdateSelectedCount(listEl, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
+  updateBulkReasonButtons();
   renderRecords();
   maybeResolveNamesExternally();
 }
@@ -229,21 +252,28 @@ function renderNameStatusLine() {
 
 function onLogin() {
   isAdmin = true;
+  profileEntryContainer.style.display = '';
   commandBlockContainer.style.display = '';
   adminControls.style.display = '';
   selectAllLabel.style.display = '';
   unbanBtn.style.display = '';
   copyPurgeBtn.style.display = '';
+  bulkReasonRow.style.display = '';
   renderBans(lastBanned);
 }
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 commandBlockContainer.appendChild(s86BuildCommandBlock());
 
 s86WireFilter(filterInput, listEl);
 s86WireSelectAll(selectAll, listEl, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
 s86WireCopyPurge(copyPurgeBtn, purgePre, listEl, 'ban-checkbox');
+
+listEl.addEventListener('change', updateBulkReasonButtons);
+selectAll.addEventListener('change', updateBulkReasonButtons);
+bulkReasonInput.addEventListener('input', updateBulkReasonButtons);
 
 unbanBtn.addEventListener('click', function () {
   if (!isAdmin) {
@@ -334,6 +364,55 @@ banForm.addEventListener('submit', function (evt) {
       setStatus('ban failed');
     });
 });
+
+function submitBulkReason(mode) {
+  if (!isAdmin) {
+    return;
+  }
+  var checkboxes = listEl.querySelectorAll('.ban-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  if (selected.length === 0) {
+    setStatus('nothing selected');
+    return;
+  }
+  var reason = bulkReasonInput.value;
+  if (!reason) {
+    setStatus('enter a reason first');
+    return;
+  }
+
+  s86SignAndPost('/api/reason', { pubkeys: selected, reason: reason, mode: mode })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('set reason failed: ' + s86ErrMsg(result));
+        return;
+      }
+      var updated = result.body.updated;
+      setStatus('set reason on ' + updated.length + ' ban(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      if (updated.length > 0) {
+        s86AddRecord({
+          type: 'reason',
+          at: Date.now(),
+          count: updated.length,
+          entries: updated.length <= S86_REASON_UNDO_MAX
+            ? updated.map(function (u) { return { pubkey: u.pubkey, old_reason: u.old_reason }; })
+            : null
+        });
+      }
+      bulkReasonInput.value = '';
+      return loadBans();
+    })
+    .catch(function () {
+      setStatus('set reason failed');
+    });
+}
+
+bulkReasonReplaceBtn.addEventListener('click', function () { submitBulkReason('replace'); });
+bulkReasonAppendBtn.addEventListener('click', function () { submitBulkReason('append'); });
 
 loadBans();
 </script>

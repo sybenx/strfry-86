@@ -45,6 +45,14 @@ def _read_file():
 
 
 def _refresh(force=False):
+    """force=True must mean 'read from disk NOW, unconditionally' — not
+    merely 'skip the once-per-second throttle'. Two writes to this file
+    close enough together can land on the SAME mtime on some filesystems
+    (observed on a Linux/virtiofs container mount under back-to-back
+    writes with no gap at all, though not on macOS/APFS in the same
+    scenario), and every force=True caller here is specifically the
+    reload-fresh-before-write path racing a concurrent admin action —
+    exactly the case an mtime-equality skip must not be allowed to win."""
     global _cache, _cache_mtime, _last_checked
     now = time.monotonic()
     if not force and _last_checked is not None and (now - _last_checked) < _MIN_CHECK_INTERVAL:
@@ -54,7 +62,7 @@ def _refresh(force=False):
         mtime = os.stat(BLACKLIST_PATH).st_mtime
     except OSError:
         mtime = None
-    if mtime != _cache_mtime:
+    if force or mtime != _cache_mtime:
         _cache = _read_file()
         _cache_mtime = mtime
 
@@ -142,6 +150,48 @@ def set_names(hits, queried, now):
         except OSError:
             _cache_mtime = None
     return stamped
+
+
+def set_reasons(pubkeys, reason, mode, now):
+    """Bulk-set (`mode="replace"`) or bulk-extend (`mode="append"`) the
+    `reason` field on existing entries only — this can never create a ban,
+    so a pubkey not currently in the blacklist is skipped. Reloads from
+    disk first, exactly like set_names(), so `append` joins against the
+    CURRENT reason rather than a snapshot the admin's request might be
+    racing. Edits `reason` and NOTHING else — `report_type`,
+    `report_event_id`, and `banned_at` are provenance from the original
+    ban and are never touched here.
+
+    Returns (updated, skipped): `updated` is a list of
+    {"pubkey", "old_reason", "new_reason"} (old_reason is always a string,
+    never null, so the client can restore it verbatim on undo); `skipped`
+    is the subset of `pubkeys` that were not banned."""
+    global _cache, _cache_mtime
+    _refresh(force=True)
+    data = dict(_cache)
+    updated = []
+    skipped = []
+    for pk in pubkeys:
+        if pk not in data:
+            skipped.append(pk)
+            continue
+        entry = dict(data[pk])
+        old_reason = entry.get("reason") or ""
+        if mode == "append" and old_reason:
+            new_reason = old_reason + " — " + reason
+        else:
+            new_reason = reason
+        entry["reason"] = new_reason
+        data[pk] = entry
+        updated.append({"pubkey": pk, "old_reason": old_reason, "new_reason": new_reason})
+    if updated:
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None
+    return updated, skipped
 
 
 def remove(pubkeys):
