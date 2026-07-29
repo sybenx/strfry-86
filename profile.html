@@ -23,6 +23,7 @@ li { overflow-wrap: anywhere; }
 
 <div id="content" style="display:none">
   <p><span id="npub-text"></span> <a id="njump-link" target="_blank">njump</a></p>
+  <p id="nip05-line" style="display:none"></p>
   <p id="ban-status-line"></p>
   <p id="ban-controls" style="display:none">
     <input id="reason-input" type="text" placeholder="reason (optional)">
@@ -64,6 +65,7 @@ var entryFallback = document.getElementById('entry-fallback');
 var contentEl = document.getElementById('content');
 var npubTextEl = document.getElementById('npub-text');
 var njumpLink = document.getElementById('njump-link');
+var nip05LineEl = document.getElementById('nip05-line');
 var banStatusLine = document.getElementById('ban-status-line');
 var banControls = document.getElementById('ban-controls');
 var reasonInput = document.getElementById('reason-input');
@@ -144,6 +146,14 @@ function runProfilePage() {
     npubTextEl.textContent = p.npub;
     njumpLink.href = 'https://njump.me/' + p.npub;
     njumpLink.textContent = 'njump';
+
+    if (p.nip05) {
+      nip05LineEl.textContent = p.nip05;
+      nip05LineEl.style.display = '';
+    } else {
+      nip05LineEl.textContent = '';
+      nip05LineEl.style.display = 'none';
+    }
 
     renderBanStatus();
     renderProfileFields();

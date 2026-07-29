@@ -538,7 +538,7 @@ Admin only. Everything the relay knows about ONE pubkey, on one page, so that ju
 
 1. `<h1>` with the display name if known, else the truncated npub; then the links to `/`, `/authors`, and `/domain`
 2. "Login with extension" button and status text
-3. The full npub as plain selectable text, and beside it a single `<a href="https://njump.me/<npub>" target="_blank">njump</a>`
+3. The full npub as plain selectable text, and beside it a single `<a href="https://njump.me/<npub>" target="_blank">njump</a>`; directly below, the nip05 as plain text when known, rendered as nothing at all (no empty element) when it isn't
 4. Ban status: `(banned)` with reason, report type, and ban time if banned — plus a "Ban" or "Unban" button with the shared reason input, signing the same endpoints every other page uses
 5. Profile fields from kind 0: about, website, picture, lud16 — each as PLAIN TEXT, labelled
 6. Counts: lifetime event total, the kind tally, distinct reporters
