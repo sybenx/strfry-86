@@ -229,9 +229,9 @@ reported itself as having run just now. Rules for it:
 - **A precondition failure states the fix**, since it is the operator's to make:
   `relay_url is not set — set it from the admin page and re-run` — the fix is a field on the
   same report page, not a file to go edit, since `relay_url` lives in `config.json` (set via
-  the "This relay's URL" field above the subscriber scan, POST `/api/relay-url`), never in
-  `strfry.conf`. Naming exactly where the fix happens is the whole difference between a
-  diagnostic and a shrug.
+  the input field above the subscriber scan, POST `/api/relay-url`), never in `strfry.conf`.
+  Naming exactly where the fix happens is the whole difference between a diagnostic and a
+  shrug.
 
 **8. Each panel has exactly one slot for message text**, directly under the status line and
 above the figures. No renderer may echo `warning` or `error` into the result body. A message
@@ -450,10 +450,10 @@ the cap is raised, because a floor cannot be used as an exemption list`.
 
 An unset `relay_url` is a `failed` run under Part 2, not a result: no `scanned_at`,
 no cache replacement, `error: "relay_url is not set — set it from the admin page and
-re-run"`. `relay_url` lives in `config.json` (GET/POST `/api/relay-url`, surfaced as a
-"This relay's URL" field on `/report`, right above the subscriber scan) — never in
-`strfry.conf`, which strfry itself never reads for this. See `get_relay_url` /
-`set_relay_url` / `validate_relay_url_input` in `server86.py`.
+re-run"`. `relay_url` lives in `config.json` (GET/POST `/api/relay-url`, surfaced as an
+input field on `/report`, right above the subscriber scan) — never in `strfry.conf`,
+which strfry itself never reads for this. See `get_relay_url` / `set_relay_url` /
+`validate_relay_url_input` in `server86.py`.
 
 ### `POST /api/report/totals` — replace the `gap_share` paragraph
 
