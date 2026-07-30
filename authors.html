@@ -3,10 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
 <title>strfry-86 — active authors</title>
 <style>
-body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+:root { color-scheme: light dark; }
+#theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
 li { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 600px) { body { font-size: 1.15em; } }
 </style>
 </head>
@@ -14,6 +18,7 @@ li { overflow-wrap: anywhere; }
 <h1>strfry-86 — active authors</h1>
 <p><a href="/">← ban list</a> · <a href="/report">relay report</a></p>
 <button id="login-btn" type="button">Login with extension</button>
+<button id="theme-btn" type="button"></button>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
   <div id="profile-entry-container"></div>
@@ -24,6 +29,7 @@ li { overflow-wrap: anywhere; }
     <label><input type="radio" name="scan-mode" value="full"> full author list (every note, reaction, report and profile — excludes DMs, ~2 minutes)</label>
   </p>
   <p><button id="scan-btn" type="button">scan recent activity (newest 20,000 events)</button></p>
+  <p id="empty-state-line"></p>
   <p id="provenance-line"></p>
   <div id="composition-line"></div>
   <p><input id="filter-input" type="search" placeholder="filter authors — name, nip05, or npub"></p>
@@ -58,11 +64,13 @@ var RENDER_MAX_CLIENT = 500;
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
+s86WireThemeToggle(document.getElementById('theme-btn'));
 var adminSection = document.getElementById('admin-section');
 var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var scanBtn = document.getElementById('scan-btn');
+var emptyStateLine = document.getElementById('empty-state-line');
 var provenanceLine = document.getElementById('provenance-line');
 var compositionLine = document.getElementById('composition-line');
 var filterInput = document.getElementById('filter-input');
@@ -98,11 +106,31 @@ document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) {
 
 // --- provenance / composition ---------------------------------------------
 
+// This page's empty state (no scan yet) is the state every new operator
+// meets first — it names what the list will contain and which press is
+// cheap, per CLAUDE.md's "Rendering results" / empty-region guidance,
+// rather than just rendering a blank page. Durations come from `modes` in
+// GET /api/authors: measured on THIS relay once a run of that mode exists,
+// a generic (never relay-specific) shape otherwise — never a number from
+// the developer's relay.
+function emptyStateText(data) {
+  var modes = (data && data.modes) || {};
+  var recent = modes.recent || {};
+  var full = modes.full || {};
+  var recentEvents = recent.events != null ? recent.events.toLocaleString() : '20,000';
+  var recentDuration = recent.typical_seconds ? ('about ' + s86FormatDuration(recent.typical_seconds)) : 'about three seconds';
+  var fullDuration = full.typical_seconds ? ('about ' + s86FormatDuration(full.typical_seconds)) : 'about two minutes';
+  return 'no scan yet. A recent scan reads the newest ' + recentEvents + ' events and takes ' + recentDuration
+    + '; the full author list takes ' + fullDuration + ' and you can close the tab while it runs.';
+}
+
 function renderProvenance(data) {
   if (!data || data.scanned_at === null || data.scanned_at === undefined) {
     provenanceLine.textContent = '';
+    emptyStateLine.textContent = (data && data.error) ? ('could not run — ' + data.error) : emptyStateText(data);
     return;
   }
+  emptyStateLine.textContent = '';
   var text = data.events_read + ' events, '
     + s86FormatDate(data.span_start) + ' → ' + s86FormatDate(data.span_end) + ', '
     + data.authors.length + ' authors — scanned ' + s86FormatDate(data.scanned_at);

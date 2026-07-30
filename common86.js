@@ -13,6 +13,8 @@ var S86_MAX_RECORDS_RENDERED = 20;
 var S86_RECORDS_INLINE = 3;
 var S86_MAX_DISMISSED = 1000;
 var S86_REASON_UNDO_MAX = 50;
+var S86_FIGURE_HEAD_MAX = 10;   // ranked figure rows shown before the tail is summarised — mirrors FIGURE_HEAD_MAX in server86.py
+var S86_THEME_KEY = 'strfry86_theme';
 
 // --- localStorage helpers ---------------------------------------------------
 
@@ -31,6 +33,88 @@ function s86SaveStored(key, arr, max) {
   } catch (e) {
     // ignore quota/availability errors — this is UI state, not source of truth
   }
+}
+
+// --- theme toggle ------------------------------------------------------------
+// No custom colors anywhere in this project — every page is unstyled
+// browser-default HTML, which is exactly what makes this safe: setting
+// `color-scheme` only tells the browser which of ITS OWN tested light/dark
+// palettes to use for the default background, text, form controls, and
+// links. We never choose a color, so we never get one wrong; readability
+// is the browser's own guarantee, not something recomputed here.
+//
+// 'auto' (the default, nothing stored) leaves `color-scheme: light dark`
+// from the page's own <style> in effect, which follows the OS/browser dark
+// mode signal. Picking 'light' or 'dark' overrides that by setting the
+// property directly on the root element, which wins over the stylesheet
+// rule regardless of source order. The SAME override is applied by a tiny
+// inline <script> at the top of <head>, before first paint, so a stored
+// preference never flashes the wrong theme on load; this function only
+// needs to handle the toggle button itself.
+function s86CurrentTheme() {
+  try {
+    var t = localStorage.getItem(S86_THEME_KEY);
+    return (t === 'light' || t === 'dark') ? t : 'auto';
+  } catch (e) {
+    return 'auto';
+  }
+}
+
+function s86ApplyTheme(pref) {
+  document.documentElement.style.colorScheme = (pref === 'light' || pref === 'dark') ? pref : 'light dark';
+}
+
+// Auto has no icon of its own — it shows whichever of the two icons
+// matches what the OS is CURRENTLY resolving to, via matchMedia, so the
+// glyph is always an honest description of what's on screen right now
+// rather than a third symbol the operator has to learn.
+function s86OsPrefersDark() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+// buttonEl: a <button> already in the DOM, moved to the top-right corner
+// by #theme-btn's rule in the shared <style> block. Cycles auto -> light
+// -> dark -> auto on each press and persists the choice. The glyph (☀/☾)
+// always names the CURRENT resolved appearance and the hover text (title,
+// doubling as aria-label per this project's icon-button convention) names
+// both the current state and what the next click does, so the icon alone
+// never has to be memorized.
+function s86WireThemeToggle(buttonEl) {
+  function render() {
+    var pref = s86CurrentTheme();
+    var resolvedDark = pref === 'dark' || (pref === 'auto' && s86OsPrefersDark());
+    var next = pref === 'auto' ? 'light' : (pref === 'light' ? 'dark' : 'auto');
+    buttonEl.textContent = resolvedDark ? '☾' : '☀';
+    var label = 'theme: ' + (pref === 'auto' ? ('auto, ' + (resolvedDark ? 'dark' : 'light')) : pref)
+      + ' — click for ' + next;
+    buttonEl.title = label;
+    buttonEl.setAttribute('aria-label', label);
+  }
+  buttonEl.addEventListener('click', function () {
+    var order = ['auto', 'light', 'dark'];
+    var next = order[(order.indexOf(s86CurrentTheme()) + 1) % order.length];
+    try {
+      if (next === 'auto') {
+        localStorage.removeItem(S86_THEME_KEY);
+      } else {
+        localStorage.setItem(S86_THEME_KEY, next);
+      }
+    } catch (e) {
+      // ignore quota/availability errors — this is UI state, not source of truth
+    }
+    s86ApplyTheme(next);
+    render();
+  });
+  // While on auto, the glyph tracks a LIVE OS change (no reload needed) —
+  // the same signal color-scheme: light dark already reacts to in CSS.
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+      if (s86CurrentTheme() === 'auto') {
+        render();
+      }
+    });
+  }
+  render();
 }
 
 // --- generic DOM / formatting helpers ---------------------------------------
@@ -451,6 +535,100 @@ function s86TruncateForRender(rows, max) {
   return { shown: rows.slice(0, max), truncatedCount: rows.length - max, totalCount: rows.length };
 }
 
+// --- figure tables --------------------------------------------------------
+// CLAUDE.md 'Rendering results': a numeric result is a semantic <table>,
+// never a sentence and never a space-padded <pre>. Browser-default
+// rendering only — no new CSS.
+
+// rows: [[label, value, shareText|null], ...]. shareText names its own
+// denominator ('64.7% of all') so percentages never collide in one
+// sentence when they refer to different totals.
+function s86BuildKeyValueTable(rows) {
+  var table = document.createElement('table');
+  rows.forEach(function (r) {
+    var tr = document.createElement('tr');
+    var th = document.createElement('th');
+    th.textContent = r[0];
+    tr.appendChild(th);
+    var td = document.createElement('td');
+    td.textContent = typeof r[1] === 'number' ? r[1].toLocaleString() : (r[1] || '');
+    tr.appendChild(td);
+    var td2 = document.createElement('td');
+    td2.textContent = r[2] || '';
+    tr.appendChild(td2);
+    table.appendChild(tr);
+  });
+  return table;
+}
+
+// Ranked two-column <table> of (label, count), capped at
+// S86_FIGURE_HEAD_MAX with a one-line tail summary naming the omitted
+// count AND its total — never a bare 'more' — plus the full list behind a
+// <details>, one row per line, never a comma-separated run.
+// rows: [[label, count], ...], already sorted descending by count.
+function s86BuildRankedFigureTable(rows, opts) {
+  opts = opts || {};
+  var wrap = document.createElement('div');
+  if (rows.length === 0) {
+    if (opts.emptyText) {
+      wrap.appendChild(s86El('p', opts.emptyText));
+    }
+    return wrap;
+  }
+
+  var unit = opts.unit || 'rows';
+
+  function rowTr(r) {
+    var tr = document.createElement('tr');
+    var th = document.createElement('th');
+    th.textContent = r[0];
+    tr.appendChild(th);
+    var td = document.createElement('td');
+    td.textContent = r[1].toLocaleString();
+    tr.appendChild(td);
+    var td2 = document.createElement('td');
+    td2.textContent = r[2] || '';
+    tr.appendChild(td2);
+    return tr;
+  }
+
+  var head = rows.slice(0, S86_FIGURE_HEAD_MAX);
+  var tail = rows.slice(S86_FIGURE_HEAD_MAX);
+
+  var headTable = document.createElement('table');
+  head.forEach(function (r) { headTable.appendChild(rowTr(r)); });
+
+  if (tail.length > 0) {
+    // A server-supplied total (e.g. unlisted_total) avoids summing every
+    // one of potentially hundreds of tail rows just to report their sum —
+    // the head is only S86_FIGURE_HEAD_MAX rows, so subtracting is cheap
+    // where re-summing the tail would not be.
+    var headTotal = head.reduce(function (sum, r) { return sum + r[1]; }, 0);
+    var tailTotal = opts.grandTotal != null ? (opts.grandTotal - headTotal)
+      : tail.reduce(function (sum, r) { return sum + r[1]; }, 0);
+    var tailTr = document.createElement('tr');
+    var tailTd = document.createElement('td');
+    tailTd.colSpan = 3;
+    tailTd.textContent = '+ ' + tail.length.toLocaleString() + ' more ' + unit + ', ' + tailTotal.toLocaleString() + (opts.itemNoun || ' events');
+    tailTr.appendChild(tailTd);
+    headTable.appendChild(tailTr);
+  }
+  wrap.appendChild(headTable);
+
+  if (tail.length > 0) {
+    var details = document.createElement('details');
+    var summary = document.createElement('summary');
+    summary.textContent = 'all ' + rows.length.toLocaleString() + ' ' + unit;
+    details.appendChild(summary);
+    var fullTable = document.createElement('table');
+    rows.forEach(function (r) { fullTable.appendChild(rowTr(r)); });
+    details.appendChild(fullTable);
+    wrap.appendChild(details);
+  }
+
+  return wrap;
+}
+
 // --- copy purge command -------------------------------------------------
 
 function s86BuildPurgeCommand(pubkeys) {
@@ -560,6 +738,11 @@ function s86FormatDuration(seconds) {
 // progress line everywhere it appears, so 'scanning…' means the same
 // thing on every page. No estimate is ever computed client-side beyond
 // formatting the server's own numbers — the client may not invent a rate.
+// Covers ONLY the running/blocked wording — the idle states (never run /
+// result / failed) are rendered by s86BuildScanPanel's applyStatus below,
+// since those need the CACHED RECORD (scanned_at/warning/error), not just
+// the job-status dict, to tell a fresh result apart from a failed attempt
+// still showing a stale one.
 function s86ScanStatusText(status) {
   if (status.blocked_by) {
     return 'waiting on ' + (S86_JOB_LABELS[status.blocked_by] || status.blocked_by);
@@ -576,21 +759,22 @@ function s86ScanStatusText(status) {
     }
     return 'scanning… ' + progress.toLocaleString() + ' events read';
   }
+  if (status.error) {
+    return 'could not run — ' + status.error;
+  }
   if (!status.scanned_at) {
     return 'never run';
   }
-  var line = s86FormatScanAge(status.scanned_at);
-  if (status.warning) {
-    line += ' — ' + status.warning;
-  }
-  return line;
+  return s86FormatScanAge(status.scanned_at);
 }
 
 // opts: {
 //   heading, costText (string shown before any run — describes the WORK,
 //     never a duration), buttonLabel, onStart (function() -> Promise,
 //     issues the signed POST),
-//   renderResult(container, record) — record is never null when called,
+//   renderResult(container, record) — called only when a usable result
+//     exists (a successful run, OR a previous successful run being shown
+//     underneath a failed attempt).
 //   lastRunNote(record) -> string|null, appended to the cost line once a
 //     record exists ('last run: 9m 06s at 4,814 events/sec'). No duration
 //     from a relay other than the operator's own is ever printed here.
@@ -598,6 +782,18 @@ function s86ScanStatusText(status) {
 // }
 // Returns {el, applyStatus(jobStatus, record)}. The caller owns polling
 // and auth; this only owns the DOM shape and the shared status wording.
+//
+// Four panel states (CLAUDE.md 'Rendering results', rule 7), and each has
+// exactly one slot for message text (rule 8):
+//   never run — no cache: the cost line and the button, visibly empty.
+//   running   — the job holds the lock: the progress line only.
+//   result    — cache present, run succeeded: the age, then the figures.
+//   failed    — run started, produced no usable result: why it failed,
+//               and the PREVIOUS result (if any) at its TRUE age — never
+//               rendered as though it were this attempt's output.
+// `error` and `warning` are distinct and never both rendered as the same
+// line: `error` replaces a result that is NOT rendered as fresh; `warning`
+// rides alongside a result that IS.
 function s86BuildScanPanel(opts) {
   var el = document.createElement('div');
   el.appendChild(s86El('h3', opts.heading));
@@ -615,6 +811,9 @@ function s86BuildScanPanel(opts) {
   var statusLine = s86El('p', 'never run');
   el.appendChild(statusLine);
 
+  var msgLine = s86El('p', '');
+  el.appendChild(msgLine);
+
   var resultEl = document.createElement('div');
   el.appendChild(resultEl);
 
@@ -630,24 +829,57 @@ function s86BuildScanPanel(opts) {
   });
 
   function applyStatus(jobStatus, record) {
-    statusLine.textContent = s86ScanStatusText(jobStatus);
-    btn.disabled = jobStatus.status === 'running' || !!jobStatus.blocked_by;
+    var running = jobStatus.status === 'running';
+    var blocked = !!jobStatus.blocked_by;
+    btn.disabled = running || blocked;
 
     resultEl.textContent = '';
+    msgLine.textContent = '';
     costLine.textContent = opts.costText;
-    if (record) {
-      if (opts.lastRunNote) {
-        var note = opts.lastRunNote(record);
-        if (note) {
-          costLine.textContent = opts.costText + ' — ' + note;
+
+    if (running || blocked) {
+      statusLine.textContent = s86ScanStatusText(jobStatus);
+      return;
+    }
+
+    record = record || {};
+    var hasResult = record.scanned_at != null;
+    var hasError = !!record.error;
+
+    if (hasError) {
+      statusLine.textContent = 'could not run — ' + record.error;
+      if (hasResult) {
+        costLine.textContent = opts.costText + ' — last successful run '
+          + s86FormatDate(record.scanned_at) + ' (' + s86FormatRelativeAge(record.scanned_at) + ')';
+        if (opts.renderResult) {
+          opts.renderResult(resultEl, record);
         }
       }
+      return;
+    }
+
+    if (!hasResult) {
+      statusLine.textContent = 'never run';
+      return;
+    }
+
+    statusLine.textContent = s86FormatScanAge(record.scanned_at);
+    if (opts.lastRunNote) {
+      var note = opts.lastRunNote(record);
+      if (note) {
+        costLine.textContent = opts.costText + ' — ' + note;
+      }
+    }
+    if (record.warning) {
+      msgLine.textContent = record.warning;
+    }
+    if (opts.renderResult) {
       opts.renderResult(resultEl, record);
-      if (opts.extraNote) {
-        var extra = opts.extraNote(record);
-        if (extra) {
-          resultEl.appendChild(s86El('p', extra));
-        }
+    }
+    if (opts.extraNote) {
+      var extra = opts.extraNote(record);
+      if (extra) {
+        resultEl.appendChild(s86El('p', extra));
       }
     }
   }
@@ -1057,14 +1289,23 @@ function s86BuildCommandGenerator(options) {
     var subscribers = purgeSources.getSubscribersCache();
     var subsFresh = subscribers && subscribers.scanned_at
       && (Math.floor(Date.now() / 1000) - subscribers.scanned_at) <= S86_SUBSCRIBER_CACHE_STALE_SECONDS;
+    var subsSaturated = !!(subscribers && subscribers.saturated);
     var recipientsAvailable = recipients && recipients.scanned_at;
 
-    if (!recipientsAvailable || !subsFresh) {
+    // Saturation is a REFUSAL here, not a label, and is checked separately
+    // from staleness: a saturated subscriber scan is a FLOOR on who
+    // subscribes, so missing subscribers means missing exemptions means
+    // MORE deletion — the opposite of a saturated recipient scan, which
+    // only ever deletes less. A floor cannot be used as an exemption list.
+    if (!recipientsAvailable || !subsFresh || subsSaturated) {
       var reason = !recipients || !recipients.scanned_at
         ? 'no recipient scan has been run yet'
         : (!subscribers || !subscribers.scanned_at
           ? 'no subscriber scan has been run yet'
-          : 'the subscriber scan is more than 7 days old');
+          : (!subsFresh
+            ? 'the subscriber scan is more than 7 days old'
+            : 'the subscriber scan hit its ' + (subscribers.scan_limit ? subscribers.scan_limit.toLocaleString() + '-event ' : '')
+              + 'cap — a floor cannot be used as an exemption list'));
       extraEl.appendChild(s86El('p', 'subscriber-exempt form unavailable: ' + reason
         + '. Run the missing scan(s) on the report page, or uncheck "exempt subscribers" for the blanket form below.'));
       pre.textContent = blanket;
@@ -1363,18 +1604,19 @@ function s86BuildRecordDetailList(entries) {
   return ul;
 }
 
-// Inline "set reason" row, shared by record lines (bans.html, authors.html,
-// domain.html — always called with currentReason: '', since that row is
-// for typing a fresh reason and prefilling it from history invited setting
-// the same one back) and profile.html's ban-status editor (which passes
-// the pubkey's actual current reason, since there the row IS the "edit the
-// reason on file" control). One text input and one button, disabled while
-// the input is empty — same disable rule as the bulk-reason row on
-// bans.html, since an empty reason submitted from a row with no checkbox
-// concept would otherwise silently no-op. Posts /api/reason in 'replace'
-// mode for exactly the pubkeys this call concerns, then records a normal
-// 'reason' undo entry — reusing the existing mechanism rather than
-// inventing a second way to undo a reason change.
+// Inline "set reason" row. Used ONLY by profile.html's ban-status editor,
+// which passes the pubkey's actual current reason — there the row IS the
+// "edit the reason on file" control for that one named pubkey, not a
+// control acting on a set the page assembled. (It used to also render
+// inside every record line on every page; that leaked a bulk
+// public-publishing control onto pages with no checked set for it to act
+// on — see the note on s86BuildRecordLine.) One text input and one
+// button, disabled while the input is empty — same disable rule as the
+// bulk-reason row on bans.html, since an empty reason submitted would
+// otherwise silently no-op. Posts /api/reason in 'replace' mode for
+// exactly the pubkeys this call concerns, then records a normal 'reason'
+// undo entry — reusing the existing mechanism rather than inventing a
+// second way to undo a reason change.
 function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
   var p = document.createElement('p');
 
@@ -1446,12 +1688,15 @@ function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
 // the Undo button entirely rather than rendering one that can't work. A
 // truncated undo is worse than none.
 //
-// reasonEdit is optional: {pubkeys, currentReason, callbacks}. When present
-// (ban and report records only — never unban or reason records), renders
-// the inline reason row from s86BuildReasonEditRow as a second row below
-// the line, exactly like the expand-arrow detail list, so it never disturbs
-// the main line's fixed dismiss/label/Undo/npub ordering.
-function s86BuildRecordLine(parts, onUndo, onDismiss, reasonEdit) {
+// A record line carries at most three controls: ↩ (dismiss), Undo, and
+// (multi-pubkey records only) the expand arrow — no input, no reason
+// field, no third-party control, on any page. A per-line reason-edit row
+// used to render here too; it leaked a bulk public-publishing control onto
+// every record line on every page, including report.html, which has no
+// checked set for it to act on. The bulk-reason control lives exactly
+// once, on bans.html, bound to the checked set — see bulk-reason-row
+// there — and is not part of this component.
+function s86BuildRecordLine(parts, onUndo, onDismiss) {
   var wrap = document.createElement('div');
   var line = document.createElement('p');
 
@@ -1503,10 +1748,6 @@ function s86BuildRecordLine(parts, onUndo, onDismiss, reasonEdit) {
       expandBtn.setAttribute('aria-label', expandBtn.title);
     });
     wrap.appendChild(detail);
-  }
-
-  if (reasonEdit) {
-    wrap.appendChild(s86BuildReasonEditRow(reasonEdit.pubkeys, reasonEdit.currentReason, reasonEdit.callbacks));
   }
 
   return wrap;
@@ -1673,23 +1914,13 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
     if (l.kind === 'stored') {
       var record = l.ref;
       var canUndo = !(record.type === 'reason' && !record.entries);
-      // currentReason is always blank here, never the reason the ban was
-      // made with — this row is for typing a NEW reason, and prefilling
-      // it from history invited setting the same reason back rather than
-      // deliberately choosing one.
-      var reasonEdit = record.type === 'ban' ? {
-        pubkeys: record.entries.map(function (e) { return e.pubkey; }),
-        currentReason: '',
-        callbacks: callbacks
-      } : null;
       return s86BuildRecordLine(
         s86RecordLabelParts(record),
         canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
         function () {
           s86RemoveStoredRecord(record.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        },
-        reasonEdit
+        }
       );
     } else {
       var ban = l.ref;
@@ -1707,10 +1938,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         function () {
           s86DismissReport(l.id);
           s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        },
-        // Blank for the same reason as the ban-record row above — this
-        // is for entering a fresh reason, not editing the one on file.
-        { pubkeys: [ban.pubkey], currentReason: '', callbacks: callbacks }
+        }
       );
     }
   });

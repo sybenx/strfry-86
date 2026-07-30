@@ -3,10 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
 <title>strfry-86 — relay report</title>
 <style>
-body { max-width: 40em; margin: 0 auto; padding: 0 1em; }
+:root { color-scheme: light dark; }
+#theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
 li { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 600px) { body { font-size: 1.15em; } }
 </style>
 </head>
@@ -14,6 +18,7 @@ li { overflow-wrap: anywhere; }
 <h1>strfry-86 — relay report</h1>
 <p><a href="/">← ban list</a> · <a href="/authors">active authors</a> · <a href="/domain">domain roster</a></p>
 <button id="login-btn" type="button">Login with extension</button>
+<button id="theme-btn" type="button"></button>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
   <div id="profile-entry-container"></div>
@@ -39,6 +44,7 @@ var lastBanned = [];
 
 var statusEl = document.getElementById('status');
 var loginBtn = document.getElementById('login-btn');
+s86WireThemeToggle(document.getElementById('theme-btn'));
 var adminSection = document.getElementById('admin-section');
 var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
@@ -55,20 +61,78 @@ var KNOWN_KINDS = {
   10002: 'relay list', 10050: 'DM relay list', 30023: 'long-form'
 };
 function kindLabel(kind) {
-  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+  return 'kind ' + kind + (KNOWN_KINDS[kind] ? ' (' + KNOWN_KINDS[kind] + ')' : '');
 }
 
 // --- § Database: totals + walk, sharing GET /api/report ------------------
+// Two independent buttons, because independent persistence implies
+// independent triggers: 'refresh totals' is seconds-long, 'run full
+// database walk' is minutes-long, and a single button that takes three
+// seconds on Tuesday and nine minutes on Wednesday is how an operator
+// learns to be afraid of pressing it. The walk reads the same --count
+// first for its own denominator, so pressing it refreshes the totals
+// above as a byproduct — the reverse is never true.
 
-function reportJobStatusFor(data, jobName, record) {
-  var scannedAt = record ? record.scanned_at : null;
+var lastReportData = null;
+
+function reportJobStatusFor(data, jobName) {
   if (data.status === 'running') {
     if (data.job === jobName) {
-      return { status: 'running', progress: data.progress, total: data.total, rate: data.rate, eta: data.eta, blocked_by: null, scanned_at: scannedAt };
+      return { status: 'running', progress: data.progress, total: data.total, rate: data.rate, eta: data.eta, blocked_by: null };
     }
-    return { status: 'idle', blocked_by: 'report-' + data.job, scanned_at: scannedAt };
+    return { status: 'idle', blocked_by: 'report-' + data.job };
   }
-  return { status: 'idle', blocked_by: data.blocked_by, scanned_at: scannedAt, warning: record ? record.warning : null };
+  return { status: 'idle', blocked_by: data.blocked_by };
+}
+
+// The three-level allowlist-gap ladder from CLAUDE.md's "Auditing the
+// allowlist — two questions, two thresholds". gap_level/needs_walk/
+// gap_alarm_kind/gap_alarm_events all come from POST /api/report/totals;
+// the 'notice, walk fresh, no alarm kind' case additionally names the
+// gap's SHAPE from the walk record, since an index count alone knows only
+// the gap's size, never its composition.
+function renderGapVerdict(container, totals, walk) {
+  var coveragePct = (100 - totals.gap_share * 100).toFixed(1);
+  var gapPct = (totals.gap_share * 100).toFixed(1);
+
+  if (totals.gap_level === 'ok') {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events.'));
+    return;
+  }
+
+  if (totals.gap_level === 'stale') {
+    var nonGiftwrap = totals.total_events - totals.giftwrap_events;
+    var alarmPct = nonGiftwrap > 0 ? (totals.gap_alarm_events / nonGiftwrap * 100).toFixed(1) : '0.0';
+    container.appendChild(s86El('p', kindLabel(totals.gap_alarm_kind) + ' holds ' + totals.gap_alarm_events.toLocaleString()
+      + ' events — ' + alarmPct + '% of non-gift-wrap — and is NOT in AUTHOR_SCAN_KINDS.'));
+    container.appendChild(s86El('p', 'The full author list is missing its authors. Add it.'));
+    return;
+  }
+
+  // 'notice': size alone doesn't justify an alarm. Name the shape from the
+  // walk when one is fresh enough to have produced this verdict; otherwise
+  // say what would resolve it.
+  if (totals.needs_walk || !walk || !walk.unlisted_kinds) {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events. The remaining '
+      + gapPct + '% (' + totals.gap_events.toLocaleString() + ' events) has not been broken down by kind yet — '
+      + 'run the database walk to see whether this is one missing kind or the long tail.'));
+    return;
+  }
+  var unlisted = Object.keys(walk.unlisted_kinds)
+    .map(function (k) { return [parseInt(k, 10), walk.unlisted_kinds[k]]; })
+    .sort(function (a, b) { return b[1] - a[1]; });
+  if (unlisted.length === 0) {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events.'));
+    return;
+  }
+  var worst = unlisted[0];
+  var nonGiftwrapWalk = totals.total_events - totals.giftwrap_events;
+  var worstPct = nonGiftwrapWalk > 0 ? (worst[1] / nonGiftwrapWalk * 100).toFixed(2) : '0.00';
+  var kindCount = walk.unlisted_kind_count != null ? walk.unlisted_kind_count : unlisted.length;
+  container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events. The remaining '
+    + gapPct + '% is spread across ' + kindCount.toLocaleString() + ' kinds; the largest is ' + kindLabel(worst[0])
+    + ' at ' + worst[1].toLocaleString() + ' events (' + worstPct + '%). This is the long tail, not staleness — '
+    + 'no single kind is worth adding.'));
 }
 
 var totalsPanel = s86BuildScanPanel({
@@ -78,38 +142,63 @@ var totalsPanel = s86BuildScanPanel({
   onStart: function () { return startReportJob('/api/report/totals'); },
   lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration)) : null; },
   renderResult: function (container, record) {
-    container.appendChild(s86El('p', record.total_events.toLocaleString() + ' events, '
-      + record.giftwrap_events.toLocaleString() + ' gift wraps (' + (record.giftwrap_share * 100).toFixed(1) + '%), '
-      + record.allowlist_events.toLocaleString() + ' in AUTHOR_SCAN_KINDS'));
-    var gapPct = record.gap_share * 100;
-    if (gapPct > 2) {
-      container.appendChild(s86El('p', 'allowlist gap: ' + gapPct.toFixed(1) + '% of non-gift-wrap events — AUTHOR_SCAN_KINDS is stale.'));
-      container.appendChild(s86El('p', 'The full author list is missing authors. Run the database walk below to see which kinds.'));
-    } else {
-      container.appendChild(s86El('p', 'allowlist gap: ' + gapPct.toFixed(1) + '% of non-gift-wrap events.'));
-    }
+    var nonGiftwrap = record.total_events - record.giftwrap_events;
+    container.appendChild(s86BuildKeyValueTable([
+      ['all events', record.total_events, ''],
+      ['gift wraps', record.giftwrap_events, (record.giftwrap_share * 100).toFixed(1) + '% of all'],
+      ['non-gift-wrap', nonGiftwrap, ''],
+      ['— in allowlist', record.allowlist_events, (100 - record.gap_share * 100).toFixed(1) + '%'],
+      ['— not in allowlist', record.gap_events, (record.gap_share * 100).toFixed(1) + '%']
+    ]));
+    renderGapVerdict(container, record, lastReportData && lastReportData.walk);
   }
 });
 
 var walkPanel = s86BuildScanPanel({
   heading: 'whole-database walk',
-  costText: 'reads every event in the database — the estimate appears within a few seconds of starting',
+  costText: 'reads every event in the database — the estimate appears within a few seconds of starting; refreshes the totals above as a byproduct',
   buttonLabel: 'run full database walk',
   onStart: function () { return startReportJob('/api/report/walk'); },
   lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration) + ' at ' + s86FormatRate(record.rate)) : null; },
   renderResult: function (container, record) {
-    container.appendChild(s86El('p', 'distinct authors: ' + record.distinct_authors.toLocaleString()
-      + ' (' + record.distinct_authors_nongiftwrap.toLocaleString() + ' measured, '
-      + record.distinct_authors_giftwrap.toLocaleString() + ' structural — gift wraps, one key per message)'));
+    var giftwraps = record.distinct_authors_giftwrap;
+    var kindsSeen = Object.keys(record.kinds || {}).length;
+    var unlistedCount = record.unlisted_kind_count != null ? record.unlisted_kind_count : Object.keys(record.unlisted_kinds || {}).length;
+    var unlistedTotal = record.unlisted_total != null ? record.unlisted_total : 0;
+    container.appendChild(s86BuildKeyValueTable([
+      ['events walked', record.events_read, ''],
+      ['distinct authors', record.distinct_authors, ''],
+      ['— measured', record.distinct_authors_nongiftwrap, ''],
+      ['— gift wraps', giftwraps, 'one key per message'],
+      ['kinds seen', kindsSeen, ''],
+      ['unlisted kinds', unlistedCount, unlistedTotal.toLocaleString() + ' events']
+    ]));
+
+    var nonGiftwrap = record.events_read - giftwraps;
     var unlisted = Object.keys(record.unlisted_kinds || {})
-      .map(function (k) { return [parseInt(k, 10), record.unlisted_kinds[k]]; })
+      .map(function (k) {
+        var count = record.unlisted_kinds[k];
+        var pct = nonGiftwrap > 0 ? (count / nonGiftwrap * 100).toFixed(2) + '%' : '';
+        return [kindLabel(parseInt(k, 10)), count, pct];
+      })
       .sort(function (a, b) { return b[1] - a[1]; });
-    if (unlisted.length === 0) {
-      container.appendChild(s86El('p', 'no event kinds outside AUTHOR_SCAN_KINDS were seen'));
-    } else {
-      container.appendChild(s86El('p', 'kinds missing from AUTHOR_SCAN_KINDS: '
-        + unlisted.map(function (e) { return kindLabel(e[0]) + ': ' + e[1].toLocaleString(); }).join(', ')));
+    container.appendChild(s86BuildRankedFigureTable(unlisted, {
+      unit: 'unlisted kinds',
+      grandTotal: record.unlisted_total,
+      emptyText: 'no event kinds outside AUTHOR_SCAN_KINDS were seen'
+    }));
+  },
+  extraNote: function (record) {
+    var totals = lastReportData && lastReportData.totals;
+    if (!totals || !totals.scanned_at || !record.scanned_at) {
+      return null;
     }
+    var deltaMin = Math.round(Math.abs(record.scanned_at - totals.scanned_at) / 60);
+    if (deltaMin < 1) {
+      return null;
+    }
+    return 'figures taken ' + deltaMin + ' minute' + (deltaMin === 1 ? '' : 's')
+      + ' apart; events written in between account for small differences';
   }
 });
 
@@ -117,8 +206,9 @@ document.getElementById('totals-panel-container').appendChild(totalsPanel.el);
 document.getElementById('walk-panel-container').appendChild(walkPanel.el);
 
 function applyReportStatus(data) {
-  totalsPanel.applyStatus(reportJobStatusFor(data, 'totals', data.totals), data.totals);
-  walkPanel.applyStatus(reportJobStatusFor(data, 'walk', data.walk), data.walk);
+  lastReportData = data;
+  totalsPanel.applyStatus(reportJobStatusFor(data, 'totals'), data.totals);
+  walkPanel.applyStatus(reportJobStatusFor(data, 'walk'), data.walk);
 }
 
 function fetchReport() {
@@ -139,9 +229,16 @@ function loadAuthorPointer() {
     .then(function (res) { return res.json(); })
     .then(function (data) {
       authorPointerLine.textContent = '';
-      var prefix = data.scanned_at
-        ? ('full author list — ' + (data.authors || []).length.toLocaleString() + ' authors, ' + s86FormatRelativeAge(data.scanned_at) + ' → ')
-        : 'full author list — never run → ';
+      var prefix;
+      if (data.scanned_at) {
+        prefix = 'full author list — ' + (data.authors || []).length.toLocaleString() + ' authors, ' + s86FormatRelativeAge(data.scanned_at) + ' → ';
+      } else {
+        var recentMode = (data.modes && data.modes.recent) || {};
+        var costPart = recentMode.typical_seconds
+          ? ('a recent scan takes about ' + s86FormatDuration(recentMode.typical_seconds))
+          : 'a recent scan takes about 3 seconds';
+        prefix = 'full author list — never run; ' + costPart + ' → ';
+      }
       authorPointerLine.appendChild(document.createTextNode(prefix));
       var link = document.createElement('a');
       link.href = '/authors';
@@ -159,10 +256,11 @@ var recipientsPanel = s86BuildScanPanel({
   buttonLabel: 'scan gift-wrap recipients',
   onStart: function () { return startSimpleJob('/api/recipients', fetchRecipients, applyRecipientsStatus); },
   renderResult: function (container, record) {
-    container.appendChild(s86El('p', record.events_read.toLocaleString() + ' gift-wrap events read, '
-      + record.recipients.length.toLocaleString() + ' distinct recipients, '
-      + s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end)
-      + (record.saturated ? ' — SATURATED: window limit reached' : '')));
+    container.appendChild(s86BuildKeyValueTable([
+      ['gift-wrap events read', record.events_read, record.saturated ? 'SATURATED — window limit reached' : ''],
+      ['distinct recipients', record.recipients.length, ''],
+      ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
+    ]));
   }
 });
 
@@ -172,16 +270,22 @@ var subscribersPanel = s86BuildScanPanel({
   buttonLabel: 'scan subscribers',
   onStart: function () { return startSimpleJob('/api/subscribers', fetchSubscribers, applySubscribersStatus); },
   renderResult: function (container, record) {
-    if (!record.relay_url) {
-      container.appendChild(s86El('p', 'relay.info.url is not set in strfry.conf — cannot match subscriber relay lists'));
-      return;
-    }
-    container.appendChild(s86El('p', 'relay: ' + record.relay_url));
-    container.appendChild(s86El('p', record.subscribers.length.toLocaleString() + ' DM-inbox subscribers, '
-      + record.general_subscribers.length.toLocaleString() + ' general relay-list subscribers'
-      + (record.saturated ? ' — SATURATED: window limit reached' : '')));
+    container.appendChild(s86BuildKeyValueTable([
+      ['relay', record.relay_url, ''],
+      ['DM-inbox subscribers', record.subscribers.length, record.saturated ? 'SATURATED — floor, not a count' : ''],
+      ['general relay-list subscribers', record.general_subscribers.length, '']
+    ]));
   },
+  // Saturation is a REFUSAL of the exempt-purge command, not a label — a
+  // saturated subscriber list is a FLOOR, so missing subscribers means
+  // missing exemptions means MORE deletion, the opposite of a saturated
+  // recipient scan. Checked ahead of staleness since it matters even on a
+  // scan that just completed.
   extraNote: function (record) {
+    if (record.saturated) {
+      return 'subscriber scan hit its ' + (record.scan_limit ? record.scan_limit.toLocaleString() + '-event ' : '')
+        + 'cap — the exempt purge command is unavailable until the cap is raised, because a floor cannot be used as an exemption list.';
+    }
     if (!record.scanned_at) {
       return null;
     }
@@ -197,8 +301,8 @@ document.getElementById('subscribers-panel-container').appendChild(subscribersPa
 
 function fetchRecipients() { return fetch('/api/recipients').then(function (res) { return res.json(); }); }
 function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
-function applyRecipientsStatus(data) { recipientsPanel.applyStatus(data, data.scanned_at ? data : null); }
-function applySubscribersStatus(data) { subscribersPanel.applyStatus(data, data.scanned_at ? data : null); }
+function applyRecipientsStatus(data) { recipientsPanel.applyStatus(data, data); }
+function applySubscribersStatus(data) { subscribersPanel.applyStatus(data, data); }
 
 function startSimpleJob(postEndpoint, fetchFn, applyFn) {
   return s86SignAndPost(postEndpoint, {}).then(function (result) {

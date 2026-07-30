@@ -115,7 +115,12 @@ PROFILE_EVENT_LIMIT = 500       # events read for one pubkey's kind tally
 PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
 PROFILE_REPORT_LIMIT = 100      # kind-1984 events read for reports against one pubkey
 DOMAIN_LOOKUP_MAX = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
+# --- rendering caps: no result reaches a page uncapped --------------------
 RENDER_MAX = 500                # list rows rendered client-side before truncation
+FIGURE_HEAD_MAX = 10             # ranked rows shown before the tail is summarised
+# --- allowlist audit: size and actionability are separate questions -------
+GAP_NOTICE_SHARE = 0.02         # gap worth a sentence, never an alarm on its own
+KIND_ALARM_SHARE = 0.005        # ONE unlisted kind this big is the actionable alarm
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
@@ -597,20 +602,23 @@ def _make_progress_cb(job):
 def _run_scan_job(name, job, cache, cache_path, compute_fn):
     """Background-thread body for one async scan. `compute_fn(progress_cb)`
     returns the result dict on success. On failure the previous cache is
-    preserved (mutated with a `warning` attached) and NEVER replaced with
-    a partial result — a scan that hit its deadline is an error, not a
-    smaller answer. Always releases the global lock on the way out,
-    success or failure — a deadline that fires without releasing the lock
-    would disable every scan in the deployment until the container
-    restarts."""
+    preserved (mutated with an `error` attached, never `scanned_at`) and
+    NEVER replaced with a partial result — a scan that hit its deadline, or
+    a precondition that was never satisfiable, is a FAILED run, not a
+    smaller answer. `error` is distinct from `warning`: `warning` rides
+    inside a result that IS rendered; `error` replaces a result that is
+    not, and a stale `scanned_at` must never be presented as this attempt's
+    age. Always releases the global lock on the way out, success or
+    failure — a deadline that fires without releasing the lock would
+    disable every scan in the deployment until the container restarts."""
     progress_cb = _make_progress_cb(job)
     try:
         result = compute_fn(progress_cb)
     except Exception as e:
-        warning = f"{name} scan failed: {type(e).__name__}: {e}"[:600]
-        log(f"server86: {warning}")
+        error = f"{name} scan failed: {type(e).__name__}: {e}"[:600]
+        log(f"server86: {error}")
         with _scan_lock:
-            cache["warning"] = warning
+            cache["error"] = error
             job["status"] = "idle"
             job["progress"] = None
             job["total"] = None
@@ -700,6 +708,7 @@ def compute_authors(mode, progress_cb=None):
     the main author list still succeeds. Neither scan touches purplepag.es
     or writes to blacklist.json — both are paid for by the same admin
     press."""
+    start = time.monotonic()
     filter_obj = dict(AUTHOR_SCAN_MODES[mode])
     limit = filter_obj["limit"]
     if progress_cb:
@@ -805,6 +814,7 @@ def compute_authors(mode, progress_cb=None):
 
     return {
         "scanned_at": int(time.time()),
+        "duration": time.monotonic() - start,
         "mode": mode,
         "limit": limit,
         "saturated": saturated,
@@ -816,22 +826,31 @@ def compute_authors(mode, progress_cb=None):
         "reports_saturated": reports_saturated,
         "reports_scanned": reports_scanned,
         "warning": None if reports_ok else "reports tally failed — sorting by event count only",
+        "error": None,
         "authors": authors,
     }
 
 
 def _empty_authors_result():
     return {
-        "scanned_at": None, "mode": None, "limit": None, "saturated": False,
+        "scanned_at": None, "duration": None, "mode": None, "limit": None, "saturated": False,
         "events_read": 0, "span_start": None, "span_end": None,
         "kinds": {}, "singleton_kinds": {},
         "reports_saturated": False, "reports_scanned": 0,
-        "warning": None, "authors": [],
+        "warning": None, "error": None, "authors": [],
     }
 
 
 _authors_cache = _load_cache_or(AUTHORS_CACHE_PATH, _empty_authors_result())
 _JOB_REGISTRY["authors"] = _authors_job
+
+# Measured duration of the last successful run of EACH mode, ON THIS RELAY —
+# kept separate from authors-cache.json (which holds only the latest scan's
+# result and would lose every other mode's measurement the moment a
+# different mode is run) so an empty-state press can be estimated honestly
+# without inventing a number or reusing one from a different relay.
+AUTHOR_MODE_DURATIONS_PATH = os.path.join(SCRIPT_DIR, "author-mode-durations.json")
+_author_mode_durations = _load_cache_or(AUTHOR_MODE_DURATIONS_PATH, {})
 
 
 def start_authors_scan(mode):
@@ -843,12 +862,29 @@ def start_authors_scan(mode):
             "authors", _authors_job, _authors_cache, AUTHORS_CACHE_PATH,
             lambda progress_cb: compute_authors(mode, progress_cb=progress_cb),
         )
+        with _scan_lock:
+            ok = _authors_cache.get("error") is None and _authors_cache.get("mode") == mode
+            duration = _authors_cache.get("duration") if ok else None
+        if duration is not None:
+            _author_mode_durations[mode] = duration
+            try:
+                _save_cache_atomic(AUTHOR_MODE_DURATIONS_PATH, _author_mode_durations)
+            except OSError as e:
+                log(f"server86: failed to persist author-mode-durations.json: {e}")
     return _start_scan_job("authors", _authors_job, run, extra_job_fields={"mode": mode})
 
 
 def get_authors_status():
-    """GET /api/authors: never scans, never starts one."""
-    return _scan_status("authors", _authors_job, _authors_cache)
+    """GET /api/authors: never scans, never starts one. `modes` names every
+    selectable AUTHOR_SCAN_MODES entry with its bound and its measured
+    typical duration ON THIS RELAY — null until a run of that mode has
+    completed successfully at least once, never a number from elsewhere."""
+    status = _scan_status("authors", _authors_job, _authors_cache)
+    status["modes"] = {
+        name: {"events": cfg.get("limit"), "typical_seconds": _author_mode_durations.get(name)}
+        for name, cfg in AUTHOR_SCAN_MODES.items()
+    }
+    return status
 
 
 def authors_scan_pubkeys():
@@ -873,7 +909,7 @@ def authors_scan_pubkeys():
 def _empty_recipients_result():
     return {
         "scanned_at": None, "events_read": 0, "span_start": None, "span_end": None,
-        "saturated": False, "warning": None, "recipients": [],
+        "saturated": False, "warning": None, "error": None, "recipients": [],
     }
 
 
@@ -939,6 +975,7 @@ def compute_recipients(progress_cb=None):
         "span_end": span["end"],
         "saturated": saturated,
         "warning": None,
+        "error": None,
         "recipients": recipients,
     }
 
@@ -971,7 +1008,9 @@ def get_recipients_status():
 
 def _empty_subscribers_result():
     return {
-        "scanned_at": None, "relay_url": None, "saturated": False, "warning": None,
+        "scanned_at": None, "relay_url": None, "saturated": False,
+        "scan_limit": SUBSCRIBER_SCAN_LIMIT, "counted": {},
+        "warning": None, "error": None,
         "subscribers": [], "general_subscribers": [],
     }
 
@@ -1052,23 +1091,36 @@ def compute_subscribers(progress_cb=None):
     and kind 10002 (general relay lists) — a pubkey listing this relay for
     general use is a different relationship from one listing it for DMs.
     Each is capped at SUBSCRIBER_SCAN_LIMIT and matched host-only against
-    get_relay_url(). If that is unconfigured, returns empty rather than
-    guessing: this result feeds a destructive retention-purge exemption
-    (Phase 5), so a silently-empty subscriber list must never be mistaken
-    for 'nobody subscribes'."""
+    get_relay_url().
+
+    An unconfigured relay.info.url is a FAILED run, not a result: raising
+    here means the caller (_run_scan_job) preserves whatever cache existed
+    before, stamps no new scanned_at, and attaches `error` rather than
+    rendering an empty subscriber list as a fresh answer. This result feeds
+    a destructive retention-purge exemption (Phase 5); a silently-empty
+    list presented as current is indistinguishable from 'nobody subscribes'
+    and must never be produced.
+
+    SATURATION on this endpoint is unsafe in the direction that matters:
+    a saturated subscriber list is a FLOOR, so missing subscribers means
+    missing exemptions means MORE deletion, not less (the opposite of a
+    saturated recipient scan, which only deletes less). `counted` runs an
+    exact index count per kind alongside the bounded tally read, so
+    saturation is a fact rather than an inference, and callers (the
+    exempt-purge command builder) must refuse to build an exemption list
+    from a saturated scan."""
     relay_url = get_relay_url()
     relay_host = _hostname_of(relay_url)
     if relay_host is None:
-        return {
-            "scanned_at": int(time.time()),
-            "relay_url": None,
-            "saturated": False,
-            "warning": "relay.info.url is not set in strfry.conf — cannot match subscriber relay lists",
-            "subscribers": [],
-            "general_subscribers": [],
-        }
+        raise RuntimeError(
+            "relay.info.url is not set — add it to /config/strfry.conf and re-run"
+        )
+
+    counted = {}
 
     def scan_kind(kind):
+        counted[str(kind)] = run_strfry_count({"kinds": [kind]}, timeout=AUTHOR_SCAN_DEADLINE)
+
         tally = {}  # pubkey -> latest created_at among matching events
         if progress_cb:
             progress_cb(0, total=SUBSCRIBER_SCAN_LIMIT)
@@ -1133,7 +1185,10 @@ def compute_subscribers(progress_cb=None):
         "scanned_at": int(time.time()),
         "relay_url": relay_url,
         "saturated": dm_saturated or general_saturated,
+        "scan_limit": SUBSCRIBER_SCAN_LIMIT,
+        "counted": counted,
         "warning": None,
+        "error": None,
         "subscribers": build_rows(dm_tally),
         "general_subscribers": build_rows(general_tally),
     }
@@ -1172,7 +1227,9 @@ def _empty_report_totals():
         "scanned_at": None, "duration": None, "total_events": None,
         "giftwrap_events": None, "giftwrap_share": None,
         "allowlist_events": None, "gap_events": None, "gap_share": None,
-        "warning": None,
+        "gap_level": None, "needs_walk": False,
+        "gap_alarm_kind": None, "gap_alarm_events": None,
+        "warning": None, "error": None,
     }
 
 
@@ -1181,8 +1238,40 @@ def _empty_report_walk():
         "scanned_at": None, "duration": None, "rate": None, "events_read": None,
         "distinct_authors": None, "distinct_authors_nongiftwrap": None,
         "distinct_authors_giftwrap": None, "kinds": {}, "unlisted_kinds": {},
-        "warning": None,
+        "unlisted_total": None, "unlisted_kind_count": None,
+        "warning": None, "error": None,
     }
+
+
+def _compute_gap_level(gap_share, totals_scanned_at, walk_record):
+    """See CLAUDE.md 'Auditing the allowlist — two questions, two
+    thresholds'. Below GAP_NOTICE_SHARE the gap isn't worth a sentence.
+    At or above it, only a walk's per-kind composition can tell size apart
+    from actionability — a `--count` alone cannot, since Nostr filters have
+    neither negation nor group-by — and only when that walk is at least as
+    recent as the totals record being evaluated; a composition from a month
+    ago paired with a size from a minute ago is not one measurement, so a
+    totals-only refresh always reads back down to 'notice' until the walk
+    is re-run alongside it."""
+    if gap_share < GAP_NOTICE_SHARE:
+        return {"gap_level": "ok", "needs_walk": False, "gap_alarm_kind": None, "gap_alarm_events": None}
+
+    walk_scanned_at = walk_record.get("scanned_at") if walk_record else None
+    if walk_scanned_at is None or walk_scanned_at < totals_scanned_at:
+        return {"gap_level": "notice", "needs_walk": True, "gap_alarm_kind": None, "gap_alarm_events": None}
+
+    events_read = walk_record.get("events_read") or 0
+    giftwrap = walk_record.get("distinct_authors_giftwrap") or 0
+    non_giftwrap = events_read - giftwrap
+    unlisted = walk_record.get("unlisted_kinds") or {}
+    if non_giftwrap > 0 and unlisted:
+        worst_kind, worst_count = max(unlisted.items(), key=lambda kv: kv[1])
+        if (worst_count / non_giftwrap) >= KIND_ALARM_SHARE:
+            return {
+                "gap_level": "stale", "needs_walk": False,
+                "gap_alarm_kind": int(worst_kind), "gap_alarm_events": worst_count,
+            }
+    return {"gap_level": "notice", "needs_walk": False, "gap_alarm_kind": None, "gap_alarm_events": None}
 
 
 def _load_report_cache():
@@ -1210,17 +1299,22 @@ def compute_report_totals(progress_cb=None):
 
     non_giftwrap = total_events - giftwrap_events
     gap_events = total_events - allowlist_events - giftwrap_events
-    return {
-        "scanned_at": int(time.time()),
+    scanned_at = int(time.time())
+    gap_share = (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0
+    result = {
+        "scanned_at": scanned_at,
         "duration": duration,
         "total_events": total_events,
         "giftwrap_events": giftwrap_events,
         "giftwrap_share": (giftwrap_events / total_events) if total_events > 0 else 0.0,
         "allowlist_events": allowlist_events,
         "gap_events": gap_events,
-        "gap_share": (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0,
+        "gap_share": gap_share,
         "warning": None,
+        "error": None,
     }
+    result.update(_compute_gap_level(gap_share, scanned_at, _report_cache["walk"]))
+    return result
 
 
 def compute_report_walk(progress_cb=None):
@@ -1288,6 +1382,7 @@ def compute_report_walk(progress_cb=None):
     non_giftwrap = total_events - giftwrap_events
     gap_events = total_events - allowlist_events - giftwrap_events
 
+    gap_share = (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0
     totals_record = {
         "scanned_at": int(time.time()),
         "duration": count_duration,
@@ -1296,8 +1391,9 @@ def compute_report_walk(progress_cb=None):
         "giftwrap_share": (giftwrap_events / total_events) if total_events > 0 else 0.0,
         "allowlist_events": allowlist_events,
         "gap_events": gap_events,
-        "gap_share": (gap_events / non_giftwrap) if non_giftwrap > 0 else 0.0,
+        "gap_share": gap_share,
         "warning": None,
+        "error": None,
     }
     walk_record = {
         "scanned_at": int(time.time()),
@@ -1309,8 +1405,12 @@ def compute_report_walk(progress_cb=None):
         "distinct_authors_giftwrap": giftwrap_count,
         "kinds": kind_counts,
         "unlisted_kinds": unlisted_kinds,
+        "unlisted_total": sum(unlisted_kinds.values()),
+        "unlisted_kind_count": len(unlisted_kinds),
         "warning": None,
+        "error": None,
     }
+    totals_record.update(_compute_gap_level(gap_share, totals_record["scanned_at"], walk_record))
     return {"totals": totals_record, "walk": walk_record}
 
 
@@ -1330,18 +1430,19 @@ _JOB_REGISTRY["report-walk"] = _report_job
 def _run_report_job(job_name, compute_fn):
     """Same shape as _run_scan_job, specialized for the two-record report
     cache: a totals-only run replaces just the totals record; a walk run
-    replaces both (see compute_report_walk). A failure attaches `warning`
-    to the record THIS run was attempting and leaves the other completely
-    untouched — a walk timeout must never even brush the totals record."""
+    replaces both (see compute_report_walk). A failure attaches `error`
+    (never `scanned_at`) to the record THIS run was attempting and leaves
+    the other completely untouched — a walk timeout must never even brush
+    the totals record."""
     progress_cb = _make_progress_cb(_report_job)
     try:
         result = compute_fn(progress_cb)
     except Exception as e:
-        warning = f"report {job_name} failed: {type(e).__name__}: {e}"[:600]
-        log(f"server86: {warning}")
+        error = f"report {job_name} failed: {type(e).__name__}: {e}"[:600]
+        log(f"server86: {error}")
         with _scan_lock:
             key = "totals" if job_name == "totals" else "walk"
-            _report_cache[key]["warning"] = warning
+            _report_cache[key]["error"] = error
             _report_job["status"] = "idle"
             _report_job["job"] = None
             _report_job["progress"] = None
@@ -1387,10 +1488,12 @@ def start_report_walk_scan():
 
 def get_report_status():
     """GET /api/report: never scans, never starts one. `totals`/`walk` are
-    null until each has run at least once — the page's own 'never run'
-    state — rather than a skeleton dict with every field null, so the
-    client can tell 'no result yet' apart from 'a result with nulls in it'
-    with one falsy check."""
+    null only in the genuine 'never run' state — no result and no error
+    yet — rather than a skeleton dict with every field null, so the client
+    can tell 'no result yet' apart from 'a result with nulls in it' with
+    one falsy check. A record that failed before ever succeeding (`error`
+    set, `scanned_at` still null) is NOT collapsed back to null — the
+    client still needs to see why it failed."""
     with _scan_lock:
         job = dict(_report_job)
         totals = dict(_report_cache["totals"])
@@ -1406,8 +1509,8 @@ def get_report_status():
         "rate": job["rate"],
         "eta": job["eta"],
         "blocked_by": blocked_by,
-        "totals": totals if totals.get("scanned_at") is not None else None,
-        "walk": walk if walk.get("scanned_at") is not None else None,
+        "totals": totals if (totals.get("scanned_at") is not None or totals.get("error") is not None) else None,
+        "walk": walk if (walk.get("scanned_at") is not None or walk.get("error") is not None) else None,
     }
 
 

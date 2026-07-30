@@ -606,11 +606,15 @@ check(server86._hostname_of("wss://relay.example.evil.com") != server86._hostnam
 check(server86._hostname_of(None) is None and server86._hostname_of("") is None,
       "_hostname_of returns None for missing/empty input rather than ''")
 
+_orig_run_strfry_count = server86.run_strfry_count
+
 server86.get_relay_url = lambda: None
-empty_subs = server86.compute_subscribers()
-check(empty_subs["relay_url"] is None and empty_subs["subscribers"] == [] and empty_subs["general_subscribers"] == [],
-      "compute_subscribers returns empty (never a guess) when relay.info.url is unconfigured")
-check(empty_subs["warning"] is not None, "compute_subscribers explains why the list is empty")
+try:
+    server86.compute_subscribers()
+    check(False, "compute_subscribers raises — never a fake-empty result — when relay.info.url is unconfigured")
+except RuntimeError as e:
+    check("relay.info.url" in str(e), "compute_subscribers's precondition-failure message names relay.info.url")
+    check("strfry.conf" in str(e), "compute_subscribers's precondition-failure message states the fix location")
 
 dm_pubkey = "a" * 64
 general_pubkey = "b" * 64
@@ -630,8 +634,16 @@ def _streaming_subscribers(filter_obj, on_event, timeout, on_progress=None):
         return 1
 
 
+_subscriber_counts = {10050: 2, 10002: 1}
+
+
+def _count_subscribers(filter_obj, timeout=None):
+    return _subscriber_counts[filter_obj["kinds"][0]]
+
+
 server86.get_relay_url = lambda: "wss://relay.example.com"
 server86.run_strfry_scan_streaming = _streaming_subscribers
+server86.run_strfry_count = _count_subscribers
 server86._recipients_cache.clear()
 server86._recipients_cache.update({"scanned_at": 999, "recipients": [{"pubkey": dm_pubkey, "count": 42}]})
 
@@ -644,8 +656,28 @@ check([r["pubkey"] for r in subs_result["general_subscribers"]] == [general_pubk
       "compute_subscribers keeps kind 10002 (general_subscribers) separate from kind 10050 (subscribers)")
 check(subs_result["general_subscribers"][0]["giftwrap_count"] is None,
       "compute_subscribers reports giftwrap_count null for a pubkey absent from the recipients cache")
+check(subs_result["counted"] == {"10050": 2, "10002": 1},
+      "compute_subscribers runs an exact index --count per kind, so saturation is a fact rather than an inference")
+
+# Saturation: a subscriber-list FLOOR is unsafe in the direction that
+# matters (missing subscribers means missing exemptions means MORE
+# deletion), unlike a saturated recipient scan, which only deletes less.
+server86.SUBSCRIBER_SCAN_LIMIT = 1
+
+
+def _streaming_subscribers_saturated(filter_obj, on_event, timeout, on_progress=None):
+    on_event({"pubkey": dm_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com/"]]})
+    return filter_obj["limit"]
+
+
+server86.run_strfry_scan_streaming = _streaming_subscribers_saturated
+saturated_result = server86.compute_subscribers()
+check(saturated_result["saturated"] is True,
+      "compute_subscribers reports saturated when the bounded scan hit SUBSCRIBER_SCAN_LIMIT")
+server86.SUBSCRIBER_SCAN_LIMIT = 50000
 
 server86.run_strfry_scan_streaming = _orig_streaming
+server86.run_strfry_count = _orig_run_strfry_count
 server86.resolve_profiles = _orig_resolve_profiles
 
 
@@ -998,6 +1030,41 @@ check(99999 in walk_result["walk"]["unlisted_kinds"] and walk_result["walk"]["un
       "compute_report_walk: unlisted_kinds reports a kind that is neither in AUTHOR_SCAN_KINDS nor 1059")
 check(1059 not in walk_result["walk"]["unlisted_kinds"] and 1 not in walk_result["walk"]["unlisted_kinds"],
       "compute_report_walk: unlisted_kinds excludes gift wraps and allowlisted kinds")
+check(walk_result["walk"]["unlisted_total"] == 1 and walk_result["walk"]["unlisted_kind_count"] == 1,
+      "compute_report_walk: unlisted_total/unlisted_kind_count summarise unlisted_kinds so the page needs no client-side arithmetic")
+
+# --- the gap ladder: this is the assertion that would have caught the
+# permanent false alarm before it shipped (CLAUDE.md Part 0 #1 / Part 3).
+# Reference-relay-shaped numbers: gap 2.008% (one tick over
+# GAP_NOTICE_SHARE), spread across 444 kinds, largest kind 43 at 0.079% of
+# non-gift-wrap (comfortably under KIND_ALARM_SHARE) -> 'notice', never
+# 'stale'. The same gap with one kind (2003) at 27.9% -> 'stale', naming
+# it. No walk record at all -> never 'stale', regardless of gap size.
+_gap_non_giftwrap = 933085
+_gap_share_notice = 18728 / _gap_non_giftwrap  # 2.008%
+_walk_long_tail = {"scanned_at": 500, "events_read": 2642995, "distinct_authors_giftwrap": 1709910,
+                    "unlisted_kinds": {"43": 735, "10011": 598}}
+level = server86._compute_gap_level(_gap_share_notice, 500, _walk_long_tail)
+check(level["gap_level"] == "notice" and level["needs_walk"] is False and level["gap_alarm_kind"] is None,
+      "gap ladder: 2.008% gap spread across a long tail (largest kind 0.079% of non-gift-wrap) is 'notice', never 'stale'")
+
+_walk_single_miss = {"scanned_at": 500, "events_read": 2642995, "distinct_authors_giftwrap": 1709910,
+                      "unlisted_kinds": {"2003": 258290}}
+level = server86._compute_gap_level(_gap_share_notice, 500, _walk_single_miss)
+check(level["gap_level"] == "stale" and level["gap_alarm_kind"] == 2003 and level["gap_alarm_events"] == 258290,
+      "gap ladder: a single unlisted kind at 27.9% of non-gift-wrap (kind 2003, the real miss this check exists for) is 'stale' and names it")
+
+level = server86._compute_gap_level(_gap_share_notice, 500, None)
+check(level["gap_level"] == "notice" and level["needs_walk"] is True,
+      "gap ladder: with no walk record at all, a totals-only refresh never reaches 'stale' — it asks for a walk instead")
+
+level_old_walk = server86._compute_gap_level(_gap_share_notice, 500, {**_walk_single_miss, "scanned_at": 100})
+check(level_old_walk["gap_level"] == "notice" and level_old_walk["needs_walk"] is True,
+      "gap ladder: a walk OLDER than the totals record being evaluated cannot promote it to 'stale', even if that walk contains an alarm-worthy kind")
+
+level_ok = server86._compute_gap_level(0.001, 500, _walk_single_miss)
+check(level_ok["gap_level"] == "ok" and level_ok["needs_walk"] is False,
+      "gap ladder: a gap below GAP_NOTICE_SHARE is 'ok' regardless of what any walk would show")
 
 # deadline: preserves the PREVIOUS walk record byte-identical, releases the
 # lock, and never even touches the totals record — a walk timeout must not
@@ -1021,15 +1088,45 @@ _time.sleep(0.3)
 
 check(server86._report_cache["walk"]["events_read"] == 999 and server86._report_cache["walk"]["scanned_at"] == 12345,
       "a walk that hits its deadline preserves the PREVIOUS walk record byte-identical, never a partial")
-check(server86._report_cache["walk"].get("warning") is not None,
-      "a walk that hits its deadline attaches a warning to the walk record")
+check(server86._report_cache["walk"].get("error") is not None,
+      "a walk that hits its deadline attaches an error (not a warning) to the walk record")
 check(server86._report_cache["totals"] == _prev_totals_snapshot,
-      "a failed walk leaves the totals record completely untouched — not even a warning added")
+      "a failed walk leaves the totals record completely untouched — not even an error added")
 check(server86._active_scan["name"] is None,
       "a deadline that fires RELEASES the global lock — a lock that never releases disables every scan in the deployment")
 
 server86.run_strfry_count = _orig_run_strfry_count
 server86.run_strfry_scan_streaming = _orig_streaming
+
+# 'failed' is not 'result', for the other two async scans too (authors,
+# recipients) — same rule as the walk above: a scan that hit its deadline
+# preserves the PREVIOUS cache byte-identical (aside from `error`) and
+# never stamps a new scanned_at.
+server86._authors_cache.clear()
+server86._authors_cache.update({**server86._empty_authors_result(), "scanned_at": 555, "events_read": 42})
+_prev_authors_snapshot = dict(server86._authors_cache)
+server86.run_strfry_scan_streaming = _streaming_timeout
+authors_fail_status = server86.start_authors_scan("recent")
+check(authors_fail_status["status"] == "running", "POST /api/authors/scan starts the job and returns 202 running immediately")
+_time.sleep(0.3)
+check(server86._authors_cache["scanned_at"] == 555 and server86._authors_cache["events_read"] == 42,
+      "a failed author scan preserves the PREVIOUS cache byte-identical, never a partial")
+check(server86._authors_cache.get("error") is not None,
+      "a failed author scan attaches an error (not a warning) to the authors cache, and no rendered result claims to be this attempt's")
+server86.run_strfry_scan_streaming = _orig_streaming
+
+server86._recipients_cache.clear()
+server86._recipients_cache.update({**server86._empty_recipients_result(), "scanned_at": 777, "events_read": 9})
+server86.run_strfry_scan_streaming = _streaming_timeout
+recipients_fail_status = server86.start_recipients_scan()
+check(recipients_fail_status["status"] == "running", "POST /api/recipients starts the job and returns 202 running immediately")
+_time.sleep(0.3)
+check(server86._recipients_cache["scanned_at"] == 777 and server86._recipients_cache["events_read"] == 9,
+      "a failed recipients scan preserves the PREVIOUS cache byte-identical, never a partial")
+check(server86._recipients_cache.get("error") is not None,
+      "a failed recipients scan attaches an error (not a warning) to the recipients cache")
+server86.run_strfry_scan_streaming = _orig_streaming
+server86._active_scan["name"] = None
 
 
 # --- global scan lock (server86.py: shared by every async scan) -----------
@@ -1157,6 +1254,134 @@ echo "$BOUNDS_OUTPUT"
 BOUNDS_FAIL_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^FAIL: ')"
 FAILURES=$((FAILURES + BOUNDS_FAIL_COUNT))
 rm -f "$BOUNDS_TEST_SCRIPT"
+
+# --- client-side rendering rules (common86.js), executed for real --------
+# CLAUDE.md's "Rendering results" caps and the record-line safety rule are
+# JS-side, not server-side — these run the ACTUAL shared functions (not a
+# reimplementation of their logic) against a minimal DOM shim, so a future
+# edit that reintroduces the per-record-line reason control, or that drops
+# a rendering cap, fails here rather than only in a live browser.
+
+if command -v node >/dev/null 2>&1; then
+    JS_TEST_SCRIPT="$TESTDIR/js_render_test.js"
+    cat > "$JS_TEST_SCRIPT" <<'JSEOF'
+const fs = require('fs');
+const vm = require('vm');
+const path = process.argv[2];
+const results = [];
+function check(cond, name) { results.push([!!cond, name]); }
+
+// A minimal DOM shim covering exactly what s86BuildRecordLine,
+// s86BuildKeyValueTable, and s86BuildRankedFigureTable use:
+// createElement/appendChild/textContent/setAttribute/addEventListener.
+// No querySelector — these functions never call it.
+function makeEl(tag) {
+  return {
+    tagName: String(tag).toUpperCase(),
+    childNodes: [],
+    attrs: {},
+    _text: '',
+    get textContent() { return this._text; },
+    set textContent(v) {
+      this._text = String(v);
+      this.childNodes = [];
+    },
+    appendChild(child) { this.childNodes.push(child); return child; },
+    setAttribute(k, v) { this.attrs[k] = v; },
+    addEventListener() {},
+    get title() { return this.attrs.title || ''; },
+    set title(v) { this.attrs.title = v; },
+  };
+}
+function flatten(node, out) {
+  out.push(node.tagName);
+  (node.childNodes || []).forEach((c) => flatten(c, out));
+  return out;
+}
+
+function makeTextNode(text) {
+  return { tagName: '#text', childNodes: [], _text: String(text), get textContent() { return this._text; } };
+}
+
+const sandbox = {
+  document: { createElement: makeEl, createTextNode: makeTextNode },
+  console,
+  Math,
+  Object,
+  Date,
+  JSON,
+  parseInt,
+  Array,
+};
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(path, 'utf8'), sandbox, { filename: path });
+
+// --- caps hold: RENDER_MAX-style truncation (s86TruncateForRender) -------
+const rows = Array.from({ length: 12481 }, (_, i) => i);
+const trunc = sandbox.s86TruncateForRender(rows, 500);
+check(trunc.shown.length === 500 && trunc.truncatedCount === 11981 && trunc.totalCount === 12481,
+  's86TruncateForRender: a 12,481-row list renders exactly 500 rows and reports 11,981 truncated against the full 12,481');
+
+// --- caps hold: FIGURE_HEAD_MAX ranked table + tail summary + full <details>
+const unlistedRows = [];
+for (let i = 0; i < 444; i++) { unlistedRows.push(['kind ' + (20000 + i), 444 - i, '']); }
+const grandTotal = unlistedRows.reduce((s, r) => s + r[1], 0);
+const wrap = sandbox.s86BuildRankedFigureTable(unlistedRows, { unit: 'unlisted kinds', grandTotal });
+const headTable = wrap.childNodes[0];
+const headRows = headTable.childNodes.filter((tr) => tr.tagName === 'TR');
+check(headRows.length === sandbox.S86_FIGURE_HEAD_MAX + 1,
+  's86BuildRankedFigureTable: renders exactly FIGURE_HEAD_MAX rows plus one tail-summary row for a 444-row input');
+const tailCell = headRows[headRows.length - 1].childNodes[0];
+const expectedTailTotal = grandTotal - unlistedRows.slice(0, sandbox.S86_FIGURE_HEAD_MAX).reduce((s, r) => s + r[1], 0);
+check(tailCell.textContent.indexOf(expectedTailTotal.toLocaleString()) !== -1,
+  "s86BuildRankedFigureTable: the tail-summary row's stated event total equals the sum of the omitted rows");
+const details = wrap.childNodes[1];
+check(details.tagName === 'DETAILS', 's86BuildRankedFigureTable: the full list sits behind a <details>, not inline');
+const fullTable = details.childNodes[1];
+const fullRows = fullTable.childNodes.filter((tr) => tr.tagName === 'TR');
+check(fullRows.length === 444, 's86BuildRankedFigureTable: the <details> contains all 444 rows, one per line, never a comma-separated run');
+
+// --- no record line contains an <input>, in any state --------------------
+const banLine = sandbox.s86BuildRecordLine(
+  { verb: 'banned', name: null, nip05: null, suffix: null, npub: 'npub1xxxx', entries: null },
+  () => {}, () => {});
+check(flatten(banLine, []).indexOf('INPUT') === -1,
+  's86BuildRecordLine (ban record): no <input> anywhere in the rendered line');
+
+const reportLine = sandbox.s86BuildRecordLine(
+  { verb: 'reported', name: null, nip05: null, suffix: ' — spam', npub: 'npub1yyyy', entries: null },
+  () => {}, () => {});
+check(flatten(reportLine, []).indexOf('INPUT') === -1,
+  's86BuildRecordLine (report record): no <input> anywhere in the rendered line');
+
+check(sandbox.s86BuildRecordLine.length === 3,
+  's86BuildRecordLine takes exactly 3 parameters — no reasonEdit 4th argument for a record line to act on');
+
+for (const [ok, name] of results) {
+  console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
+}
+JSEOF
+    JS_OUTPUT="$(node "$JS_TEST_SCRIPT" "$REPO_ROOT/common86.js" 2>&1)"
+    echo "$JS_OUTPUT"
+    JS_FAIL_COUNT="$(echo "$JS_OUTPUT" | grep -c '^FAIL: ')"
+    FAILURES=$((FAILURES + JS_FAIL_COUNT))
+else
+    echo "SKIP: client-side rendering rules (node not found)"
+fi
+
+# --- report.html has no control bound to a page-assembled set ------------
+# Static-source check: every checkbox in this project (author-checkbox,
+# ban-checkbox, select-all, the command generator's exempt-subscribers
+# field) is created via document.createElement in common86.js, never as a
+# literal <input> in an .html file — so a literal type="checkbox" in
+# report.html's own source would mean a NEW, page-specific control, which
+# is exactly what this rule forbids.
+if grep -q 'type="checkbox"' "$REPO_ROOT/report.html"; then
+    FAILURES=$((FAILURES + 1))
+    echo 'FAIL: report.html contains no control bound to a page-assembled set (found a literal checkbox in report.html source)'
+else
+    echo 'PASS: report.html contains no control bound to a page-assembled set (no literal checkbox in report.html source)'
+fi
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
