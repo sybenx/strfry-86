@@ -49,6 +49,9 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   <h2 id="events-heading">Recent events</h2>
   <p>
     <input id="events-date-input" type="date">
+    <input id="events-time-input" type="time" step="1">
+    <button id="events-time-prev-btn" type="button" title="previous event" aria-label="previous event">‹</button>
+    <button id="events-time-next-btn" type="button" title="next event" aria-label="next event">›</button>
     <button id="events-date-clear-btn" type="button" style="display:none">back to recent events</button>
   </p>
   <p id="previews-note"></p>
@@ -92,6 +95,9 @@ var commandBlockContainer = document.getElementById('command-block-container');
 var lookupReporterNamesBtn = document.getElementById('lookup-reporter-names-btn');
 var eventsHeading = document.getElementById('events-heading');
 var eventsDateInput = document.getElementById('events-date-input');
+var eventsTimeInput = document.getElementById('events-time-input');
+var eventsTimePrevBtn = document.getElementById('events-time-prev-btn');
+var eventsTimeNextBtn = document.getElementById('events-time-next-btn');
 var eventsDateClearBtn = document.getElementById('events-date-clear-btn');
 
 // A day picked here can never be in the future — strfry has nothing to
@@ -121,6 +127,23 @@ if (!pubkeyHex) {
 
 function truncatedNpub(npub) {
   return npub.length > 20 ? npub.slice(0, 16) + '…' : npub;
+}
+
+// UTC-safe date/time helpers for the events date+time pickers — every
+// timestamp elsewhere on this page (s86FormatDate) is UTC, so a "day" here
+// always means a UTC calendar day, never the browser's local one.
+function utcDateStr(unixSeconds) {
+  return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
+}
+
+function utcTimeStr(unixSeconds) {
+  return new Date(unixSeconds * 1000).toISOString().slice(11, 19);
+}
+
+function addDaysToDateStr(dateStr, delta) {
+  var parts = dateStr.split('-').map(Number);
+  var ms = Date.UTC(parts[0], parts[1] - 1, parts[2]) + delta * 86400000;
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 function runProfilePage() {
@@ -363,11 +386,29 @@ function runProfilePage() {
         li.appendChild(s86El('span', r.content));
       }
       li.appendChild(document.createTextNode(' — '));
-      li.appendChild(s86El('i', s86FormatDate(r.created_at)));
+      li.appendChild(s86BuildReportDateButton(r.created_at));
       reportsList.appendChild(li);
     });
 
     updateLookupReporterNamesButton();
+  }
+
+  // A report's timestamp, as a button rather than plain text: clicking it
+  // jumps the events section below to that UTC calendar day — what was
+  // this pubkey posting when it got reported? — reusing the exact same
+  // fetchDayView() the date picker itself calls, so the time picker
+  // defaults to that day's latest event either way.
+  function s86BuildReportDateButton(createdAt) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = s86FormatDate(createdAt);
+    var label = "view this pubkey's events on this day";
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.addEventListener('click', function () {
+      fetchDayView(utcDateStr(createdAt));
+    });
+    return btn;
   }
 
   // Name/nip05 for each reporter is resolved locally and automatically —
@@ -474,38 +515,141 @@ function runProfilePage() {
     });
   }
 
-  eventsDateInput.addEventListener('change', function () {
-    var date = eventsDateInput.value;
-    if (!date || !isAdmin || dayFetchInFlight) {
-      return;
+  // Fetches one UTC day's events and, on success, defaults the time picker
+  // to when the LATEST event that day appears (previews is sorted
+  // newest-first). Shared by the date picker's own change handler, a
+  // clicked report date, and the </> walker below when it crosses a day
+  // boundary — one fetch path, never duplicated three ways. Returns the
+  // resulting dayView (or null on failure/already-in-flight) so callers
+  // that need to act on it (the walker) can chain off the promise.
+  function fetchDayView(date) {
+    if (!isAdmin || dayFetchInFlight) {
+      return Promise.resolve(null);
     }
     dayFetchInFlight = true;
     eventsDateInput.disabled = true;
     setStatus('loading events for ' + date + '…');
-    s86SignAndPost('/api/profile/day', { pubkey: pubkeyHex, date: date })
+    return s86SignAndPost('/api/profile/day', { pubkey: pubkeyHex, date: date })
       .then(function (result) {
         dayFetchInFlight = false;
         eventsDateInput.disabled = false;
         if (!result.ok) {
           setStatus('failed to load events for ' + date + ': ' + s86ErrMsg(result));
-          return;
+          return null;
         }
         setStatus('');
         dayView = { date: date, previews: result.body.previews, truncated: result.body.truncated };
+        eventsDateInput.value = date;
+        eventsTimeInput.value = dayView.previews.length > 0 ? utcTimeStr(dayView.previews[0].created_at) : '';
         renderPreviews();
+        return dayView;
       })
       .catch(function () {
         dayFetchInFlight = false;
         eventsDateInput.disabled = false;
         setStatus('failed to load events for ' + date);
+        return null;
       });
+  }
+
+  eventsDateInput.addEventListener('change', function () {
+    if (eventsDateInput.value) {
+      fetchDayView(eventsDateInput.value);
+    }
   });
 
   eventsDateClearBtn.addEventListener('click', function () {
     dayView = null;
     eventsDateInput.value = '';
+    eventsTimeInput.value = '';
     renderPreviews();
   });
+
+  // The date+time inputs together name a point in time; </> step to the
+  // nearest actual event on the other side of it (older for <, newer for
+  // >), updating both inputs to that event's real timestamp. Stepping off
+  // the end of the currently-loaded day costs exactly one more bounded
+  // /api/profile/day fetch for the adjacent calendar day — never an
+  // unbounded search — and lands on that day's near edge (its newest event
+  // when arriving from later while walking older, its oldest event when
+  // arriving from earlier while walking newer). An adjacent day with zero
+  // events just reports that and stops; pressing the button again walks
+  // one more day, at the operator's own pace.
+  function anchorTimestamp() {
+    var dateStr = eventsDateInput.value;
+    if (!dateStr) {
+      return null;
+    }
+    var dateParts = dateStr.split('-').map(Number);
+    var timeParts = (eventsTimeInput.value || '00:00:00').split(':').map(Number);
+    return Math.floor(Date.UTC(
+      dateParts[0], dateParts[1] - 1, dateParts[2],
+      timeParts[0] || 0, timeParts[1] || 0, timeParts[2] || 0
+    ) / 1000);
+  }
+
+  function nearestWithin(previews, anchor, direction) {
+    if (!previews || previews.length === 0) {
+      return null;
+    }
+    if (direction < 0) {
+      for (var i = 0; i < previews.length; i++) {
+        if (previews[i].created_at < anchor) {
+          return previews[i];
+        }
+      }
+    } else {
+      for (var j = previews.length - 1; j >= 0; j--) {
+        if (previews[j].created_at > anchor) {
+          return previews[j];
+        }
+      }
+    }
+    return null;
+  }
+
+  function applyFoundEvent(ev, date) {
+    eventsDateInput.value = date;
+    eventsTimeInput.value = utcTimeStr(ev.created_at);
+  }
+
+  function stepEvent(direction) {
+    var dateStr = eventsDateInput.value;
+    var anchor = anchorTimestamp();
+    if (!dateStr || anchor === null || dayFetchInFlight) {
+      if (!dateStr) {
+        setStatus('pick a date first');
+      }
+      return;
+    }
+
+    var sameDayLoaded = dayView && dayView.date === dateStr
+      ? Promise.resolve(dayView)
+      : fetchDayView(dateStr);
+
+    sameDayLoaded.then(function (view) {
+      var found = nearestWithin(view && view.previews, anchor, direction);
+      if (found) {
+        applyFoundEvent(found, dateStr);
+        return;
+      }
+      var adjacentDate = addDaysToDateStr(dateStr, direction < 0 ? -1 : 1);
+      fetchDayView(adjacentDate).then(function (adjView) {
+        var previews = adjView && adjView.previews;
+        var edge = previews && previews.length > 0
+          ? (direction < 0 ? previews[0] : previews[previews.length - 1])
+          : null;
+        if (edge) {
+          applyFoundEvent(edge, adjacentDate);
+        } else {
+          setStatus('no ' + (direction < 0 ? 'earlier' : 'later') + ' events found on ' + adjacentDate);
+        }
+      });
+    });
+  }
+
+  eventsTimePrevBtn.addEventListener('click', function () { stepEvent(-1); });
+  eventsTimeNextBtn.addEventListener('click', function () { stepEvent(1); });
 
   // Automatic external lookup for THIS ONE pubkey only, exactly once per
   // page load — safe here in a way bulk lookups are not (see CLAUDE.md).
