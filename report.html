@@ -264,8 +264,8 @@ relayUrlSaveBtn.textContent = 'Save';
 var relayUrlStatus = s86El('p', '');
 
 var relayUrlBlock = document.createElement('div');
-relayUrlBlock.appendChild(s86El('p', 'required for this scan'));
 var relayUrlRow = document.createElement('p');
+relayUrlRow.appendChild(document.createTextNode('strfry url: '));
 relayUrlRow.appendChild(relayUrlInput);
 relayUrlRow.appendChild(relayUrlSaveBtn);
 relayUrlBlock.appendChild(relayUrlRow);
