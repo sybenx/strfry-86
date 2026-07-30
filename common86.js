@@ -657,6 +657,74 @@ function s86WireCopyPurge(buttonEl, preEl, listEl, checkboxClass) {
 // --- command blocks -----------------------------------------------------
 // Nothing here is executed and nothing here is fetched — every command is
 // plain copyable text. Identical on every page.
+//
+// One command per box, one Copy button per box — a box holding two or more
+// shell commands taught operators to copy the whole block (comments, blank
+// lines and all) and edit it down by hand before pasting. The slight
+// background is inline rather than a rule in the locked <style> block: it
+// marks only these boxes, not every <pre> on the page (the curl hint,
+// figures, etc.), and it is mixed from the same system colors the theme
+// section already uses (CanvasText/Canvas) so it never needs a light/dark
+// override of its own.
+//
+// A chunked exempt-purge command embeds up to S86_GIFTWRAP_PURGE_CHUNK_SIZE
+// 64-hex pubkeys in one filter — tens of thousands of characters that wrap
+// into a wall of hex nobody reads, burying the boxes around it. Past
+// S86_COMMAND_DISPLAY_MAX the box shows only the head (which is always
+// where the operative part of the command lives — "scan --count" vs
+// "delete --filter" never sits inside the truncated tail) plus a notice
+// stating exactly how much is hidden. The notice is never a footnote: it is
+// bold, and it says outright that Copy still copies the whole command, so
+// truncation is never mistaken for the command itself.
+var S86_COMMAND_DISPLAY_MAX = 400;
+
+function s86AppendCommandBox(container, text) {
+  var box = document.createElement('div');
+  box.style.background = 'color-mix(in srgb, CanvasText 8%, Canvas)';
+  box.style.borderRadius = '0.3em';
+  box.style.padding = '0.5em 0.6em';
+  box.style.margin = '0.4em 0';
+
+  var isTruncated = text.length > S86_COMMAND_DISPLAY_MAX;
+
+  var pre = document.createElement('pre');
+  pre.style.margin = '0 0 0.4em 0';
+  pre.style.background = 'transparent';
+  pre.textContent = isTruncated ? text.slice(0, S86_COMMAND_DISPLAY_MAX) : text;
+  box.appendChild(pre);
+
+  if (isTruncated) {
+    var hiddenChars = text.length - S86_COMMAND_DISPLAY_MAX;
+    var notice = s86El('strong', '⚠ truncated for display — ' + hiddenChars.toLocaleString()
+      + ' more characters not shown. Copy still copies the command in full.');
+    var noticeP = document.createElement('p');
+    noticeP.style.margin = '0 0 0.4em 0';
+    noticeP.appendChild(notice);
+    box.appendChild(noticeP);
+
+    var details = document.createElement('details');
+    details.appendChild(s86El('summary', 'show full command'));
+    var fullPre = document.createElement('pre');
+    fullPre.style.margin = '0.4em 0 0 0';
+    fullPre.style.background = 'transparent';
+    fullPre.textContent = text;
+    details.appendChild(fullPre);
+    box.appendChild(details);
+  }
+
+  var copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', function () {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () {});
+    }
+  });
+  box.appendChild(copyBtn);
+
+  container.appendChild(box);
+  return box;
+}
 
 // --- cached-scan panel ----------------------------------------------------
 // Shared by report.html's four panels and by authors.html's own scan area
@@ -913,7 +981,9 @@ function s86PollStatus(fetchFn, applyFn, onError) {
 
 // --- command generator ---------------------------------------------------
 // ONE <select> of intents, a FIELD SET that changes with the selection,
-// ONE <pre> holding the rendered command, ONE copy button. Nothing here is
+// and one command box per command — never one box holding several
+// commands, since that taught operators to copy-and-hand-edit a blob
+// instead of copying exactly what they meant to run. Nothing here is
 // executed, nothing is fetched by pressing anything in it, no output ever
 // returns to the page — the terminal is where this project sends
 // everything it refuses to do itself.
@@ -1032,12 +1102,14 @@ function s86PyKindTallyScript() {
   ].join('\n');
 }
 
+// Returns [countCommand, deleteCommand] — two commands, meant to be
+// copied and run one at a time (count first), never as one pasted blob.
 function s86RenderDeleteWithCountFirst(filterObj) {
   var filterJson = JSON.stringify(filterObj);
   return [
-    "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '" + filterJson + "'  # read this count BEFORE deleting",
+    "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '" + filterJson + "'",
     "strfry " + S86_STRFRY_CONFIG_FLAG + " delete --filter '" + filterJson + "'",
-  ].join('\n');
+  ];
 }
 
 // Both GET /api/recipients and GET /api/subscribers are unauthenticated
@@ -1172,18 +1244,30 @@ function s86BuildCommandGenerator(options) {
   var extraEl = document.createElement('div');
   details.appendChild(extraEl);
 
-  var pre = document.createElement('pre');
-  details.appendChild(pre);
+  var commandsEl = document.createElement('div');
+  details.appendChild(commandsEl);
 
-  var copyBtn = document.createElement('button');
-  copyBtn.type = 'button';
-  copyBtn.textContent = 'Copy';
-  copyBtn.addEventListener('click', function () {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(pre.textContent).catch(function () {});
-    }
-  });
-  details.appendChild(copyBtn);
+  // A message (an error, a prompt to fill in a field) is plain text with
+  // no box and no copy button — only an actual command gets those.
+  function setMessage(text) {
+    commandsEl.textContent = '';
+    commandsEl.appendChild(s86El('p', text));
+  }
+
+  // `items` is an array of strings (one box, no label) or
+  // {label, command} (a label line above its own box) — every command in
+  // its own box with its own Copy button, never merged into one blob.
+  function setCommands(items) {
+    commandsEl.textContent = '';
+    items.forEach(function (item) {
+      if (typeof item === 'string') {
+        s86AppendCommandBox(commandsEl, item);
+      } else {
+        commandsEl.appendChild(s86El('p', item.label));
+        s86AppendCommandBox(commandsEl, item.command);
+      }
+    });
+  }
 
   // Wired once, unconditionally — the two GETs are public reads (they
   // serve the same persisted caches report.html's own panels poll) and
@@ -1238,20 +1322,30 @@ function s86BuildCommandGenerator(options) {
   // above the delete command, on every field change, always — the count
   // and the command are one render or they are blank, never out of sync.
 
+  // [countCommand, deleteCommand] -> [{label, command}, {label, command}],
+  // the pair every destructive intent below emits as its two boxes.
+  function countThenDeleteItems(filterObj) {
+    var pair = s86RenderDeleteWithCountFirst(filterObj);
+    return [
+      { label: 'read this count BEFORE deleting:', command: pair[0] },
+      { label: 'then, if the count looks right:', command: pair[1] }
+    ];
+  }
+
   function renderDeleteByAuthor() {
     var hex = s86PubkeyInputToHex(fieldInputs.pubkey.value);
     if (!hex) {
-      pre.textContent = 'enter a pubkey above';
+      setMessage('enter a pubkey above');
       return;
     }
     var daysCheck = s86ValidateOptionalDaysInput(fieldInputs.days.value);
     if (!daysCheck.ok) {
-      pre.textContent = 'enter a positive whole number of days above, or leave it blank for all time';
+      setMessage('enter a positive whole number of days above, or leave it blank for all time');
       return;
     }
     var kindCheck = s86ValidateOptionalKindInput(fieldInputs.kind.value);
     if (!kindCheck.ok) {
-      pre.textContent = 'enter a valid kind number above, or leave it blank';
+      setMessage('enter a valid kind number above, or leave it blank');
       return;
     }
     var filter = { authors: [hex] };
@@ -1267,21 +1361,21 @@ function s86BuildCommandGenerator(options) {
     if (kindCheck.value != null) {
       filter.kinds = [kindCheck.value];
     }
-    pre.textContent = s86RenderDeleteWithCountFirst(filter);
+    setCommands(countThenDeleteItems(filter));
   }
 
   function renderGiftwrapPurge() {
     var daysCheck = s86ValidateDaysInput(fieldInputs.days.value);
     if (!daysCheck.ok) {
-      pre.textContent = 'enter a positive whole number of days above';
+      setMessage('enter a positive whole number of days above');
       return;
     }
     var days = daysCheck.value;
     var cutoff = Math.floor(Date.now() / 1000) - days * 86400;
-    var blanket = s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff });
+    var blanketItems = countThenDeleteItems({ kinds: [1059], until: cutoff });
 
     if (!fieldInputs.exempt.checked) {
-      pre.textContent = blanket;
+      setCommands(blanketItems);
       return;
     }
 
@@ -1308,7 +1402,7 @@ function s86BuildCommandGenerator(options) {
               + 'cap — a floor cannot be used as an exemption list'));
       extraEl.appendChild(s86El('p', 'subscriber-exempt form unavailable: ' + reason
         + '. Run the missing scan(s) on the report page, or uncheck "exempt subscribers" for the blanket form below.'));
-      pre.textContent = blanket;
+      setCommands(blanketItems);
       return;
     }
 
@@ -1324,22 +1418,29 @@ function s86BuildCommandGenerator(options) {
     for (var i = 0; i < exempt.length; i += S86_GIFTWRAP_PURGE_CHUNK_SIZE) {
       chunks.push(exempt.slice(i, i + S86_GIFTWRAP_PURGE_CHUNK_SIZE));
     }
-    var exemptCommands = chunks.length === 0
-      ? [s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff })]
-      : chunks.map(function (chunk) {
-        return s86RenderDeleteWithCountFirst({ kinds: [1059], until: cutoff, '#p': chunk });
+    var items = [];
+    if (chunks.length === 0) {
+      items = countThenDeleteItems({ kinds: [1059], until: cutoff });
+    } else {
+      chunks.forEach(function (chunk, i) {
+        var pairItems = countThenDeleteItems({ kinds: [1059], until: cutoff, '#p': chunk });
+        pairItems[0].label = 'chunk ' + (i + 1) + ' of ' + chunks.length + ' (' + chunk.length + ' pubkeys) — read this count BEFORE deleting:';
+        pairItems[1].label = 'chunk ' + (i + 1) + ' of ' + chunks.length + ' — then, if the count looks right:';
+        items = items.concat(pairItems);
       });
-
-    pre.textContent = exemptCommands.join('\n\n')
-      + '\n\n# blanket form below — deletes ALL gift wraps in the window, subscribers included:\n\n'
-      + blanket;
+    }
+    items.push({ label: 'blanket form below — deletes ALL gift wraps in the window, subscribers included:', command: blanketItems[0].command });
+    items.push({ label: blanketItems[1].label, command: blanketItems[1].command });
+    setCommands(items);
   }
 
   function renderKindsByAuthor() {
     var hex = s86PubkeyInputToHex(fieldInputs.pubkey.value);
-    pre.textContent = hex
-      ? ("strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript() + "\n'")
-      : 'enter a pubkey above';
+    if (!hex) {
+      setMessage('enter a pubkey above');
+      return;
+    }
+    setCommands(["strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript() + "\n'"]);
   }
 
   function render() {

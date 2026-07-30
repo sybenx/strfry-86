@@ -29,9 +29,10 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
     <input id="domain-input" type="text" placeholder="example.com">
     <button id="fetch-roster-btn" type="button">Fetch roster</button>
   </p>
+  <p id="fetch-fail-info" style="display:none"></p>
   <details id="paste-details">
     <summary>fetch failed? paste it here</summary>
-    <pre id="curl-hint"></pre>
+    <div id="curl-hint-container"></div>
     <p><textarea id="paste-textarea" rows="6" cols="50" placeholder='{"names": {"bob": "&lt;hex pubkey&gt;"}}'></textarea></p>
     <p><button id="paste-submit-btn" type="button">Use pasted roster</button></p>
   </details>
@@ -74,7 +75,9 @@ var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var domainInput = document.getElementById('domain-input');
 var fetchRosterBtn = document.getElementById('fetch-roster-btn');
-var curlHint = document.getElementById('curl-hint');
+var fetchFailInfo = document.getElementById('fetch-fail-info');
+var pasteDetails = document.getElementById('paste-details');
+var curlHintContainer = document.getElementById('curl-hint-container');
 var pasteTextarea = document.getElementById('paste-textarea');
 var pasteSubmitBtn = document.getElementById('paste-submit-btn');
 var provenanceLine = document.getElementById('provenance-line');
@@ -201,17 +204,43 @@ function runLookup(pubkeys, singleEntry) {
 // dropped as a duplicate of exactly this page action.
 function updateCurlHint() {
   var domain = domainInput.value.trim();
-  curlHint.textContent = domain ? ('curl -s https://' + domain + '/.well-known/nostr.json') : '';
+  curlHintContainer.textContent = '';
+  if (domain) {
+    s86AppendCommandBox(curlHintContainer, 'curl -s https://' + domain + '/.well-known/nostr.json');
+  }
 }
 domainInput.addEventListener('input', updateCurlHint);
 updateCurlHint();
 
-fetchRosterBtn.addEventListener('click', function () {
+// A fetch failure is almost always CORS (the domain's server, not this
+// one, decides whether a browser may read the response) — not a broken
+// domain — so the way out is never "try again," it's a path that doesn't
+// go through the browser's CORS check at all: open the URL directly (a
+// top-level navigation isn't subject to it) or run the equivalent curl
+// command server-side and paste the result below.
+function showFetchFailure(domain) {
+  var url = 'https://' + domain + '/.well-known/nostr.json';
+  setStatus('fetch failed — CORS or network error.');
+  fetchFailInfo.textContent = '';
+  fetchFailInfo.appendChild(document.createTextNode('Try '));
+  var a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.textContent = 'opening the URL directly';
+  fetchFailInfo.appendChild(a);
+  fetchFailInfo.appendChild(document.createTextNode(', or run the command below and paste its output.'));
+  fetchFailInfo.style.display = '';
+  updateCurlHint();
+  pasteDetails.open = true;
+}
+
+function fetchRoster() {
   var domain = domainInput.value.trim();
   if (!domain) {
     setStatus('enter a domain first');
     return;
   }
+  fetchFailInfo.style.display = 'none';
   updateCurlHint();
   setStatus('fetching .well-known/nostr.json…');
   fetch('https://' + domain + '/.well-known/nostr.json')
@@ -226,9 +255,11 @@ fetchRosterBtn.addEventListener('click', function () {
       processRoster(text);
     })
     .catch(function () {
-      setStatus('fetch failed — CORS or network error. Try the paste box below.');
+      showFetchFailure(domain);
     });
-});
+}
+
+fetchRosterBtn.addEventListener('click', fetchRoster);
 
 pasteSubmitBtn.addEventListener('click', function () {
   processRoster(pasteTextarea.value);
@@ -321,7 +352,8 @@ function renderRoster() {
     if (localPart) {
       li.appendChild(s86El('b', localPart + ' '));
     }
-    li.appendChild(s86El('span', r.npub + ' '));
+    li.appendChild(s86NpubLink(r.npub, r.pubkey, isAdmin));
+    li.appendChild(document.createTextNode(' '));
 
     if (r.name) {
       li.appendChild(document.createTextNode('— '));
@@ -384,10 +416,20 @@ function loadBanned() {
     });
 }
 
+var autoFetchedDomain = false;
+
 function onLogin() {
   isAdmin = true;
   adminSection.style.display = '';
   renderRecords();
+  // Autofetch only fires here, not on page load — the fetch's own
+  // result is thrown away by runLookup() until isAdmin is true (the
+  // authenticated POST /api/pubkeys/lookup requires it), so firing any
+  // earlier would just be a wasted request against the domain's server.
+  if (prefillDomain && !autoFetchedDomain) {
+    autoFetchedDomain = true;
+    fetchRoster();
+  }
 }
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
