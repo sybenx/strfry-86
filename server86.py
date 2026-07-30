@@ -26,10 +26,12 @@ Routes:
   POST /api/ban           -> NIP-98 authenticated manual ban
   POST /api/reason        -> NIP-98 authenticated: bulk-edit reason on existing bans
   POST /api/profile       -> NIP-98 authenticated: everything known about one pubkey
+  POST /api/profile/day   -> NIP-98 authenticated: one pubkey's events on one UTC calendar day
   POST /api/pubkeys/lookup -> NIP-98 authenticated: what's known about a domain's roster
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
 """
 
+import calendar
 import errno
 import hashlib
 import json
@@ -114,6 +116,7 @@ NAME_CACHE_MAX = 20000          # entries retained in names.json
 PROFILE_EVENT_LIMIT = 500       # events read for one pubkey's kind tally
 PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
 PROFILE_REPORT_LIMIT = 100      # kind-1984 events read for reports against one pubkey
+PROFILE_DAY_EVENTS_MAX = 50     # events read for one pubkey's single-day view
 DOMAIN_LOOKUP_MAX = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
 # --- rendering caps: no result reaches a page uncapped --------------------
 RENDER_MAX = 500                # list rows rendered client-side before truncation
@@ -1731,6 +1734,54 @@ def build_profile_response(pubkey_hex):
     return result
 
 
+def validate_profile_day_request(body):
+    """Return (pubkey_hex, since, until, error) for a POST /api/profile/day
+    body. The client sends a calendar date, never a raw time window — the
+    [since, until) bounds are computed HERE, server-side, as one UTC day, so
+    the client can never hand this endpoint an arbitrarily large span. Every
+    other timestamp on this page (s86FormatDate) is already rendered in UTC,
+    so the picked date has to mean the same calendar day the server scans,
+    not whatever the browser's local timezone would offset it to."""
+    pubkey_hex = body.get("pubkey")
+    date_str = body.get("date")
+    if not is_hex64(pubkey_hex):
+        return None, None, None, "malformed pubkey"
+    if not isinstance(date_str, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return None, None, None, "malformed date (expected YYYY-MM-DD)"
+    try:
+        parsed = time.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return None, None, None, "invalid date"
+    since = calendar.timegm(parsed)
+    until = since + 86400
+    return pubkey_hex, since, until, None
+
+
+def compute_profile_day(pubkey_hex, since, until):
+    """One pubkey's events within [since, until) — a single UTC calendar day,
+    already validated and computed by validate_profile_day_request(). Same
+    shape and same PROFILE_DAY_EVENTS_MAX bound as compute_profile()'s own
+    recent-events previews, just windowed by date instead of by recency;
+    `truncated` says so explicitly rather than letting a full day of events
+    look like a complete one. Admin-only because it scans; needs no button
+    beyond picking the date, same reasoning as opening /profile itself."""
+    events = run_strfry_scan(
+        {"authors": [pubkey_hex], "since": since, "until": until, "limit": PROFILE_DAY_EVENTS_MAX},
+        timeout=SCAN_TIMEOUT,
+    )
+    events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
+    truncated = len(events) >= PROFILE_DAY_EVENTS_MAX
+    previews = []
+    for ev in events:
+        content = ev.get("content")
+        previews.append({
+            "kind": ev.get("kind"),
+            "created_at": ev.get("created_at"),
+            "content": (content if isinstance(content, str) else "")[:280],
+        })
+    return {"previews": previews, "truncated": truncated}
+
+
 # --- domain roster lookup ---------------------------------------------------
 
 def validate_pubkeys_lookup_request(body):
@@ -2004,7 +2055,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in (
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
-            "/api/pubkeys/lookup", "/api/report/totals", "/api/report/walk",
+            "/api/profile/day", "/api/pubkeys/lookup", "/api/report/totals", "/api/report/walk",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2084,6 +2135,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "malformed pubkey"})
                 return
             self._send_json(200, build_profile_response(pubkey_hex))
+            return
+
+        if path == "/api/profile/day":
+            pubkey_hex, since, until, err = validate_profile_day_request(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            try:
+                self._send_json(200, compute_profile_day(pubkey_hex, since, until))
+            except Exception as e:
+                log(f"server86: profile day-events scan failed for {pubkey_hex}: {e}")
+                self._send_json(502, {"error": "day-events scan failed"})
             return
 
         if path == "/api/pubkeys/lookup":

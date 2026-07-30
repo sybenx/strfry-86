@@ -921,6 +921,59 @@ server86.run_strfry_count = _orig_run_strfry_count
 server86.run_strfry_scan = _orig_run_strfry_scan
 server86.resolve_profiles = _orig_resolve_profiles
 
+# validate_profile_day_request: the client sends a calendar date, never a
+# raw time window — [since, until) is computed HERE, server-side, as one
+# UTC day, so the client can never hand this endpoint an arbitrary span.
+day_pubkey = "7" * 64
+pk, since, until, err = server86.validate_profile_day_request({"pubkey": day_pubkey, "date": "1970-01-02"})
+check(pk == day_pubkey and since == 86400 and until == 86400 + 86400 and err is None,
+      "validate_profile_day_request turns a calendar date into an exact [since, until) UTC-day pair")
+
+_, _, _, err = server86.validate_profile_day_request({"pubkey": "not-hex", "date": "1970-01-02"})
+check(err is not None, "validate_profile_day_request rejects a malformed pubkey")
+
+_, _, _, err = server86.validate_profile_day_request({"pubkey": day_pubkey, "date": "01/02/1970"})
+check(err is not None, "validate_profile_day_request rejects a date not in YYYY-MM-DD form")
+
+_, _, _, err = server86.validate_profile_day_request({"pubkey": day_pubkey, "date": "2024-13-40"})
+check(err is not None, "validate_profile_day_request rejects a calendar date that doesn't exist")
+
+# compute_profile_day: same PROFILE_DAY_EVENTS_MAX bound and newest-first
+# sort as compute_profile's own previews, plus an explicit `truncated` flag
+# — a full day of events must never look like a complete one.
+_orig_run_strfry_scan_day = server86.run_strfry_scan
+scan_calls = []
+
+def _fake_day_scan(filt, timeout=None):
+    scan_calls.append(filt)
+    return [
+        {"kind": 1, "created_at": 100, "content": "first"},
+        {"kind": 1, "created_at": 300, "content": "third"},
+        {"kind": 7, "created_at": 200, "content": "x" * 400},
+    ]
+
+server86.run_strfry_scan = _fake_day_scan
+day_result = server86.compute_profile_day(day_pubkey, 86400, 172800)
+check(len(scan_calls) == 1
+      and scan_calls[0]["authors"] == [day_pubkey]
+      and scan_calls[0]["since"] == 86400 and scan_calls[0]["until"] == 172800
+      and scan_calls[0]["limit"] == server86.PROFILE_DAY_EVENTS_MAX,
+      "compute_profile_day scans with the exact [since, until) window and the PROFILE_DAY_EVENTS_MAX limit")
+check([ev["created_at"] for ev in day_result["previews"]] == [300, 200, 100],
+      "compute_profile_day sorts previews newest-first regardless of strfry's own return order")
+check(len(day_result["previews"][1]["content"]) == 280,
+      "compute_profile_day truncates preview content to 280 chars, same as compute_profile's previews")
+check(day_result["truncated"] is False, "compute_profile_day: truncated is False when under PROFILE_DAY_EVENTS_MAX")
+
+server86.run_strfry_scan = lambda filt, timeout=None: [
+    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.PROFILE_DAY_EVENTS_MAX)
+]
+day_result_full = server86.compute_profile_day(day_pubkey, 86400, 172800)
+check(day_result_full["truncated"] is True,
+      "compute_profile_day: truncated is True when the scan returns exactly PROFILE_DAY_EVENTS_MAX events")
+
+server86.run_strfry_scan = _orig_run_strfry_scan_day
+
 
 # --- Phase 5: POST /api/pubkeys/lookup (server86.py) ----------------------
 
