@@ -523,24 +523,23 @@ function runProfilePage() {
     previewsList.textContent = '';
     previews.forEach(function (ev) {
       var li = document.createElement('li');
-      // The whole entry links to njump when the server could encode the
-      // event's id (ev.note) — anchors nest inline content fine, so this
-      // needs no new CSS to read as one clickable line.
-      var wrap = ev.note ? document.createElement('a') : document.createElement('span');
+      // Only the kind label ("note"/"reply"/"kind 7"/...) links to njump —
+      // the date and content stay plain text, not part of the link.
+      var kindEl = ev.note ? document.createElement('a') : document.createElement('b');
       if (ev.note) {
-        wrap.href = 'https://njump.me/' + ev.note;
-        wrap.target = '_blank';
+        kindEl.href = 'https://njump.me/' + ev.note;
+        kindEl.target = '_blank';
+        kindEl.appendChild(s86El('b', eventKindLabel(ev)));
+      } else {
+        kindEl.textContent = eventKindLabel(ev);
       }
-      var kindB = document.createElement('b');
-      kindB.textContent = eventKindLabel(ev);
-      wrap.appendChild(kindB);
-      wrap.appendChild(document.createTextNode(' '));
-      wrap.appendChild(s86El('i', s86FormatDate(ev.created_at)));
+      li.appendChild(kindEl);
+      li.appendChild(document.createTextNode(' '));
+      li.appendChild(s86El('i', s86FormatDate(ev.created_at)));
       if (ev.content) {
-        wrap.appendChild(document.createTextNode(' — '));
-        wrap.appendChild(s86El('span', ev.content));
+        li.appendChild(document.createTextNode(' — '));
+        li.appendChild(s86El('span', ev.content));
       }
-      li.appendChild(wrap);
       previewsList.appendChild(li);
     });
   }
