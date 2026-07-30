@@ -27,6 +27,7 @@ Routes:
   POST /api/reason        -> NIP-98 authenticated: bulk-edit reason on existing bans
   POST /api/profile       -> NIP-98 authenticated: everything known about one pubkey
   POST /api/profile/day   -> NIP-98 authenticated: one pubkey's events on one UTC calendar day
+  POST /api/profile/new   -> NIP-98 authenticated: events newer than a given time, bounded
   POST /api/pubkeys/lookup -> NIP-98 authenticated: what's known about a domain's roster
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
 """
@@ -1825,6 +1826,47 @@ def compute_profile_day(pubkey_hex, since, until):
     return {"previews": previews, "truncated": truncated}
 
 
+def validate_profile_new_request(body):
+    """Return (pubkey_hex, since, error) for a POST /api/profile/new body.
+    `since` is the caller's own newest-known created_at PLUS ONE — an
+    exclusive lower bound the client computes so the boundary event it
+    already has is never double-counted — never a raw relative offset the
+    server would have to interpret."""
+    pubkey_hex = body.get("pubkey")
+    since = body.get("since")
+    if not is_hex64(pubkey_hex):
+        return None, None, "malformed pubkey"
+    if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+        return None, None, "malformed since (expected a non-negative integer)"
+    return pubkey_hex, since, None
+
+
+def compute_profile_new_events(pubkey_hex, since):
+    """Events with created_at >= `since`, bounded by PROFILE_EVENT_LIMIT —
+    the cheap alternative to a full compute_profile() recompute when the
+    profile page's '>' button is pressed at the latest day. Reuses
+    PROFILE_EVENT_LIMIT (the same bound compute_profile's own kind-tally
+    scan uses) as the definition of "one page": `truncated` is True when
+    that many new events exist, meaning the true count is unknown — there
+    could be more past the bound — and the caller must not treat
+    `kinds_delta`/`len(previews)` as exact in that case. When truncated is
+    False, every new event was actually read, so total_events and each
+    kinds[] entry can be incremented by an EXACT delta instead of
+    re-scanning the whole pubkey."""
+    events = run_strfry_scan(
+        {"authors": [pubkey_hex], "since": since, "limit": PROFILE_EVENT_LIMIT}, timeout=SCAN_TIMEOUT,
+    )
+    events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
+    truncated = len(events) >= PROFILE_EVENT_LIMIT
+    kinds_delta = {}
+    for ev in events:
+        kind = ev.get("kind")
+        if isinstance(kind, int):
+            kinds_delta[kind] = kinds_delta.get(kind, 0) + 1
+    previews = [_build_event_preview(ev) for ev in events]
+    return {"previews": previews, "truncated": truncated, "kinds_delta": kinds_delta}
+
+
 # --- domain roster lookup ---------------------------------------------------
 
 def validate_pubkeys_lookup_request(body):
@@ -2102,8 +2144,8 @@ class Handler(BaseHTTPRequestHandler):
         if path not in (
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
-            "/api/profile/day", "/api/pubkeys/lookup", "/api/report/totals", "/api/report/walk",
-            "/api/relay-url",
+            "/api/profile/day", "/api/profile/new", "/api/pubkeys/lookup", "/api/report/totals",
+            "/api/report/walk", "/api/relay-url",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2204,6 +2246,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log(f"server86: profile day-events scan failed for {pubkey_hex}: {e}")
                 self._send_json(502, {"error": "day-events scan failed"})
+            return
+
+        if path == "/api/profile/new":
+            pubkey_hex, since, err = validate_profile_new_request(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            try:
+                self._send_json(200, compute_profile_new_events(pubkey_hex, since))
+            except Exception as e:
+                log(f"server86: profile new-events scan failed for {pubkey_hex}: {e}")
+                self._send_json(502, {"error": "new-events scan failed"})
             return
 
         if path == "/api/pubkeys/lookup":

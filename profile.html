@@ -158,6 +158,9 @@ function runProfilePage() {
   var reporterNameResolutionInFlight = false;
   var dayView = null;          // {date, previews, truncated} or null (recent-events mode)
   var dayFetchInFlight = false;
+  var newestKnownCreatedAt = null;  // previews[0].created_at from the last full load — the
+                                     // exclusive lower bound checkForNewEvents() scans from
+  var newEventsCheckInFlight = false;
 
   function onLogin() {
     isAdmin = true;
@@ -184,6 +187,8 @@ function runProfilePage() {
           return;
         }
         profileData = result.body;
+        newestKnownCreatedAt = (profileData.previews && profileData.previews.length > 0)
+          ? profileData.previews[0].created_at : null;
         contentEl.style.display = '';
         renderProfile();
         maybeResolveNameExternally();
@@ -333,7 +338,8 @@ function runProfilePage() {
     var distinctReporters = {};
     (p.reports || []).forEach(function (r) { distinctReporters[r.reporter] = true; });
     var reporterCount = Object.keys(distinctReporters).length;
-    var text = 'lifetime events: ' + (p.total_events === null || p.total_events === undefined ? 'unknown' : p.total_events);
+    var text = 'lifetime events: ' + (p.total_events === null || p.total_events === undefined ? 'unknown' : p.total_events)
+      + (p._countsUncertain ? '?' : '');
     if (p.scan_count !== null && p.scan_count !== undefined) {
       text += ' — rank ' + p.scan_rank + ' in last author scan (' + p.scan_count + ' events in that window)';
     }
@@ -350,7 +356,7 @@ function runProfilePage() {
     var p = profileData;
     var entries = Object.keys(p.kinds || {}).map(function (k) { return [parseInt(k, 10), p.kinds[k]]; });
     entries.sort(function (a, b) { return b[1] - a[1]; });
-    var parts = entries.map(function (e) { return (KNOWN_KINDS[e[0]] || ('kind ' + e[0])) + ':' + e[1]; });
+    var parts = entries.map(function (e) { return (KNOWN_KINDS[e[0]] || ('kind ' + e[0])) + ':' + e[1] + (p._countsUncertain ? '?' : ''); });
     var prefix = 'kind breakdown (most recent ' + p.kinds_window + ' events'
       + (p.kinds_saturated ? ', not all ' + p.total_events : '') + '): ';
     kindsLine.textContent = prefix + (parts.length ? parts.join('  ') : 'none');
@@ -599,10 +605,9 @@ function runProfilePage() {
   // </> read back; it plays no part in which day comes next.
   //
   // '›' past the latest day doesn't fetch a future day — there's nothing
-  // there yet — it instead refreshes: jumps back to recent-events mode
-  // (which restamps the pickers to right now, see renderPreviews) and
-  // re-fetches the profile, so pressing '›' repeatedly at the front edge
-  // reads as "check for anything new" rather than a dead end.
+  // there yet — it instead checks for anything new since the last full
+  // load, via the cheap /api/profile/new path below, rather than paying
+  // for compute_profile()'s full three-scan recompute on every press.
   function stepDay(direction) {
     var dateStr = eventsDateInput.value;
     if (!dateStr) {
@@ -611,12 +616,63 @@ function runProfilePage() {
     }
     var todayStr = utcDateStr(Math.floor(Date.now() / 1000));
     if (direction > 0 && (!dayView || dayView.date >= todayStr)) {
-      eventsLoadStatus.textContent = 'checking for new events…';
-      dayView = null;
-      fetchProfile();
+      checkForNewEvents();
       return;
     }
     fetchDayView(addDaysToDateStr(dateStr, direction));
+  }
+
+  var PROFILE_PREVIEW_MAX_CLIENT = 20;   // mirrors server86.py's PROFILE_PREVIEW_MAX
+
+  // The cheap alternative to fetchProfile(): reads only events newer than
+  // the last-known one. When the server actually read every new event
+  // (truncated: false) total_events/kinds are bumped by an EXACT delta —
+  // no re-scan needed. When truncated is true there could be MORE new
+  // events past the bound, so the true delta is unknown; rather than
+  // apply a partial (and therefore misleading) delta, the stale counts
+  // are left as they are and marked with a trailing '?' by
+  // renderCounts()/renderKinds(), until a full reload (fetchProfile)
+  // gets a real number again and clears it.
+  function checkForNewEvents() {
+    if (!isAdmin || !profileData || newEventsCheckInFlight) {
+      return;
+    }
+    newEventsCheckInFlight = true;
+    eventsLoadStatus.textContent = 'checking for new events…';
+    var since = newestKnownCreatedAt != null ? newestKnownCreatedAt + 1 : 0;
+    s86SignAndPost('/api/profile/new', { pubkey: pubkeyHex, since: since })
+      .then(function (result) {
+        newEventsCheckInFlight = false;
+        if (!result.ok) {
+          eventsLoadStatus.textContent = 'failed to check for new events: ' + s86ErrMsg(result);
+          return;
+        }
+        var body = result.body;
+        if (body.truncated) {
+          profileData._countsUncertain = true;
+        } else {
+          if (profileData.total_events != null) {
+            profileData.total_events += body.previews.length;
+          }
+          Object.keys(body.kinds_delta).forEach(function (k) {
+            var kind = parseInt(k, 10);
+            profileData.kinds[kind] = (profileData.kinds[kind] || 0) + body.kinds_delta[k];
+          });
+        }
+        if (body.previews.length > 0) {
+          profileData.previews = body.previews.concat(profileData.previews).slice(0, PROFILE_PREVIEW_MAX_CLIENT);
+          newestKnownCreatedAt = body.previews[0].created_at;
+        }
+        dayView = null;
+        eventsLoadStatus.textContent = '';
+        renderCounts();
+        renderKinds();
+        renderPreviews();
+      })
+      .catch(function () {
+        newEventsCheckInFlight = false;
+        eventsLoadStatus.textContent = 'failed to check for new events';
+      });
   }
 
   eventsTimePrevBtn.addEventListener('click', function () { stepDay(-1); });

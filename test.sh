@@ -1032,6 +1032,66 @@ check(day_result_full["truncated"] is True,
 
 server86.run_strfry_scan = _orig_run_strfry_scan_day
 
+# validate_profile_new_request / compute_profile_new_events: the cheap
+# alternative to a full compute_profile() recompute for the profile page's
+# '>' button at the latest day — reads only events newer than a
+# client-supplied `since`, and reports whether it read ALL of them
+# (truncated: False) or hit PROFILE_EVENT_LIMIT (truncated: True), so the
+# client knows whether an exact counter delta is safe to apply.
+pk, since, err = server86.validate_profile_new_request({"pubkey": day_pubkey, "since": 500})
+check(pk == day_pubkey and since == 500 and err is None,
+      "validate_profile_new_request accepts a pubkey and a non-negative integer since")
+
+_, _, err = server86.validate_profile_new_request({"pubkey": "not-hex", "since": 500})
+check(err is not None, "validate_profile_new_request rejects a malformed pubkey")
+
+_, _, err = server86.validate_profile_new_request({"pubkey": day_pubkey, "since": -1})
+check(err is not None, "validate_profile_new_request rejects a negative since")
+
+_, _, err = server86.validate_profile_new_request({"pubkey": day_pubkey, "since": "500"})
+check(err is not None, "validate_profile_new_request rejects a since that isn't an int (no silent str->int coercion)")
+
+_, _, err = server86.validate_profile_new_request({"pubkey": day_pubkey})
+check(err is not None, "validate_profile_new_request rejects a missing since")
+
+_orig_run_strfry_scan_new = server86.run_strfry_scan
+new_scan_calls = []
+
+
+def _fake_new_scan(filt, timeout=None):
+    new_scan_calls.append(filt)
+    return [
+        {"kind": 1, "created_at": 500, "content": "a"},
+        {"kind": 1, "created_at": 600, "content": "b"},
+        {"kind": 7, "created_at": 550, "content": "+"},
+    ]
+
+
+server86.run_strfry_scan = _fake_new_scan
+new_result = server86.compute_profile_new_events(day_pubkey, 500)
+check(len(new_scan_calls) == 1
+      and new_scan_calls[0]["authors"] == [day_pubkey]
+      and new_scan_calls[0]["since"] == 500
+      and "until" not in new_scan_calls[0]
+      and new_scan_calls[0]["limit"] == server86.PROFILE_EVENT_LIMIT,
+      "compute_profile_new_events scans with since (no until) and the PROFILE_EVENT_LIMIT bound")
+check([ev["created_at"] for ev in new_result["previews"]] == [600, 550, 500],
+      "compute_profile_new_events sorts previews newest-first regardless of strfry's own return order")
+check(new_result["kinds_delta"] == {1: 2, 7: 1},
+      "compute_profile_new_events tallies kinds_delta from exactly the events it read")
+check(new_result["truncated"] is False,
+      "compute_profile_new_events: truncated is False when under PROFILE_EVENT_LIMIT")
+
+server86.run_strfry_scan = lambda filt, timeout=None: [
+    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.PROFILE_EVENT_LIMIT)
+]
+new_result_full = server86.compute_profile_new_events(day_pubkey, 500)
+check(new_result_full["truncated"] is True,
+      "compute_profile_new_events: truncated is True when the scan returns exactly PROFILE_EVENT_LIMIT events — "
+      "the caller must not trust kinds_delta/len(previews) as an exact count in this case")
+
+server86.run_strfry_scan = _orig_run_strfry_scan_new
+
 # _build_event_preview: reply detection (kind-1-only) and note1 id encoding
 # — shared by compute_profile and compute_profile_day so both previews
 # lists carry the same fields the profile page's events list renders.
@@ -1417,6 +1477,17 @@ try:
         check(False, "POST /api/relay-url without auth is rejected")
     except _urllib_error.HTTPError as e:
         check(e.code == 401, "POST /api/relay-url without a valid NIP-98 auth is rejected with 401, same as every other mutating endpoint")
+
+    _profile_new_req = _urllib_request.Request(
+        _base_url + "/api/profile/new",
+        data=json.dumps({"pubkey": "a" * 64, "since": 0}).encode("utf-8"),
+        method="POST", headers={"Content-Type": "application/json"},
+    )
+    try:
+        _urllib_request.urlopen(_profile_new_req, timeout=5)
+        check(False, "POST /api/profile/new without auth is rejected")
+    except _urllib_error.HTTPError as e:
+        check(e.code == 401, "POST /api/profile/new without a valid NIP-98 auth is rejected with 401 — it's dispatchable (not 404) but still admin-only")
 finally:
     _httpd.shutdown()
     _httpd_thread.join(timeout=5)
