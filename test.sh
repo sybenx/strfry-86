@@ -1032,6 +1032,35 @@ check(day_result_full["truncated"] is True,
 
 server86.run_strfry_scan = _orig_run_strfry_scan_day
 
+# _build_event_preview: reply detection (kind-1-only) and note1 id encoding
+# — shared by compute_profile and compute_profile_day so both previews
+# lists carry the same fields the profile page's events list renders.
+note_pubkey = "d" * 64
+note_id = "e" * 64
+preview_reply = server86._build_event_preview(
+    {"kind": 1, "created_at": 1, "content": "hi", "id": note_id, "tags": [["e", "f" * 64]]})
+check(preview_reply["reply"] is True, "_build_event_preview: a kind-1 event with an `e` tag is a reply")
+
+preview_note = server86._build_event_preview(
+    {"kind": 1, "created_at": 1, "content": "hi", "id": note_id, "tags": [["p", note_pubkey]]})
+check(preview_note["reply"] is False, "_build_event_preview: a kind-1 event with no `e` tag is not a reply")
+
+preview_other_kind = server86._build_event_preview(
+    {"kind": 7, "created_at": 1, "content": "+", "id": note_id, "tags": [["e", "f" * 64]]})
+check(preview_other_kind["reply"] is None,
+      "_build_event_preview: reply is null for any kind other than 1 — 'reply vs note' doesn't apply")
+
+check(preview_reply["note"] == server86.bech32.note_encode(note_id),
+      "_build_event_preview: note is the event id encoded as note1... via bech32.note_encode")
+preview_bad_id = server86._build_event_preview({"kind": 1, "created_at": 1, "content": "", "id": "not-hex", "tags": []})
+check(preview_bad_id["note"] is None,
+      "_build_event_preview: note is null when the event's id is missing or malformed")
+
+_note_hrp, _note_data = server86.bech32.bech32_decode(server86.bech32.note_encode(note_id))
+_note_roundtrip = server86.bech32.convertbits(_note_data, 5, 8, False)
+check(_note_hrp == "note" and bytes(_note_roundtrip).hex() == note_id,
+      "note_encode: produces a valid bech32 string with hrp 'note' that round-trips back to the same event id")
+
 
 # --- Phase 5: POST /api/pubkeys/lookup (server86.py) ----------------------
 

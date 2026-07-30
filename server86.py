@@ -1592,6 +1592,41 @@ def _report_type_for_target(tags, target_pubkey):
     return fallback
 
 
+def _build_event_preview(ev):
+    """One event summarized for a profile's events list — shared by
+    compute_profile's recent-events read and compute_profile_day's
+    windowed one, so the two previews lists are the exact same shape.
+    `reply` is only ever true/false for kind 1 (a NIP-10 reply/quote has
+    at least one `e` tag; a top-level note has none) and None for every
+    other kind, since 'reply vs note' is a kind-1-only distinction — the
+    client falls back to its own kind-name table otherwise. `note` is the
+    event's id as a note1... bech32 string so the client can link straight
+    to njump without decoding anything itself; None if the id is missing
+    or malformed."""
+    kind = ev.get("kind")
+    reply = None
+    if kind == 1:
+        tags = ev.get("tags")
+        reply = isinstance(tags, list) and any(
+            isinstance(tag, list) and len(tag) >= 1 and tag[0] == "e" for tag in tags
+        )
+    event_id = ev.get("id")
+    note = None
+    if isinstance(event_id, str) and is_hex64(event_id):
+        try:
+            note = bech32.note_encode(event_id)
+        except (ValueError, TypeError):
+            note = None
+    content = ev.get("content")
+    return {
+        "kind": kind,
+        "reply": reply,
+        "created_at": ev.get("created_at"),
+        "content": (content if isinstance(content, str) else "")[:280],
+        "note": note,
+    }
+
+
 def compute_profile(pubkey_hex):
     """Everything server86 can say about ONE pubkey from the local
     database: three subprocesses, each bounded by the single author or by
@@ -1639,12 +1674,7 @@ def compute_profile(pubkey_hex):
                     "lud16": _clean_profile_field(content.get("lud16")),
                 }
         for ev in events[:PROFILE_PREVIEW_MAX]:
-            content = ev.get("content")
-            previews.append({
-                "kind": ev.get("kind"),
-                "created_at": ev.get("created_at"),
-                "content": (content if isinstance(content, str) else "")[:280],
-            })
+            previews.append(_build_event_preview(ev))
     except Exception as e:
         log(f"server86: profile event scan failed for {pubkey_hex}: {e}")
         warnings.append("recent event scan failed")
@@ -1791,14 +1821,7 @@ def compute_profile_day(pubkey_hex, since, until):
     )
     events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
     truncated = len(events) >= PROFILE_DAY_EVENTS_MAX
-    previews = []
-    for ev in events:
-        content = ev.get("content")
-        previews.append({
-            "kind": ev.get("kind"),
-            "created_at": ev.get("created_at"),
-            "content": (content if isinstance(content, str) else "")[:280],
-        })
+    previews = [_build_event_preview(ev) for ev in events]
     return {"previews": previews, "truncated": truncated}
 
 

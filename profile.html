@@ -496,21 +496,40 @@ function runProfilePage() {
     eventsDateClearBtn.style.display = 'none';
   }
 
+  // A kind-1 event with at least one `e` tag is a reply/quote, not a
+  // top-level note — the server flags this as `reply` (true/false for
+  // kind 1, null for every other kind) since only it can see the tags.
+  function eventKindLabel(ev) {
+    if (ev.kind === 1 && ev.reply != null) {
+      return ev.reply ? 'reply' : 'note';
+    }
+    return KNOWN_KINDS[ev.kind] || ('kind ' + ev.kind);
+  }
+
   function renderPreviewList(previews, heading, note) {
     eventsHeading.textContent = heading;
     previewsNote.textContent = note;
     previewsList.textContent = '';
     previews.forEach(function (ev) {
       var li = document.createElement('li');
-      var kindB = document.createElement('b');
-      kindB.textContent = KNOWN_KINDS[ev.kind] || ('kind ' + ev.kind);
-      li.appendChild(kindB);
-      li.appendChild(document.createTextNode(' '));
-      li.appendChild(s86El('i', s86FormatDate(ev.created_at)));
-      if (ev.content) {
-        li.appendChild(document.createTextNode(' — '));
-        li.appendChild(s86El('span', ev.content));
+      // The whole entry links to njump when the server could encode the
+      // event's id (ev.note) — anchors nest inline content fine, so this
+      // needs no new CSS to read as one clickable line.
+      var wrap = ev.note ? document.createElement('a') : document.createElement('span');
+      if (ev.note) {
+        wrap.href = 'https://njump.me/' + ev.note;
+        wrap.target = '_blank';
       }
+      var kindB = document.createElement('b');
+      kindB.textContent = eventKindLabel(ev);
+      wrap.appendChild(kindB);
+      wrap.appendChild(document.createTextNode(' '));
+      wrap.appendChild(s86El('i', s86FormatDate(ev.created_at)));
+      if (ev.content) {
+        wrap.appendChild(document.createTextNode(' — '));
+        wrap.appendChild(s86El('span', ev.content));
+      }
+      li.appendChild(wrap);
       previewsList.appendChild(li);
     });
   }

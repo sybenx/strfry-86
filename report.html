@@ -303,6 +303,25 @@ relayUrlSaveBtn.addEventListener('click', function () {
 
 // --- § Gift wrap storage: recipients + subscribers, each its own endpoint -
 
+var RENDER_MAX_CLIENT = 500;
+
+// Beneath the counts table: the actual pubkeys, capped and clickable, same
+// shape s86BuildRecordDetailList already renders for a ban record's expand
+// arrow — name in bold when known, nip05 as plain text, npub always a link.
+function appendPubkeyList(container, rows, label) {
+  if (rows.length === 0) {
+    return;
+  }
+  if (label) {
+    container.appendChild(s86El('p', label));
+  }
+  var truncation = s86TruncateForRender(rows, RENDER_MAX_CLIENT);
+  container.appendChild(s86BuildRecordDetailList(truncation.shown));
+  if (truncation.truncatedCount > 0) {
+    container.appendChild(s86El('p', 'showing top ' + RENDER_MAX_CLIENT + ' of ' + truncation.totalCount));
+  }
+}
+
 var recipientsPanel = s86BuildScanPanel({
   heading: 'gift-wrap recipients',
   costText: 'reads the newest 250,000 gift-wrap events — a few seconds to a couple of minutes',
@@ -314,6 +333,7 @@ var recipientsPanel = s86BuildScanPanel({
       ['distinct recipients', record.recipients.length, ''],
       ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
     ]));
+    appendPubkeyList(container, record.recipients);
   }
 });
 
@@ -328,6 +348,8 @@ var subscribersPanel = s86BuildScanPanel({
       ['DM-inbox subscribers', record.subscribers.length, record.saturated ? 'SATURATED — floor, not a count' : ''],
       ['general relay-list subscribers', record.general_subscribers.length, '']
     ]));
+    appendPubkeyList(container, record.subscribers, 'DM-inbox subscribers:');
+    appendPubkeyList(container, record.general_subscribers, 'general relay-list subscribers:');
   },
   // Saturation is a REFUSAL of the exempt-purge command, not a label — a
   // saturated subscriber list is a FLOOR, so missing subscribers means

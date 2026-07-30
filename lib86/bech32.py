@@ -119,3 +119,16 @@ def npub_decode(npub):
     if decoded is None or len(decoded) != 32:
         raise ValueError("invalid npub payload length")
     return bytes(decoded).hex()
+
+
+def note_encode(event_id_hex):
+    """Encode a 64-char lowercase hex event id as a note1... bech32 string
+    (NIP-19's bare event-id form) — the shape njump.me/note1... expects for
+    linking straight to one event."""
+    raw = bytes.fromhex(event_id_hex)
+    if len(raw) != 32:
+        raise ValueError("event id must be 32 bytes")
+    data = convertbits(list(raw), 8, 5, True)
+    if data is None:
+        raise ValueError("bech32 conversion failed")
+    return bech32_encode("note", data)
