@@ -867,6 +867,60 @@ check(resp2["scan_rank"] is None and resp2["scan_count"] is None,
 server86.compute_profile = _orig_compute_profile
 server86.resolve_profiles = _orig_resolve_profiles
 
+# compute_profile: the reports-against list gets name/nip05 attached via a
+# single batched LOCAL resolve_profiles() call over the DISTINCT reporters
+# — never once per report row — and independent of the report scan itself,
+# so a resolve_profiles failure loses only the names, never the reports.
+reporter1 = "1" * 64
+reporter2 = "2" * 64
+profile_subject = "3" * 64
+
+def _fake_scan_for_profile(filt, timeout=None):
+    if filt.get("kinds") == [1984]:
+        return [
+            {"pubkey": reporter1, "kind": 1984, "content": "spam", "created_at": 10,
+             "tags": [["p", profile_subject, "spam"]]},
+            {"pubkey": reporter2, "kind": 1984, "content": "", "created_at": 20,
+             "tags": [["p", profile_subject]]},
+            {"pubkey": reporter1, "kind": 1984, "content": "again", "created_at": 30,
+             "tags": [["p", profile_subject]]},
+        ]
+    return []
+
+_orig_run_strfry_count = server86.run_strfry_count
+_orig_run_strfry_scan = server86.run_strfry_scan
+_orig_resolve_profiles = server86.resolve_profiles
+server86.run_strfry_count = lambda *a, **kw: 0
+server86.run_strfry_scan = _fake_scan_for_profile
+
+resolve_calls = []
+def _fake_resolve(pks):
+    resolve_calls.append(list(pks))
+    return {reporter1: {"name": "Alice", "nip05": "alice@example.com"}}
+server86.resolve_profiles = _fake_resolve
+
+result = server86.compute_profile(profile_subject)
+by_reporter = {}
+for r in result["reports"]:
+    by_reporter.setdefault(r["reporter"], []).append(r)
+check(len(resolve_calls) == 1 and sorted(resolve_calls[0]) == sorted([reporter1, reporter2]),
+      "compute_profile resolves reporters' name/nip05 with ONE batched call over the DISTINCT reporter set")
+check(all(r["name"] == "Alice" and r["nip05"] == "alice@example.com" for r in by_reporter[reporter1]),
+      "compute_profile attaches a resolved reporter's name/nip05 to EVERY one of their report rows")
+check(by_reporter[reporter2][0]["name"] is None and by_reporter[reporter2][0]["nip05"] is None,
+      "compute_profile leaves name/nip05 null for a reporter resolve_profiles has nothing for")
+
+def _raising_resolve(pks):
+    raise RuntimeError("boom")
+server86.resolve_profiles = _raising_resolve
+result2 = server86.compute_profile(profile_subject)
+check(len(result2["reports"]) == 3 and all(r["name"] is None and r["nip05"] is None for r in result2["reports"]),
+      "compute_profile keeps the reports list intact (name/nip05 null) when resolve_profiles itself raises")
+
+server86.run_strfry_count = _orig_run_strfry_count
+server86.run_strfry_scan = _orig_run_strfry_scan
+server86.resolve_profiles = _orig_resolve_profiles
+
 
 # --- Phase 5: POST /api/pubkeys/lookup (server86.py) ----------------------
 

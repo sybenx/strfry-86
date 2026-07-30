@@ -1649,10 +1649,30 @@ def compute_profile(pubkey_hex):
                 "report_type": _report_type_for_target(ev.get("tags"), pubkey_hex),
                 "content": content if isinstance(content, str) else "",
                 "created_at": ev.get("created_at"),
+                "name": None,
+                "nip05": None,
             })
     except Exception as e:
         log(f"server86: profile reports-against scan failed for {pubkey_hex}: {e}")
         warnings.append("reports-against scan failed")
+
+    # Local-only name/nip05 per distinct reporter — the same batched kind-0
+    # lookup (resolve_profiles) every other page uses, bounded by the
+    # reporters actually on this page (<= PROFILE_REPORT_LIMIT, well under
+    # NAME_RESOLVE_MAX). No outbound network access here; a reporter this
+    # leaves unresolved stays eligible for the client's button-triggered
+    # s86ResolveNamesExternally pass, same as authors.html's unresolved rows.
+    distinct_reporters = list(dict.fromkeys(r["reporter"] for r in reports))
+    if distinct_reporters:
+        try:
+            resolved_reporters = resolve_profiles(distinct_reporters)
+        except Exception as e:
+            log(f"server86: reporter name resolution failed for {pubkey_hex}: {e}")
+            resolved_reporters = {}
+        for r in reports:
+            info = resolved_reporters.get(r["reporter"]) or {}
+            r["name"] = info.get("name")
+            r["nip05"] = info.get("nip05")
 
     return {
         "total_events": total_events,

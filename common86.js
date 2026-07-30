@@ -1505,24 +1505,25 @@ function s86ResolveNamesExternally(pubkeys, callbacks) {
 // report) combined are ever rendered; older ones are dropped from view
 // and, for stored records, deleted from localStorage outright.
 
-// Returns {verb, name, nip05, suffix, npub, entries} — never a string, so
-// the caller can build <b>/text nodes per the untrusted-string rule instead
-// of merging attacker-influenced text into one opaque string. `entries` is
-// only set for a 2+-pubkey ban/unban record, where it feeds the expand-arrow
-// detail list in place of the (ambiguous, therefore omitted) single trailing
-// npub.
+// Returns {verb, name, nip05, suffix, npub, hex, entries} — never a string,
+// so the caller can build <b>/text nodes per the untrusted-string rule
+// instead of merging attacker-influenced text into one opaque string.
+// `entries` is only set for a 2+-pubkey ban/unban record, where it feeds the
+// expand-arrow detail list in place of the (ambiguous, therefore omitted)
+// single trailing npub. `hex` is the pubkey behind that single trailing
+// npub, so the caller can link it to this relay's own profile page.
 function s86RecordLabelParts(record) {
   if (record.type === 'reason') {
     return {
       verb: 'set reason on ' + record.count + ' ban' + (record.count === 1 ? '' : 's')
         + (record.entries ? '' : ' — undo unavailable'),
-      name: null, nip05: null, suffix: null, npub: null, entries: null
+      name: null, nip05: null, suffix: null, npub: null, hex: null, entries: null
     };
   }
   var verb = record.type === 'ban' ? 'banned' : 'unbanned';
   if (record.entries.length === 1) {
     var e = record.entries[0];
-    return { verb: verb, name: e.name || null, nip05: e.nip05 || null, suffix: null, npub: e.npub || e.pubkey, entries: null };
+    return { verb: verb, name: e.name || null, nip05: e.nip05 || null, suffix: null, npub: e.npub || e.pubkey, hex: e.pubkey, entries: null };
   }
   // A bulk ban has exactly one reason input for the whole batch, so every
   // entry carries the same value — show it once in the summary rather than
@@ -1536,7 +1537,7 @@ function s86RecordLabelParts(record) {
       suffix = ' — ' + reason;
     }
   }
-  return { verb: verb + ' ' + record.entries.length + ' pubkeys', name: null, nip05: null, suffix: suffix, npub: null, entries: record.entries };
+  return { verb: verb + ' ' + record.entries.length + ' pubkeys', name: null, nip05: null, suffix: suffix, npub: null, hex: null, entries: record.entries };
 }
 
 function s86AddRecord(record) {
@@ -1582,9 +1583,10 @@ function s86BuildLabelSpan(parts) {
 }
 
 // One row per pubkey for a multi-entry record's expand-arrow detail list:
-// name in <b> when known, nip05 as plain text after it, then the npub —
-// the same shape and the same createElement/textContent-only rule as every
-// other record line, since name/nip05 are attacker-influenced.
+// name in <b> when known, nip05 as plain text after it, then the npub,
+// linked to this relay's own profile page — same as the single-entry
+// record line's trailing npub. This list only ever renders inside
+// s86RenderRecords' admin-gated container, so isAdmin is always true here.
 function s86BuildRecordDetailList(entries) {
   var ul = document.createElement('ul');
   entries.forEach(function (e) {
@@ -1598,7 +1600,7 @@ function s86BuildRecordDetailList(entries) {
     if (e.nip05) {
       li.appendChild(document.createTextNode(e.nip05 + ' '));
     }
-    li.appendChild(document.createTextNode(e.npub || e.pubkey));
+    li.appendChild(s86NpubLink(e.npub || e.pubkey, e.pubkey, true));
     ul.appendChild(li);
   });
   return ul;
@@ -1677,11 +1679,14 @@ function s86BuildReasonEditRow(pubkeys, currentReason, callbacks) {
   return p;
 }
 
-// parts: {verb, name, nip05, suffix, npub, entries} — see
+// parts: {verb, name, nip05, suffix, npub, hex, entries} — see
 // s86RecordLabelParts. npub is omitted (no trailing element at all) when
-// null. `entries` (2+ pubkeys) replaces that omitted npub with a third
-// control, a ▸/▾ expand arrow revealing a detail list — the one exception
-// to a record line's normal two-touch-target rule.
+// null; when present it renders via s86NpubLink (isAdmin is always true
+// here — this whole component only renders inside s86RenderRecords' own
+// isAdmin gate), linking to this relay's profile page. `entries` (2+
+// pubkeys) replaces that omitted npub with a third control, a ▸/▾ expand
+// arrow revealing a detail list — the one exception to a record line's
+// normal two-touch-target rule.
 //
 // onUndo is optional — a null/undefined onUndo (the reason-record "undo
 // unavailable" case, once its snapshot exceeds S86_REASON_UNDO_MAX) omits
@@ -1724,7 +1729,7 @@ function s86BuildRecordLine(parts, onUndo, onDismiss) {
 
   if (parts.npub) {
     line.appendChild(document.createTextNode(' '));
-    line.appendChild(document.createTextNode(parts.npub));
+    line.appendChild(s86NpubLink(parts.npub, parts.hex, true));
   }
 
   wrap.appendChild(line);
@@ -1930,6 +1935,7 @@ function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
         nip05: ban.nip05 || null,
         suffix: ban.report_type ? ' — ' + ban.report_type : null,
         npub: ban.npub,
+        hex: ban.pubkey,
         entries: null
       };
       return s86BuildRecordLine(

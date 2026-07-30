@@ -269,7 +269,8 @@ function renderAuthors() {
       li.appendChild(s86El('span', a.nip05 + ' '));
     }
 
-    li.appendChild(s86El('span', a.npub + ' '));
+    li.appendChild(s86NpubLink(a.npub, a.pubkey, true));
+    li.appendChild(document.createTextNode(' '));
     li.appendChild(document.createTextNode('— ' + a.count + ' events'));
     if (a.reporters) {
       li.appendChild(document.createTextNode(' — reported by ' + a.reporters));

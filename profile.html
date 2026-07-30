@@ -20,10 +20,10 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 <button id="login-btn" type="button">Login with extension</button>
 <button id="theme-btn" type="button"></button>
 <p id="status"></p>
+<div id="profile-entry-container"></div>
 
 <div id="param-error-block" style="display:none">
   <p id="param-error"></p>
-  <div id="entry-fallback"></div>
 </div>
 
 <div id="content" style="display:none">
@@ -44,12 +44,12 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   <h2>Reports against this pubkey</h2>
   <p id="reports-count-line"></p>
   <ul id="reports-list"></ul>
+  <button id="lookup-reporter-names-btn" type="button" style="display:none"></button>
 
   <h2>Recent events</h2>
   <p id="previews-note"></p>
   <ul id="previews-list"></ul>
 
-  <div id="profile-entry-container"></div>
   <div id="command-block-container"></div>
 </div>
 
@@ -67,7 +67,6 @@ s86WireThemeToggle(document.getElementById('theme-btn'));
 var pageTitle = document.getElementById('page-title');
 var paramErrorBlock = document.getElementById('param-error-block');
 var paramErrorEl = document.getElementById('param-error');
-var entryFallback = document.getElementById('entry-fallback');
 var contentEl = document.getElementById('content');
 var npubTextEl = document.getElementById('npub-text');
 var njumpLink = document.getElementById('njump-link');
@@ -86,15 +85,21 @@ var previewsNote = document.getElementById('previews-note');
 var previewsList = document.getElementById('previews-list');
 var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
+var lookupReporterNamesBtn = document.getElementById('lookup-reporter-names-btn');
 
 function setStatus(text) {
   statusEl.textContent = text;
 }
 
+// Present up top regardless of login state or whether the URL param was
+// valid — pure client-side navigation, no signing involved, same as every
+// other page's copy of this field — so a bad/missing param never strands
+// the visitor with nothing but a login button.
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
+
 if (!pubkeyHex) {
   paramErrorEl.textContent = 'no valid npub or hex pubkey given — enter one below';
   paramErrorBlock.style.display = '';
-  entryFallback.appendChild(s86BuildProfileEntryField(statusEl));
 } else {
   runProfilePage();
 }
@@ -109,6 +114,8 @@ function runProfilePage() {
   var profileData = null;
   var attemptedExternalLookup = false;
   var nameResolutionInFlight = false;
+  var attemptedReporterLookup = new Set();
+  var reporterNameResolutionInFlight = false;
 
   function onLogin() {
     isAdmin = true;
@@ -167,9 +174,6 @@ function runProfilePage() {
     renderKinds();
     renderReports();
     renderPreviews();
-
-    profileEntryContainer.textContent = '';
-    profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 
     commandBlockContainer.textContent = '';
     commandBlockContainer.appendChild(s86BuildCommandGenerator({ pubkey: p.npub }));
@@ -323,7 +327,16 @@ function runProfilePage() {
     reportsList.textContent = '';
     reports.forEach(function (r) {
       var li = document.createElement('li');
-      li.appendChild(document.createTextNode(r.reporter_npub));
+      if (r.name) {
+        var b = document.createElement('b');
+        b.textContent = r.name;
+        li.appendChild(b);
+        li.appendChild(document.createTextNode(' '));
+      }
+      if (r.nip05) {
+        li.appendChild(document.createTextNode(r.nip05 + ' '));
+      }
+      li.appendChild(s86NpubLink(r.reporter_npub, r.reporter, true));
       if (r.report_type) {
         li.appendChild(document.createTextNode(' — '));
         li.appendChild(s86El('span', r.report_type));
@@ -336,7 +349,73 @@ function runProfilePage() {
       li.appendChild(s86El('i', s86FormatDate(r.created_at)));
       reportsList.appendChild(li);
     });
+
+    updateLookupReporterNamesButton();
   }
+
+  // Name/nip05 for each reporter is resolved locally and automatically —
+  // see resolve_profiles() server-side — so this button only ever concerns
+  // the reporters that local resolution left empty. Button-triggered, not
+  // automatic, same reasoning as authors.html's version: this set does not
+  // self-extinguish, so querying external relays on every profile load
+  // would mean an unbounded, unconsented outbound query per page view.
+  function unresolvedReporterPubkeys() {
+    var reports = (profileData && profileData.reports) || [];
+    var seen = {};
+    var out = [];
+    reports.forEach(function (r) {
+      if (r.name || r.nip05) {
+        return;
+      }
+      if (attemptedReporterLookup.has(r.reporter) || seen[r.reporter]) {
+        return;
+      }
+      seen[r.reporter] = true;
+      out.push(r.reporter);
+    });
+    return out;
+  }
+
+  function updateLookupReporterNamesButton() {
+    if (!isAdmin) {
+      lookupReporterNamesBtn.style.display = 'none';
+      return;
+    }
+    var pubkeys = unresolvedReporterPubkeys();
+    if (pubkeys.length === 0) {
+      lookupReporterNamesBtn.style.display = 'none';
+      return;
+    }
+    lookupReporterNamesBtn.style.display = '';
+    lookupReporterNamesBtn.textContent = 'look up names for the ' + pubkeys.length
+      + ' reporter(s) without one (queries external relays)';
+  }
+
+  lookupReporterNamesBtn.addEventListener('click', function () {
+    if (!isAdmin || reporterNameResolutionInFlight) {
+      return;
+    }
+    var pubkeys = unresolvedReporterPubkeys();
+    if (pubkeys.length === 0) {
+      return;
+    }
+    reporterNameResolutionInFlight = true;
+    lookupReporterNamesBtn.disabled = true;
+    pubkeys.forEach(function (pk) { attemptedReporterLookup.add(pk); });
+
+    s86ResolveNamesExternally(pubkeys, {
+      onDone: function () {
+        reporterNameResolutionInFlight = false;
+        lookupReporterNamesBtn.disabled = false;
+        fetchProfile();
+      },
+      onError: function (msg) {
+        reporterNameResolutionInFlight = false;
+        lookupReporterNamesBtn.disabled = false;
+        setStatus(msg);
+      }
+    });
+  });
 
   function renderPreviews() {
     var p = profileData;
