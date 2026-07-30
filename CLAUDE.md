@@ -219,17 +219,19 @@ reported itself as having run just now. Rules for it:
 
 - **A run that produced no usable result does not stamp `scanned_at` and does not replace
   the cache.** This is already the rule for a deadline hit; it now covers every failure,
-  including a precondition that was never satisfiable (`relay.info.url` unset, strfry binary
+  including a precondition that was never satisfiable (`relay_url` unset, strfry binary
   not found, `--count` returning non-numeric output). Add `error: <string|null>` to every
   cache record, distinct from `warning`: `warning` accompanies a result that IS rendered,
   `error` replaces one that is not.
-- **A failed run never renders as an age.** `could not run — relay.info.url is not set in
-  strfry.conf`, then, if a previous result exists, `last successful run 2026-07-22@09:14 UTC
-  (7 days ago)`. An operator must never have to work out that a timestamp describes a
-  failure.
+- **A failed run never renders as an age.** `could not run — relay_url is not set`, then, if
+  a previous result exists, `last successful run 2026-07-22@09:14 UTC (7 days ago)`. An
+  operator must never have to work out that a timestamp describes a failure.
 - **A precondition failure states the fix**, since it is the operator's to make:
-  `set relay.info.url in /config/strfry.conf and re-run`. Naming the file and the key is the
-  whole difference between a diagnostic and a shrug.
+  `relay_url is not set — set it from the admin page and re-run` — the fix is a field on the
+  same report page, not a file to go edit, since `relay_url` lives in `config.json` (set via
+  the "This relay's URL" field above the subscriber scan, POST `/api/relay-url`), never in
+  `strfry.conf`. Naming exactly where the fix happens is the whole difference between a
+  diagnostic and a shrug.
 
 **8. Each panel has exactly one slot for message text**, directly under the status line and
 above the figures. No renderer may echo `warning` or `error` into the result body. A message
@@ -446,8 +448,12 @@ nothing and turn saturation from an inference into a fact. The page states it in
 `subscriber scan hit its 50,000-event cap — the exempt purge command is unavailable until
 the cap is raised, because a floor cannot be used as an exemption list`.
 
-An unset `relay.info.url` is a `failed` run under Part 2, not a result: no `scanned_at`,
-no cache replacement, `error: "relay.info.url is not set in /config/strfry.conf"`.
+An unset `relay_url` is a `failed` run under Part 2, not a result: no `scanned_at`,
+no cache replacement, `error: "relay_url is not set — set it from the admin page and
+re-run"`. `relay_url` lives in `config.json` (GET/POST `/api/relay-url`, surfaced as a
+"This relay's URL" field on `/report`, right above the subscriber scan) — never in
+`strfry.conf`, which strfry itself never reads for this. See `get_relay_url` /
+`set_relay_url` / `validate_relay_url_input` in `server86.py`.
 
 ### `POST /api/report/totals` — replace the `gap_share` paragraph
 
@@ -591,7 +597,7 @@ nature, which is the bar the rest of the suite already meets.
   walk containing one kind at 27.9% yields `"stale"` and names that kind. Totals with no
   walk record never yields `"stale"`. This is the assertion that would have caught the false
   alarm before it shipped.
-- **`failed` is not `result`.** A subscriber scan with `relay.info.url` unset leaves
+- **`failed` is not `result`.** A subscriber scan with `relay_url` unset leaves
   `scanned_at` unchanged, leaves the previous cache byte-identical, sets `error`, and the
   rendered status line contains no timestamp attributable to the failed run. Same for a
   missing strfry binary and for `--count` returning non-numeric output.

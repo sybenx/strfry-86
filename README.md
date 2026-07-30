@@ -111,18 +111,7 @@ The `/domain` page answers a different question than a kind-0 `nip05` field does
 
 Two more bounded, background-scanned endpoints: `/api/recipients` tallies who's on the receiving end of your relay's gift wraps (NIP-17 DMs) — useful for storage/retention decisions, never a moderation signal — and `/api/subscribers` finds every pubkey whose DM relay list or general relay list actually names your relay. Results persist to `recipients-cache.json` and `subscribers-cache.json`, exactly like `authors-cache.json` — safe to delete at any time, rebuilt on the next scan.
 
-`/api/subscribers` needs to know your relay's own address, which strfry doesn't otherwise expose to itself. If you want it to work, add a `url` line inside the `info { }` block of `strfry.conf` by hand — it's not a standard NIP-11 field, so the updater will never add it for you:
-
-```
-relay {
-    info {
-        url = "wss://relay.example.com"
-        ...
-    }
-}
-```
-
-Without it, `/api/subscribers` returns an empty result and says why, rather than guessing.
+`/api/subscribers` needs to know your relay's own address, which strfry doesn't otherwise expose to itself. Set it on the `/report` page, in the "This relay's URL" field above the subscriber scan — it's stored in `config.json`, not `strfry.conf`, and strfry itself never reads it; this value exists purely so this admin page can host-match a kind-10050/10002 relay tag against your relay. Without it, `/api/subscribers` returns an empty result and says why, rather than guessing.
 
 Both scans feed the "Gift-wrap retention purge" intent in the terminal-commands block (see below): open it, and if either scan hasn't been run in the last 7 days you'll see a "scan now" button right there before it renders anything destructive. Once both are fresh, it renders a `strfry delete` filter that excludes your subscribers' gift wraps — never their messages, just everyone else's — alongside the blunter blanket form for comparison.
 

@@ -1042,51 +1042,51 @@ _relay_url_last_checked = None
 
 
 def get_relay_url():
-    """Best-effort read of a `url` field inside strfry.conf's `relay.info`
-    block. This is NOT a standard NIP-11 field — strfry ships only
-    name/description/pubkey/contact/icon/nips there — so it is absent
-    unless the operator adds it by hand (documented in README); callers
-    treat None as 'unconfigured' and return empty rather than guessing.
-    Re-read on strfry.conf mtime change, checked at most once per second,
-    same shape as get_contact_appeal()."""
+    """Best-effort read of config.json's `relay_url` — this relay's own
+    public address, needed only so /api/subscribers can tell whether a
+    kind-10050/10002 relay tag names THIS relay. strfry has no notion of
+    its own address and never reads this field; it's admin-page state,
+    set via POST /api/relay-url (see set_relay_url) rather than by hand-
+    editing strfry.conf. Re-read on config.json mtime change, checked at
+    most once per second, same shape as get_contact_appeal()."""
     global _relay_url_cache, _relay_url_mtime, _relay_url_last_checked
     now = time.monotonic()
     if _relay_url_last_checked is not None and (now - _relay_url_last_checked) < CONTACT_APPEAL_CHECK_INTERVAL:
         return _relay_url_cache
     _relay_url_last_checked = now
     try:
-        mtime = os.stat(STRFRY_CONF_PATH).st_mtime
+        mtime = os.stat(CONFIG_PATH).st_mtime
     except OSError:
         return _relay_url_cache
     if mtime == _relay_url_mtime:
         return _relay_url_cache
     _relay_url_mtime = mtime
     try:
-        with open(STRFRY_CONF_PATH, "r") as f:
-            lines = f.readlines()
-    except OSError:
-        return _relay_url_cache
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        value = cfg.get("relay_url")
+        _relay_url_cache = value if isinstance(value, str) and value.strip() else None
+    except (OSError, ValueError):
+        pass
+    return _relay_url_cache
 
-    in_info = False
-    depth = 0
-    url = None
-    for line in lines:
-        if line.strip().startswith("#"):
-            continue
-        if not in_info:
-            if re.match(r'^\s*info\s*\{', line):
-                in_info = True
-                depth = line.count("{") - line.count("}")
-            continue
-        depth += line.count("{") - line.count("}")
-        m = re.search(r'\burl\s*=\s*"([^"]*)"', line)
-        if m and m.group(1).strip():
-            url = m.group(1).strip()
-            break
-        if depth <= 0:
-            in_info = False
-    _relay_url_cache = url
-    return url
+
+def set_relay_url(value):
+    """Writes (or clears, when value is falsy) config.json's `relay_url`.
+    Admin-only — called from POST /api/relay-url, which sits behind the
+    blanket NIP-98 check in do_POST alongside every other mutating
+    endpoint. Forces the next get_relay_url() to re-read rather than wait
+    out CONTACT_APPEAL_CHECK_INTERVAL, so a save takes effect immediately
+    for the very next subscriber scan."""
+    global _relay_url_last_checked
+    with open(CONFIG_PATH, "r") as f:
+        cfg = json.load(f)
+    if value:
+        cfg["relay_url"] = value
+    else:
+        cfg.pop("relay_url", None)
+    _save_cache_atomic(CONFIG_PATH, cfg)
+    _relay_url_last_checked = None
 
 
 def compute_subscribers(progress_cb=None):
@@ -1116,7 +1116,7 @@ def compute_subscribers(progress_cb=None):
     relay_host = _hostname_of(relay_url)
     if relay_host is None:
         raise RuntimeError(
-            "relay.info.url is not set — add it to /config/strfry.conf and re-run"
+            "relay_url is not set — set it from the admin page and re-run"
         )
 
     counted = {}
@@ -1515,6 +1515,26 @@ def get_report_status():
         "totals": totals if (totals.get("scanned_at") is not None or totals.get("error") is not None) else None,
         "walk": walk if (walk.get("scanned_at") is not None or walk.get("error") is not None) else None,
     }
+
+
+def validate_relay_url_input(body):
+    """Return (value, error) for a POST /api/relay-url body. `value` is
+    None to CLEAR relay_url (an absent field or a blank/whitespace-only
+    string are both treated as 'clear', not as errors) or the trimmed
+    string to store. A non-string relay_url, or one with no parseable
+    hostname, is rejected outright rather than silently stored — a typo
+    that /api/subscribers can't match against anything is worse than the
+    'not set' state, since it reads as configured while quietly matching
+    nothing."""
+    raw = body.get("relay_url")
+    if raw is not None and not isinstance(raw, str):
+        return None, "relay_url must be a string"
+    value = raw.strip() if isinstance(raw, str) else ""
+    if not value:
+        return None, None
+    if not _hostname_of(value):
+        return None, "could not parse a hostname out of that URL"
+    return value, None
 
 
 def validate_authors_scan_mode(body):
@@ -2044,6 +2064,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_subscribers_status())
             return
 
+        if path == "/api/relay-url":
+            self._send_json(200, {"relay_url": get_relay_url()})
+            return
+
         if path == "/api/report":
             self._send_json(200, get_report_status())
             return
@@ -2056,6 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
             "/api/profile/day", "/api/pubkeys/lookup", "/api/report/totals", "/api/report/walk",
+            "/api/relay-url",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2100,6 +2125,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/subscribers":
             status = start_subscribers_scan()
             self._send_json(202, status)
+            return
+
+        if path == "/api/relay-url":
+            value, err = validate_relay_url_input(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            set_relay_url(value)
+            self._send_json(200, {"ok": True, "relay_url": get_relay_url()})
             return
 
         if path == "/api/report/totals":

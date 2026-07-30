@@ -469,6 +469,33 @@ mode, err = server86.validate_authors_scan_mode({"mode": "recent", "kinds": [1, 
 check(mode is None and err is not None, "validate_authors_scan_mode rejects a request-supplied kinds array")
 
 
+# --- validate_relay_url_input (POST /api/relay-url) ----------------------
+
+value, err = server86.validate_relay_url_input({"relay_url": "wss://relay.example.com"})
+check(value == "wss://relay.example.com" and err is None,
+      "validate_relay_url_input accepts a wss:// URL")
+
+value, err = server86.validate_relay_url_input({"relay_url": "  relay.example.com  "})
+check(value == "relay.example.com" and err is None,
+      "validate_relay_url_input accepts a bare hostname and trims whitespace")
+
+value, err = server86.validate_relay_url_input({})
+check(value is None and err is None,
+      "validate_relay_url_input treats a missing relay_url as 'clear', not an error")
+
+value, err = server86.validate_relay_url_input({"relay_url": "   "})
+check(value is None and err is None,
+      "validate_relay_url_input treats a blank/whitespace-only relay_url as 'clear', not an error")
+
+value, err = server86.validate_relay_url_input({"relay_url": 12345})
+check(value is None and err is not None,
+      "validate_relay_url_input rejects a non-string relay_url")
+
+value, err = server86.validate_relay_url_input({"relay_url": "://not a url"})
+check(value is None and err is not None,
+      "validate_relay_url_input rejects a string with no parseable hostname")
+
+
 # --- authors_scan_pubkeys / /api/names widened accept-bound --------------
 
 check(server86.authors_scan_pubkeys() == set(), "authors_scan_pubkeys is empty before any scan has run")
@@ -509,6 +536,13 @@ import tempfile as _tempfile
 _cache_tmpdir = _tempfile.mkdtemp()
 server86.RECIPIENTS_CACHE_PATH = os.path.join(_cache_tmpdir, "recipients-cache.json")
 server86.SUBSCRIBERS_CACHE_PATH = os.path.join(_cache_tmpdir, "subscribers-cache.json")
+
+# relay_url now lives in config.json, not strfry.conf — redirect CONFIG_PATH
+# too, same reasoning as the cache paths above: a test run must never write
+# into the repo's own config.json.
+server86.CONFIG_PATH = os.path.join(_cache_tmpdir, "config.json")
+with open(server86.CONFIG_PATH, "w") as f:
+    json.dump({"admin_pubkey_hex": "a" * 64}, f)
 
 # never-scanned skeleton shape
 _idle_job_fields = {"status": "idle", "started_at": None, "progress": None,
@@ -608,13 +642,37 @@ check(server86._hostname_of(None) is None and server86._hostname_of("") is None,
 
 _orig_run_strfry_count = server86.run_strfry_count
 
+# relay_url: config.json-backed (POST /api/relay-url, GET /api/relay-url),
+# replacing the old hand-edited strfry.conf `info.url` field entirely.
+check(server86.get_relay_url() is None,
+      "get_relay_url returns None before relay_url is ever set")
+
+server86.set_relay_url("wss://relay.example.com")
+check(server86.get_relay_url() == "wss://relay.example.com",
+      "set_relay_url writes relay_url, and get_relay_url reads it straight back")
+with open(server86.CONFIG_PATH) as f:
+    _cfg_after_set = json.load(f)
+check(_cfg_after_set.get("relay_url") == "wss://relay.example.com",
+      "set_relay_url persists relay_url into config.json itself")
+check(_cfg_after_set.get("admin_pubkey_hex") == "a" * 64,
+      "set_relay_url leaves the rest of config.json (admin_pubkey_hex) untouched")
+
+server86.set_relay_url(None)
+check(server86.get_relay_url() is None,
+      "set_relay_url(None) clears relay_url")
+with open(server86.CONFIG_PATH) as f:
+    check("relay_url" not in json.load(f),
+          "set_relay_url(None) removes the key from config.json rather than writing an empty string")
+
+_orig_get_relay_url = server86.get_relay_url
+
 server86.get_relay_url = lambda: None
 try:
     server86.compute_subscribers()
-    check(False, "compute_subscribers raises — never a fake-empty result — when relay.info.url is unconfigured")
+    check(False, "compute_subscribers raises — never a fake-empty result — when relay_url is unconfigured")
 except RuntimeError as e:
-    check("relay.info.url" in str(e), "compute_subscribers's precondition-failure message names relay.info.url")
-    check("strfry.conf" in str(e), "compute_subscribers's precondition-failure message states the fix location")
+    check("relay_url" in str(e), "compute_subscribers's precondition-failure message names relay_url")
+    check("admin page" in str(e), "compute_subscribers's precondition-failure message states the fix")
 
 dm_pubkey = "a" * 64
 general_pubkey = "b" * 64
@@ -1287,6 +1345,7 @@ server86.compute_authors = _orig_compute_authors
 # not a reimplementation of it.
 
 import threading as _threading
+import urllib.error as _urllib_error
 import urllib.request as _urllib_request
 from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
 
@@ -1308,6 +1367,27 @@ try:
         status_query, body_query = _get_bytes(route + "?d=../../../../etc/passwd&npub=../../../../etc/passwd")
         check(status_plain == 200 and status_query == 200 and body_plain == body_query,
               f"static route {route} serves IDENTICAL bytes with and without a query string containing '../' ({label})")
+
+    # /api/relay-url: GET is a public read (same stance as /api/authors,
+    # /api/recipients, /api/subscribers — only the mutating POST needs
+    # auth), reflecting whatever's currently in config.json. get_relay_url
+    # was monkeypatched to a lambda for the compute_subscribers tests above;
+    # restore the real one so this actually exercises config.json, not a stub.
+    server86.get_relay_url = _orig_get_relay_url
+    server86.set_relay_url("wss://relay.example.com")
+    status, body = _get_bytes("/api/relay-url")
+    check(status == 200 and json.loads(body) == {"relay_url": "wss://relay.example.com"},
+          "GET /api/relay-url is a public read reflecting the configured value")
+
+    _post_req = _urllib_request.Request(
+        _base_url + "/api/relay-url", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _urllib_request.urlopen(_post_req, timeout=5)
+        check(False, "POST /api/relay-url without auth is rejected")
+    except _urllib_error.HTTPError as e:
+        check(e.code == 401, "POST /api/relay-url without a valid NIP-98 auth is rejected with 401, same as every other mutating endpoint")
 finally:
     _httpd.shutdown()
     _httpd_thread.join(timeout=5)
