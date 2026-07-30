@@ -32,13 +32,6 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   <p>A safe gift-wrap retention purge needs both scans below: recipients, so the purge command can name whose gift wraps it would delete, and subscribers, so it can exempt the ones this relay is their own DM inbox for.</p>
 
   <div id="recipients-panel-container"></div>
-
-  <p>Needed below so the scan can tell whether a pubkey lists this relay.</p>
-  <p>
-    <input id="relay-url-input" type="text" placeholder="wss://relay.example.com">
-    <button id="relay-url-save-btn" type="button">Save</button>
-  </p>
-  <p id="relay-url-status"></p>
   <div id="subscribers-panel-container"></div>
 
   <div id="command-block-container"></div>
@@ -58,9 +51,6 @@ var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var authorPointerLine = document.getElementById('author-pointer-line');
-var relayUrlInput = document.getElementById('relay-url-input');
-var relayUrlSaveBtn = document.getElementById('relay-url-save-btn');
-var relayUrlStatus = document.getElementById('relay-url-status');
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -262,6 +252,24 @@ function loadAuthorPointer() {
 // --- § This relay's URL: config.json-backed, not strfry.conf -------------
 // Existing solely so /api/subscribers can host-match a kind-10050/10002
 // relay tag against THIS relay; strfry itself never reads this value.
+// Built here (not static HTML) so it can be spliced directly under the
+// subscribers panel's own heading rather than sitting in its own block.
+
+var relayUrlInput = document.createElement('input');
+relayUrlInput.type = 'text';
+relayUrlInput.placeholder = 'wss://relay.example.com';
+var relayUrlSaveBtn = document.createElement('button');
+relayUrlSaveBtn.type = 'button';
+relayUrlSaveBtn.textContent = 'Save';
+var relayUrlStatus = s86El('p', '');
+
+var relayUrlBlock = document.createElement('div');
+relayUrlBlock.appendChild(s86El('p', 'required for this scan'));
+var relayUrlRow = document.createElement('p');
+relayUrlRow.appendChild(relayUrlInput);
+relayUrlRow.appendChild(relayUrlSaveBtn);
+relayUrlBlock.appendChild(relayUrlRow);
+relayUrlBlock.appendChild(relayUrlStatus);
 
 function loadRelayUrl() {
   return fetch('/api/relay-url')
@@ -343,6 +351,9 @@ var subscribersPanel = s86BuildScanPanel({
 
 document.getElementById('recipients-panel-container').appendChild(recipientsPanel.el);
 document.getElementById('subscribers-panel-container').appendChild(subscribersPanel.el);
+// splice the relay-url field in right below the panel's own "DM-inbox
+// subscribers" <h3> — its first child — rather than above/below the panel.
+subscribersPanel.el.insertBefore(relayUrlBlock, subscribersPanel.el.children[1]);
 
 function fetchRecipients() { return fetch('/api/recipients').then(function (res) { return res.json(); }); }
 function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
