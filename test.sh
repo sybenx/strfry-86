@@ -1476,6 +1476,151 @@ else
     echo "SKIP: client-side rendering rules (node not found)"
 fi
 
+# --- strfry-86-updater.py: ensure_config() tops up a missing installer- ----
+# prompted field on UPDATE, not just on a fresh install ----------------------
+# contact_appeal was added to this project after its initial release, and
+# ensure_config() grew a special-cased "if contact_appeal missing, prompt
+# for it" block to top up existing installs — but that block only knew
+# about contact_appeal by name. INSTALLER_PROMPTED_FIELDS generalizes it: a
+# fresh install prompts for every field in that list, and an update tops up
+# whichever of those are missing from an EXISTING config.json — so the next
+# field added the way contact_appeal was doesn't need its own bespoke
+# top-up block remembered alongside it. Executes the real ensure_config(),
+# not a reimplementation, against a temp INSTALL_DIR.
+UPDATER_TEST_SCRIPT="$TESTDIR/updater_config_test.py"
+cat > "$UPDATER_TEST_SCRIPT" <<'PYEOF'
+import builtins
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+
+repo_root = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "strfry86_updater", os.path.join(repo_root, "strfry-86-updater.py"))
+updater = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(updater)
+
+ADMIN_HEX = "a" * 64
+
+
+def check(cond, name):
+    print(("PASS: " if cond else "FAIL: ") + name)
+
+
+def with_tmp_install_dir(fn):
+    tmpdir = tempfile.mkdtemp()
+    orig_install_dir = updater.INSTALL_DIR
+    orig_config_path = updater.CONFIG_JSON_PATH
+    orig_conf_path = updater.STRFRY_CONF_PATH
+    updater.INSTALL_DIR = tmpdir
+    updater.CONFIG_JSON_PATH = os.path.join(tmpdir, "config.json")
+    # Doesn't exist -> find_relay_info_pubkey() returns None -> manual-entry
+    # prompt path, so every scenario here drives input() deterministically.
+    updater.STRFRY_CONF_PATH = os.path.join(tmpdir, "strfry.conf")
+    try:
+        fn(tmpdir)
+    finally:
+        updater.INSTALL_DIR = orig_install_dir
+        updater.CONFIG_JSON_PATH = orig_config_path
+        updater.STRFRY_CONF_PATH = orig_conf_path
+
+
+def scenario_fresh(tmpdir):
+    inputs = iter([ADMIN_HEX, "npub1contactxxxx"])
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: True
+    builtins.input = lambda prompt="": next(inputs)
+    try:
+        status = updater.ensure_config()
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+    cfg = json.load(open(updater.CONFIG_JSON_PATH))
+    check(status == "created", "fresh install: ensure_config() reports 'created'")
+    check(cfg["admin_pubkey_hex"] == ADMIN_HEX, "fresh install: admin_pubkey_hex prompted and written")
+    check(cfg["contact_appeal"] == "npub1contactxxxx", "fresh install: contact_appeal prompted and written")
+    check(cfg["port"] == updater.DEFAULT_PORT and cfg["bind"] == updater.DEFAULT_BIND,
+          "fresh install: port/bind defaulted, never prompted")
+
+
+def scenario_missing_contact_only(tmpdir):
+    cfg_path = os.path.join(tmpdir, "config.json")
+    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0"}, open(cfg_path, "w"))
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: True
+    builtins.input = lambda prompt="": "someone@example.com"
+    try:
+        status = updater.ensure_config()
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+    cfg = json.load(open(cfg_path))
+    check(status == "contact_appeal added", "update: today's one known gap (missing contact_appeal alone) is topped up")
+    check(cfg["contact_appeal"] == "someone@example.com", "update: topped-up contact_appeal value is written")
+    check(cfg["admin_pubkey_hex"] == ADMIN_HEX, "update: pre-existing admin_pubkey_hex left untouched")
+
+
+def scenario_missing_both(tmpdir):
+    cfg_path = os.path.join(tmpdir, "config.json")
+    json.dump({"port": 8686, "bind": "0.0.0.0"}, open(cfg_path, "w"))
+    inputs = iter([ADMIN_HEX, "https://example.com/appeal"])
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: True
+    builtins.input = lambda prompt="": next(inputs)
+    try:
+        status = updater.ensure_config()
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+    cfg = json.load(open(cfg_path))
+    check("admin_pubkey_hex" in status and "contact_appeal" in status,
+          "update: a config missing BOTH installer-prompted fields tops up both, not just contact_appeal")
+    check(cfg["admin_pubkey_hex"] == ADMIN_HEX, "update: admin_pubkey_hex itself is topped up when missing")
+    check(cfg["contact_appeal"] == "https://example.com/appeal", "update: contact_appeal topped up in the same run")
+
+
+def scenario_nothing_missing(tmpdir):
+    cfg_path = os.path.join(tmpdir, "config.json")
+    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0", "contact_appeal": "x"}, open(cfg_path, "w"))
+    def boom(prompt=""):
+        raise AssertionError("input() must not be called when nothing is missing")
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: True
+    builtins.input = boom
+    try:
+        status = updater.ensure_config()
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+    check(status == "unchanged", "update: a complete config.json is reported unchanged and never prompted")
+
+
+def scenario_noninteractive(tmpdir):
+    cfg_path = os.path.join(tmpdir, "config.json")
+    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0"}, open(cfg_path, "w"))
+    def boom(prompt=""):
+        raise AssertionError("input() must not be called when stdin is not a tty")
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: False
+    builtins.input = boom
+    try:
+        status = updater.ensure_config()
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+    cfg = json.load(open(cfg_path))
+    check(status == "unchanged", "update: a missing field found non-interactively is left for the next run")
+    check("contact_appeal" not in cfg, "update: a non-interactive run never writes a guessed/blank value")
+
+
+with_tmp_install_dir(scenario_fresh)
+with_tmp_install_dir(scenario_missing_contact_only)
+with_tmp_install_dir(scenario_missing_both)
+with_tmp_install_dir(scenario_nothing_missing)
+with_tmp_install_dir(scenario_noninteractive)
+PYEOF
+UPDATER_OUTPUT="$(python3 "$UPDATER_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
+echo "$UPDATER_OUTPUT"
+UPDATER_FAIL_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^FAIL: ')"
+FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
+
 # --- report.html has no control bound to a page-assembled set ------------
 # Static-source check: every checkbox in this project (author-checkbox,
 # ban-checkbox, select-all, the command generator's exempt-subscribers

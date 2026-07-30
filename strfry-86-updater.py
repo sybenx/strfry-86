@@ -424,53 +424,86 @@ def prompt_contact_appeal():
     ).strip()
 
 
+def prompt_admin_pubkey():
+    """Ask for the admin pubkey, auto-detecting relay.info.pubkey from
+    strfry.conf as a one-keystroke default and falling back to manual entry
+    (looped until valid). Shared by ensure_config()'s fresh-install path and
+    its existing-config top-up path, so a config.json somehow missing this
+    key is asked for it exactly the same way a fresh install would be —
+    never a second, slightly-different prompt to maintain."""
+    found = find_relay_info_pubkey()
+    if found:
+        candidate_hex = None
+        try:
+            candidate_hex = parse_pubkey_input(found)
+        except ValueError:
+            candidate_hex = None
+        if candidate_hex:
+            try:
+                npub = npub_encode(candidate_hex)
+            except ValueError:
+                npub = candidate_hex
+            answer = input(
+                f"Found relay.info.pubkey {npub} in strfry.conf — use as admin? [Y/n] "
+            ).strip().lower()
+            if answer in ("", "y", "yes"):
+                return candidate_hex
+
+    admin_pubkey = None
+    while admin_pubkey is None:
+        raw = input("Enter admin pubkey (npub or 64-char hex): ").strip()
+        try:
+            admin_pubkey = parse_pubkey_input(raw)
+        except ValueError as e:
+            print(f"  invalid: {e}")
+    return admin_pubkey
+
+
+# Every piece of information a fresh install ever prompts the operator for,
+# as (key, prompt_fn) — the single list an update walks to top up whatever
+# an EXISTING config.json is missing. A field added here later (the way
+# contact_appeal was added after this project's initial release) is
+# automatically both asked on a fresh install and topped up on every
+# existing one — no second "if key not in cfg" block to remember to write
+# alongside it, the exact gap that left contact_appeal as a one-off special
+# case before this refactor.
+INSTALLER_PROMPTED_FIELDS = (
+    ("admin_pubkey_hex", prompt_admin_pubkey),
+    ("contact_appeal", prompt_contact_appeal),
+)
+
+
+def _write_config(cfg):
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    tmp_path = CONFIG_JSON_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_path, CONFIG_JSON_PATH)
+
+
 def ensure_config():
     if not os.path.exists(CONFIG_JSON_PATH):
-        admin_pubkey = None
-        found = find_relay_info_pubkey()
-        if found:
-            candidate_hex = None
-            try:
-                candidate_hex = parse_pubkey_input(found)
-            except ValueError:
-                candidate_hex = None
-            if candidate_hex:
-                try:
-                    npub = npub_encode(candidate_hex)
-                except ValueError:
-                    npub = candidate_hex
-                answer = input(
-                    f"Found relay.info.pubkey {npub} in strfry.conf — use as admin? [Y/n] "
-                ).strip().lower()
-                if answer in ("", "y", "yes"):
-                    admin_pubkey = candidate_hex
-
-        while admin_pubkey is None:
-            raw = input("Enter admin pubkey (npub or 64-char hex): ").strip()
-            try:
-                admin_pubkey = parse_pubkey_input(raw)
-            except ValueError as e:
-                print(f"  invalid: {e}")
-
-        contact_appeal = prompt_contact_appeal() if sys.stdin.isatty() else ""
-
-        cfg = {
-            "admin_pubkey_hex": admin_pubkey,
-            "port": DEFAULT_PORT,
-            "bind": DEFAULT_BIND,
-            "contact_appeal": contact_appeal,
-        }
-        os.makedirs(INSTALL_DIR, exist_ok=True)
-        tmp_path = CONFIG_JSON_PATH + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(cfg, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp_path, CONFIG_JSON_PATH)
-        print(f"config.json written with admin {npub_encode(admin_pubkey)}")
+        cfg = {"port": DEFAULT_PORT, "bind": DEFAULT_BIND}
+        for key, prompt_fn in INSTALLER_PROMPTED_FIELDS:
+            # contact_appeal is the one optional field — skip the prompt
+            # (blank, same as before) rather than blocking a non-interactive
+            # first run on it. admin_pubkey_hex has no such default and is
+            # always prompted, exactly as before this refactor.
+            if key == "contact_appeal" and not sys.stdin.isatty():
+                cfg[key] = ""
+            else:
+                cfg[key] = prompt_fn()
+        _write_config(cfg)
+        print(f"config.json written with admin {npub_encode(cfg['admin_pubkey_hex'])}")
         return "created"
 
-    # config.json already exists — the only thing we may do is top up a
-    # missing contact_appeal key. Every other key/value is left untouched.
+    # config.json already exists — top up whichever installer-prompted
+    # fields are missing from it (contact_appeal was the first; won't be
+    # the last) and leave every other key/value untouched. Requires a tty,
+    # same as a fresh install's own prompts — an unattended update just
+    # leaves the gap for the next interactive run rather than blocking or
+    # guessing a value.
     try:
         with open(CONFIG_JSON_PATH) as f:
             cfg = json.load(f)
@@ -478,19 +511,19 @@ def ensure_config():
         print(f"WARNING: failed to read existing config.json ({e}) — leaving it untouched.")
         return "unchanged"
 
-    if "contact_appeal" in cfg:
+    missing = [(key, prompt_fn) for key, prompt_fn in INSTALLER_PROMPTED_FIELDS if key not in cfg]
+    if not missing:
         return "unchanged"
-
     if not sys.stdin.isatty():
         return "unchanged"
 
-    cfg["contact_appeal"] = prompt_contact_appeal()
-    tmp_path = CONFIG_JSON_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(cfg, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp_path, CONFIG_JSON_PATH)
-    return "contact_appeal added"
+    added = []
+    for key, prompt_fn in missing:
+        print(f"config.json is missing {key!r} —")
+        cfg[key] = prompt_fn()
+        added.append(key)
+    _write_config(cfg)
+    return ", ".join(added) + " added"
 
 
 # --------------------------------------------------------------------------
