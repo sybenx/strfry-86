@@ -308,7 +308,11 @@ var RENDER_MAX_CLIENT = 500;
 // Beneath the counts table: the actual pubkeys, capped and clickable, same
 // shape s86BuildRecordDetailList already renders for a ban record's expand
 // arrow — name in bold when known, nip05 as plain text, npub always a link.
-function appendPubkeyList(container, rows, label) {
+// `countField`/`countUnit`, when given, append that row's own count after
+// the npub ("— 42 gift wraps") — the rows already arrive ranked highest
+// first (server-side sort), so truncating this array top-down is already
+// "top N by amount"; nothing here re-sorts.
+function appendPubkeyList(container, rows, label, countField, countUnit) {
   if (rows.length === 0) {
     return;
   }
@@ -316,7 +320,24 @@ function appendPubkeyList(container, rows, label) {
     container.appendChild(s86El('p', label));
   }
   var truncation = s86TruncateForRender(rows, RENDER_MAX_CLIENT);
-  container.appendChild(s86BuildRecordDetailList(truncation.shown));
+  if (countField) {
+    var ul = document.createElement('ul');
+    truncation.shown.forEach(function (r) {
+      var li = document.createElement('li');
+      if (r.name) {
+        li.appendChild(s86El('b', r.name + ' '));
+      }
+      if (r.nip05) {
+        li.appendChild(document.createTextNode(r.nip05 + ' '));
+      }
+      li.appendChild(s86NpubLink(r.npub || r.pubkey, r.pubkey, true));
+      li.appendChild(document.createTextNode(' — ' + r[countField].toLocaleString() + ' ' + countUnit));
+      ul.appendChild(li);
+    });
+    container.appendChild(ul);
+  } else {
+    container.appendChild(s86BuildRecordDetailList(truncation.shown));
+  }
   if (truncation.truncatedCount > 0) {
     container.appendChild(s86El('p', 'showing top ' + RENDER_MAX_CLIENT + ' of ' + truncation.totalCount));
   }
@@ -333,7 +354,7 @@ var recipientsPanel = s86BuildScanPanel({
       ['distinct recipients', record.recipients.length, ''],
       ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
     ]));
-    appendPubkeyList(container, record.recipients);
+    appendPubkeyList(container, record.recipients, null, 'count', 'gift wraps');
   }
 });
 
