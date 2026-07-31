@@ -204,6 +204,9 @@ pre#console-log:empty::before { content:"strfry console — read-only verbs only
 pre .good { color:oklch(.78 .1 145); }
 pre .bad { color:oklch(.72 .16 25); }
 pre .dim { color:oklch(.6 .01 60); }
+/* Console answer (stdout): the one number that matters after a scan --count.
+   Bold + good so it does not share weight with dimmed loguru leftovers. */
+pre .console-answer { font-weight:700; }
 .console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
 .console-row .prompt { font-family:var(--mono); color:var(--good); }
 .console-row input { flex:1; }

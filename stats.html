@@ -204,6 +204,9 @@ pre#console-log:empty::before { content:"strfry console — read-only verbs only
 pre .good { color:oklch(.78 .1 145); }
 pre .bad { color:oklch(.72 .16 25); }
 pre .dim { color:oklch(.6 .01 60); }
+/* Console answer (stdout): the one number that matters after a scan --count.
+   Bold + good so it does not share weight with dimmed loguru leftovers. */
+pre .console-answer { font-weight:700; }
 .console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
 .console-row .prompt { font-family:var(--mono); color:var(--good); }
 .console-row input { flex:1; }
@@ -845,9 +848,64 @@ function renderDecisionLog(events) {
 }
 
 // --- console ---------------------------------------------------------------
+// strfry prints useful answers on stdout and a loguru chatter on stderr
+// (CONFIG: Loading…, atexit, the column header). Dumping both and scrolling
+// to the bottom buries `1047820` under a page of INFO lines. On success we
+// keep the answer, drop pure loguru INFO, and scroll the answer into view.
 
-function appendConsole(text) {
-  consoleLog.textContent = (consoleLog.textContent ? consoleLog.textContent + '\n' : '') + text;
+function appendConsole(text, className) {
+  if (consoleLog.childNodes.length) {
+    consoleLog.appendChild(document.createTextNode('\n'));
+  }
+  var node;
+  if (className) {
+    node = document.createElement('span');
+    node.className = className;
+    node.textContent = text;
+    consoleLog.appendChild(node);
+  } else {
+    node = document.createTextNode(text);
+    consoleLog.appendChild(node);
+  }
+  return node;
+}
+
+function isLoguruNoiseLine(line) {
+  // loguru's own column header + each INFO/DEBUG record. WARN/ERROR stay.
+  if (/^date\s+time\s+/.test(line)) {
+    return true;
+  }
+  if (/^-{10,}\s*$/.test(line)) {
+    return true;
+  }
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} /.test(line)
+      && /\]\s*(INFO|DEBUG)\|/.test(line)) {
+    return true;
+  }
+  return false;
+}
+
+function filterConsoleStderr(stderr, ok) {
+  if (!stderr) {
+    return '';
+  }
+  // Failures keep the full stderr — that is where the reason lives.
+  if (!ok) {
+    return stderr.replace(/\s+$/, '');
+  }
+  return stderr.split('\n').filter(function (ln) {
+    return ln.trim() && !isLoguruNoiseLine(ln);
+  }).join('\n');
+}
+
+function scrollConsoleTo(node) {
+  // Bring the answer (or the last error line) into view near the top of the
+  // pre, not the absolute bottom after any leftover noise.
+  if (node && node.nodeType === 1) {
+    var top = node.offsetTop - 12;
+    consoleLog.scrollTop = Math.max(0, top);
+    return;
+  }
   consoleLog.scrollTop = consoleLog.scrollHeight;
 }
 
@@ -863,21 +921,34 @@ function runConsole(command) {
   s86SignAndPost('/api/console', { command: cmd })
     .then(function (result) {
       var body = result.body || {};
-      if (body.error && !body.ok) {
-        appendConsole('refused/error: ' + body.error);
+      var ok = !!body.ok;
+      var focus = null;
+      if (body.error && !ok) {
+        focus = appendConsole('refused/error: ' + body.error, 'bad');
       }
-      if (body.stdout) {
-        appendConsole(body.stdout);
+      var stdout = (body.stdout || '').replace(/\s+$/, '');
+      if (stdout) {
+        // The answer — bold/green so it is not the same weight as chatter.
+        focus = appendConsole(stdout, 'console-answer good');
       }
-      if (body.stderr) {
-        appendConsole(body.stderr);
+      var stderr = filterConsoleStderr(body.stderr || '', ok);
+      if (stderr) {
+        var errNode = appendConsole(stderr, ok ? 'dim' : 'bad');
+        if (!focus) {
+          focus = errNode;
+        }
       }
-      if (body.exit_code != null && body.ok) {
-        appendConsole('(exit ' + body.exit_code + ')');
+      // exit 0 is noise next to a successful count; non-zero is the signal.
+      if (body.exit_code != null && !ok) {
+        appendConsole('(exit ' + body.exit_code + ')', 'bad');
       }
+      if (!stdout && !stderr && ok) {
+        focus = appendConsole('(no output)', 'dim');
+      }
+      scrollConsoleTo(focus);
     })
     .catch(function () {
-      appendConsole('request failed');
+      scrollConsoleTo(appendConsole('request failed', 'bad'));
     });
 }
 
