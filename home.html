@@ -251,8 +251,11 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   <span id="live-pill"></span>
 </div>
 <div class="toolbar">
-  <input id="pubkey-filter" type="search" placeholder="filter by pubkey…" aria-label="filter by pubkey">
-  <select id="kind-filter" aria-label="filter by kind"><option value="">All kinds</option></select>
+  <input id="pubkey-filter" type="search" placeholder="filter by pubkey or content…" aria-label="filter by pubkey or content">
+  <select id="kind-filter" aria-label="filter by kind">
+    <option value="content" selected>Only kinds with content</option>
+    <option value="">All kinds</option>
+  </select>
 </div>
 <p id="status"></p>
 <p id="feed-age"></p>
@@ -322,7 +325,8 @@ function contentPreview(text) {
 
 // Rebuilt from whatever kinds the current buffer actually contains, so the
 // menu never offers a filter that would match nothing. The operator's
-// current choice survives the rebuild.
+// current choice survives the rebuild when that kind is still present;
+// special values "content" (default) and "" (all) always survive.
 function syncKindOptions(events) {
   var seen = {};
   events.forEach(function (ev) {
@@ -333,6 +337,9 @@ function syncKindOptions(events) {
   var kinds = Object.keys(seen).map(Number).sort(function (a, b) { return a - b; });
   var current = kindFilter.value;
   kindFilter.textContent = '';
+  var contentOpt = s86El('option', 'Only kinds with content');
+  contentOpt.value = 'content';
+  kindFilter.appendChild(contentOpt);
   var allOpt = s86El('option', 'All kinds');
   allOpt.value = '';
   kindFilter.appendChild(allOpt);
@@ -341,19 +348,33 @@ function syncKindOptions(events) {
     opt.value = String(k);
     kindFilter.appendChild(opt);
   });
-  kindFilter.value = seen[Number(current)] ? current : '';
+  if (current === 'content' || current === '') {
+    kindFilter.value = current;
+  } else if (seen[Number(current)]) {
+    kindFilter.value = current;
+  } else {
+    kindFilter.value = 'content';
+  }
+}
+
+function eventHasContent(ev) {
+  return typeof ev.content === 'string' && ev.content.trim().length > 0;
 }
 
 function matchesFilters(ev) {
   var kind = kindFilter.value;
-  if (kind !== '' && String(ev.kind) !== kind) {
+  if (kind === 'content') {
+    if (!eventHasContent(ev)) {
+      return false;
+    }
+  } else if (kind !== '' && String(ev.kind) !== kind) {
     return false;
   }
   var q = pubkeyFilter.value.trim().toLowerCase();
   if (!q) {
     return true;
   }
-  return [ev.pubkey, ev.npub].join(' ').toLowerCase().indexOf(q) !== -1;
+  return [ev.pubkey, ev.npub, ev.content || ''].join(' ').toLowerCase().indexOf(q) !== -1;
 }
 
 function renderFeed(data) {

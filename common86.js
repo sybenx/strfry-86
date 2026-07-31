@@ -190,6 +190,10 @@ function s86BuildIdentityDot(pubkeyHex) {
 // Name cell as the design draws it: identity dot, then the best label this
 // row has — display name, else nip-05, else a truncated npub — never a raw
 // 64-hex key, which is unreadable at row height.
+//
+// linkIt (admin): the label navigates to this relay's profile page.
+// Otherwise, if an npub is known, a click copies it — public viewers have no
+// profile page to open, and the full npub is what they need to paste elsewhere.
 function s86BuildIdentityCell(row, linkIt) {
   var td = s86El('td', null, 'identity');
   td.appendChild(s86BuildIdentityDot(row.pubkey));
@@ -202,7 +206,28 @@ function s86BuildIdentityCell(row, linkIt) {
   } else {
     var span = s86El('span', label);
     if (row.npub) {
-      span.title = row.npub;
+      span.title = row.npub + ' — click to copy';
+      span.style.cursor = 'pointer';
+      span.setAttribute('role', 'button');
+      span.tabIndex = 0;
+      var copyNpub = function () {
+        if (!(navigator.clipboard && navigator.clipboard.writeText)) {
+          return;
+        }
+        navigator.clipboard.writeText(row.npub).then(function () {
+          span.title = 'copied';
+          setTimeout(function () {
+            span.title = row.npub + ' — click to copy';
+          }, 1200);
+        }).catch(function () {});
+      };
+      span.addEventListener('click', copyNpub);
+      span.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          copyNpub();
+        }
+      });
     }
     td.appendChild(span);
   }
