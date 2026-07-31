@@ -4,24 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>strfry-86 — active authors</title>
+<title>strfry-86 — authors</title>
 <style>
 :root { color-scheme: light dark; }
 #theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
-body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
-li { overflow-wrap: anywhere; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+body { background: Canvas; color: CanvasText; max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li, pre { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; }
 @media (max-width: 600px) { body { font-size: 1.15em; } }
+header.s86-hdr { position: sticky; top: 0; background: Canvas; padding: 0.5em 0; z-index: 1; }
+header.s86-hdr a.s86-logo { text-decoration: none; color: inherit; }
+header.s86-hdr nav a { margin-right: 0.75em; }
 </style>
 </head>
 <body>
-<h1>strfry-86 — active authors</h1>
-<p><a href="/">← ban list</a> · <a href="/report">relay report</a></p>
-<button id="login-btn" type="button">Login with extension</button>
-<button id="theme-btn" type="button"></button>
+<h1>Authors</h1>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
-  <div id="profile-entry-container"></div>
   <div id="command-block-container"></div>
   <div id="records-list"></div>
   <p>
@@ -63,10 +62,9 @@ var sortDir = 'desc';
 var RENDER_MAX_CLIENT = 500;
 
 var statusEl = document.getElementById('status');
-var loginBtn = document.getElementById('login-btn');
-s86WireThemeToggle(document.getElementById('theme-btn'));
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
 var adminSection = document.getElementById('admin-section');
-var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var scanBtn = document.getElementById('scan-btn');
@@ -457,7 +455,6 @@ function onLogin() {
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 
-profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 s86WireFilter(filterInput, listEl);

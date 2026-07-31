@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
+<title>strfry-86 — audit</title>
+<style>
+:root { color-scheme: light dark; }
+#theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
+body { background: Canvas; color: CanvasText; max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li, pre { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+header.s86-hdr { position: sticky; top: 0; background: Canvas; padding: 0.5em 0; z-index: 1; }
+header.s86-hdr a.s86-logo { text-decoration: none; color: inherit; }
+header.s86-hdr nav a { margin-right: 0.75em; }
+</style>
+</head>
+<body>
+<h1>Audit</h1>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <p>Server-side log of recent admin actions. Undo is bounded by this log's retention and auth — not only this browser's localStorage.</p>
+  <p><input id="filter-input" type="search" placeholder="filter audit log" size="40"></p>
+  <div id="records-container"></div>
+</div>
+<script src="/common86.js"></script>
+<script>
+var adminPubkey = null;
+var isAdmin = false;
+var lastRecords = [];
+
+var statusEl = document.getElementById('status');
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
+var adminSection = document.getElementById('admin-section');
+var filterInput = document.getElementById('filter-input');
+var recordsContainer = document.getElementById('records-container');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function describeRecord(r) {
+  var n = (r.pubkeys && r.pubkeys.length) || r.count || 0;
+  if (r.type === 'ban') {
+    return 'banned ' + n + ' pubkey(s)';
+  }
+  if (r.type === 'unban') {
+    return 'unbanned ' + n + ' pubkey(s)';
+  }
+  if (r.type === 'reason') {
+    return 'set reason on ' + (r.count || n) + ' ban(s)';
+  }
+  return r.type || 'action';
+}
+
+function renderRecords(records) {
+  lastRecords = records || [];
+  recordsContainer.textContent = '';
+  if (lastRecords.length === 0) {
+    recordsContainer.appendChild(s86El('p', 'no audit records yet'));
+    return;
+  }
+  lastRecords.forEach(function (r) {
+    var p = document.createElement('p');
+    var when = r.at ? s86FormatDate(r.at) : 'unknown time';
+    p.appendChild(document.createTextNode(when + ' — ' + describeRecord(r)));
+    if (r.via) {
+      p.appendChild(document.createTextNode(' (' + r.via + ')'));
+    }
+    if (r.undone) {
+      p.appendChild(document.createTextNode(' — undone'));
+    } else if (r.type === 'ban' || r.type === 'unban' || (r.type === 'reason' && r.entries)) {
+      p.appendChild(document.createTextNode(' '));
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = 'Undo';
+      btn.title = 'undo';
+      btn.setAttribute('aria-label', 'undo');
+      btn.addEventListener('click', function () {
+        btn.disabled = true;
+        s86SignAndPost('/api/audit/undo', { id: r.id })
+          .then(function (result) {
+            if (!result.ok) {
+              setStatus('undo failed: ' + s86ErrMsg(result));
+              btn.disabled = false;
+              return;
+            }
+            setStatus('undone');
+            return loadAudit();
+          })
+          .catch(function () {
+            setStatus('undo failed');
+            btn.disabled = false;
+          });
+      });
+      p.appendChild(btn);
+    }
+    if (r.pubkeys && r.pubkeys.length) {
+      p.appendChild(document.createTextNode(' '));
+      p.appendChild(document.createTextNode(r.pubkeys.slice(0, 3).join(', ')
+        + (r.pubkeys.length > 3 ? ' +' + (r.pubkeys.length - 3) + ' more' : '')));
+    }
+    recordsContainer.appendChild(p);
+  });
+}
+
+function loadAudit() {
+  var q = filterInput.value.trim();
+  return s86SignAndPost('/api/audit', { q: q })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('failed to load audit: ' + s86ErrMsg(result));
+        return;
+      }
+      renderRecords(result.body.records || []);
+    })
+    .catch(function () {
+      setStatus('failed to load audit');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  loadAudit();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+filterInput.addEventListener('input', function () {
+  if (isAdmin) {
+    loadAudit();
+  }
+});
+
+fetch('/api/banned')
+  .then(function (res) { return res.json(); })
+  .then(function (data) {
+    adminPubkey = data.admin;
+    s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+  })
+  .catch(function () {});
+</script>
+</body>
+</html>

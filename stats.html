@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
+<title>strfry-86 — stats</title>
+<style>
+:root { color-scheme: light dark; }
+#theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
+body { background: Canvas; color: CanvasText; max-width: 40em; margin: 0 auto; padding: 0 1em; }
+li, pre { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; }
+@media (max-width: 600px) { body { font-size: 1.15em; } }
+header.s86-hdr { position: sticky; top: 0; background: Canvas; padding: 0.5em 0; z-index: 1; }
+header.s86-hdr a.s86-logo { text-decoration: none; color: inherit; }
+header.s86-hdr nav a { margin-right: 0.75em; }
+</style>
+</head>
+<body>
+<h1>Stats</h1>
+<p id="status"></p>
+<p id="baseline-line"></p>
+<div id="totals-container"></div>
+<div id="kinds-container"></div>
+<div id="gap-container"></div>
+<div id="terminal-section" style="display:none">
+  <h2>Terminal</h2>
+  <p>Allowlisted non-destructive verbs only: <code>info</code>, <code>scan --count …</code>, <code>sync --dry-run …</code>. Everything else is refused.</p>
+  <pre id="terminal-log"></pre>
+  <p>
+    <input id="terminal-input" type="text" size="50" placeholder="scan --count {}">
+    <button id="terminal-run" type="button">Run</button>
+  </p>
+</div>
+<script src="/common86.js"></script>
+<script>
+var KNOWN_KINDS = {
+  0: 'profile', 1: 'note', 5: 'deletion', 6: 'repost', 7: 'reaction',
+  1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt',
+  10002: 'relay list', 10050: 'DM relay list', 30023: 'long-form'
+};
+var POLL_MS = 15000;
+var adminPubkey = null;
+var isAdmin = false;
+var pollTimer = null;
+
+var statusEl = document.getElementById('status');
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
+var baselineLine = document.getElementById('baseline-line');
+var totalsContainer = document.getElementById('totals-container');
+var kindsContainer = document.getElementById('kinds-container');
+var gapContainer = document.getElementById('gap-container');
+var terminalSection = document.getElementById('terminal-section');
+var terminalLog = document.getElementById('terminal-log');
+var terminalInput = document.getElementById('terminal-input');
+var terminalRun = document.getElementById('terminal-run');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function kindLabel(kind) {
+  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+}
+
+function renderStats(data) {
+  totalsContainer.textContent = '';
+  kindsContainer.textContent = '';
+  gapContainer.textContent = '';
+
+  if (data.baseline_at != null && data.baseline_total != null) {
+    var line = 'baseline ' + s86FormatRelativeAge(data.baseline_at)
+      + ' (' + data.baseline_total.toLocaleString() + ' events)';
+    if (data.live_total != null && data.delta != null) {
+      var sign = data.delta >= 0 ? '+' : '';
+      line += ', ' + sign + data.delta.toLocaleString() + ' since (live '
+        + data.live_total.toLocaleString() + ')';
+    } else if (data.live_error) {
+      line += ' — live count unavailable: ' + data.live_error;
+    }
+    baselineLine.textContent = line;
+  } else {
+    baselineLine.textContent = 'no walk/totals baseline yet — run a full database walk on Report to establish one. Live count alone is not a baseline.';
+    if (data.live_total != null) {
+      baselineLine.textContent += ' Live total right now: ' + data.live_total.toLocaleString() + '.';
+    }
+  }
+
+  var totals = data.totals;
+  if (totals && totals.scanned_at != null) {
+    var nonGw = totals.total_events - totals.giftwrap_events;
+    totalsContainer.appendChild(s86BuildKeyValueTable([
+      ['all events', totals.total_events, ''],
+      ['gift wraps', totals.giftwrap_events, (totals.giftwrap_share * 100).toFixed(1) + '% of all'],
+      ['non-gift-wrap', nonGw, ''],
+      ['— in allowlist', totals.allowlist_events, ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap'],
+      ['— not in allowlist', totals.gap_events, (totals.gap_share * 100).toFixed(1) + '% of non-gift-wrap']
+    ]));
+    if (totals.gap_level === 'stale') {
+      gapContainer.appendChild(s86El('p', 'allowlist alarm: a single unlisted kind is large enough to act on — see Report.'));
+    } else if (totals.gap_level === 'notice') {
+      gapContainer.appendChild(s86El('p', 'allowlist covers '
+        + ((1 - totals.gap_share) * 100).toFixed(1)
+        + '% of non-gift-wrap; remaining share is long-tail shaped (see Report walk).'));
+    } else if (totals.gap_level === 'ok') {
+      gapContainer.appendChild(s86El('p', 'allowlist covers '
+        + ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap events.'));
+    }
+  }
+
+  var walk = data.walk;
+  if (walk && walk.kinds) {
+    var kindRows = Object.keys(walk.kinds).map(function (k) {
+      return [kindLabel(parseInt(k, 10)), walk.kinds[k]];
+    }).sort(function (a, b) { return b[1] - a[1]; });
+    if (kindRows.length) {
+      kindsContainer.appendChild(s86El('h2', 'Kinds (walk baseline)'));
+      kindsContainer.appendChild(s86BuildRankedFigureTable(kindRows, {
+        unit: 'kinds',
+        grandTotal: walk.events_read || null
+      }));
+    }
+  }
+}
+
+function loadStats() {
+  return fetch('/api/stats')
+    .then(function (res) { return res.json(); })
+    .then(renderStats)
+    .catch(function () { setStatus('failed to load stats'); });
+}
+
+function appendTerminal(text) {
+  terminalLog.textContent = (terminalLog.textContent ? terminalLog.textContent + '\n' : '') + text;
+  terminalLog.scrollTop = terminalLog.scrollHeight;
+}
+
+function runTerminal() {
+  if (!isAdmin) {
+    return;
+  }
+  var cmd = terminalInput.value.trim();
+  if (!cmd) {
+    return;
+  }
+  appendTerminal('> ' + cmd);
+  s86SignAndPost('/api/terminal', { command: cmd })
+    .then(function (result) {
+      var body = result.body || {};
+      if (body.error && !body.ok) {
+        appendTerminal('refused/error: ' + body.error);
+      }
+      if (body.stdout) {
+        appendTerminal(body.stdout);
+      }
+      if (body.stderr) {
+        appendTerminal(body.stderr);
+      }
+      if (body.exit_code != null && body.ok) {
+        appendTerminal('(exit ' + body.exit_code + ')');
+      }
+    })
+    .catch(function () {
+      appendTerminal('request failed');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  terminalSection.style.display = '';
+  setStatus('logged in as admin');
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+terminalRun.addEventListener('click', runTerminal);
+terminalInput.addEventListener('keydown', function (evt) {
+  if (evt.key === 'Enter') {
+    evt.preventDefault();
+    runTerminal();
+  }
+});
+
+fetch('/api/banned')
+  .then(function (res) { return res.json(); })
+  .then(function (data) {
+    adminPubkey = data.admin;
+    s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+  })
+  .catch(function () {});
+
+loadStats();
+pollTimer = setInterval(loadStats, POLL_MS);
+</script>
+</body>
+</html>
