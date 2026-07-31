@@ -122,6 +122,40 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Range shares the same chrome as settings buttons: ink border, 8px radius,
+   sans label weight. The native track is replaced so it does not look like a
+   browser default next to Save / Edit raw. */
+.field-control input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  flex:1; min-width:10em; max-width:18em; height:2.35em; margin:0;
+  font-family:var(--sans); font-size:.82rem; font-weight:600;
+  color:var(--ink); background:transparent;
+  border:1px solid var(--ink); border-radius:8px; cursor:pointer;
+  padding:0 .7em;
+}
+.field-control input[type="range"]::-webkit-slider-runnable-track {
+  height:2px; background:var(--rule); border-radius:1px;
+}
+.field-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width:1em; height:1em; margin-top:-.4em;
+  background:var(--ink); border:1px solid var(--ink); border-radius:4px;
+  cursor:pointer;
+}
+.field-control input[type="range"]::-moz-range-track {
+  height:2px; background:var(--rule); border:none; border-radius:1px;
+}
+.field-control input[type="range"]::-moz-range-thumb {
+  width:1em; height:1em;
+  background:var(--ink); border:1px solid var(--ink); border-radius:4px;
+  cursor:pointer;
+}
+.field-control .range-days {
+  font-family:var(--sans); font-size:.82rem; font-weight:600;
+  padding:.5em 1em; color:var(--ink); background:transparent;
+  border:1px solid var(--ink); border-radius:8px; min-width:5.5em;
+  text-align:center; white-space:nowrap;
+}
 textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.6;
            padding:1em; resize:vertical; background:var(--term-bg); color:var(--term-fg);
            border:1px solid var(--term-edge); border-radius:14px; }
@@ -266,11 +300,27 @@ function buildFieldRow(field, onDirty) {
   row.appendChild(label);
 
   var control;
+  var valueReadout = null;
+  var estimateEl = null;
+  var purgeBtn = null;
+  var purgeStatus = null;
   if (field.type === 'bool') {
     control = document.createElement('input');
     control.type = 'checkbox';
     control.checked = String(field.value) === 'true';
     control.className = 'toggle';
+  } else if (field.type === 'range') {
+    control = document.createElement('input');
+    control.type = 'range';
+    control.min = field.min != null ? field.min : 7;
+    control.max = field.max != null ? field.max : 30;
+    control.step = field.step != null ? field.step : 1;
+    control.value = field.value == null || field.value === '' ? control.max : String(field.value);
+    valueReadout = s86El('span', control.value + ' days', 'range-days');
+    estimateEl = s86El('p', 'estimating…', 'note');
+    purgeBtn = s86El('button', 'Purge now');
+    purgeBtn.type = 'button';
+    purgeStatus = s86El('span', '', 'muted');
   } else {
     control = document.createElement('input');
     control.type = field.type === 'int' ? 'number' : 'text';
@@ -282,7 +332,18 @@ function buildFieldRow(field, onDirty) {
   control.addEventListener('change', onDirty);
 
   var right = s86El('div', null, 'field-control');
-  right.appendChild(control);
+  if (field.type === 'range') {
+    var sliderRow = s86El('div', null, 'toolbar');
+    sliderRow.appendChild(control);
+    sliderRow.appendChild(valueReadout);
+    sliderRow.appendChild(purgeBtn);
+    sliderRow.appendChild(purgeStatus);
+    right.appendChild(sliderRow);
+    right.appendChild(estimateEl);
+    wireGiftwrapRetention(control, valueReadout, estimateEl, purgeBtn, purgeStatus);
+  } else {
+    right.appendChild(control);
+  }
   if (field.help) {
     right.appendChild(s86El('p', field.help, 'note'));
   }
@@ -290,58 +351,138 @@ function buildFieldRow(field, onDirty) {
   return row;
 }
 
+// Live estimate + Purge now for the gift-wrap retention slider. Event count
+// is an exact index --count; storage is proportional (delete/total × db
+// size) — labelled as an estimate so it is never mistaken for free-space
+// measurement.
+function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus) {
+  var estimateTimer = null;
+  var estimateSeq = 0;
+
+  function setDaysLabel() {
+    daysEl.textContent = slider.value + ' days';
+  }
+
+  function formatEstimate(est) {
+    if (!est || est.delete_events == null) {
+      return 'could not estimate';
+    }
+    var n = est.delete_events.toLocaleString();
+    var pct = est.event_share != null
+      ? ((est.event_share * 100).toFixed(est.event_share < 0.01 ? 2 : 1) + '% of all events')
+      : null;
+    var bytes = est.bytes_estimate != null ? s86FormatBytes(est.bytes_estimate) : null;
+    var parts = ['~' + n + ' gift wraps'];
+    if (pct) {
+      parts.push(pct);
+    }
+    if (bytes) {
+      parts.push('~' + bytes + ' freed (estimate)');
+    }
+    return parts.join(' · ');
+  }
+
+  function refreshEstimate() {
+    var days = parseInt(slider.value, 10);
+    var seq = ++estimateSeq;
+    estimateEl.textContent = 'estimating…';
+    s86SignAndPost('/api/giftwrap-retention/estimate', { days: days })
+      .then(function (result) {
+        if (seq !== estimateSeq) {
+          return;
+        }
+        if (!result.ok) {
+          estimateEl.textContent = 'estimate unavailable — ' + s86ErrMsg(result);
+          return;
+        }
+        estimateEl.textContent = formatEstimate(result.body);
+      })
+      .catch(function () {
+        if (seq !== estimateSeq) {
+          return;
+        }
+        estimateEl.textContent = 'estimate unavailable';
+      });
+  }
+
+  function scheduleEstimate() {
+    setDaysLabel();
+    if (estimateTimer) {
+      clearTimeout(estimateTimer);
+    }
+    estimateTimer = setTimeout(refreshEstimate, 250);
+  }
+
+  slider.addEventListener('input', scheduleEstimate);
+  setDaysLabel();
+  refreshEstimate();
+
+  purgeBtn.addEventListener('click', function () {
+    if (!isAdmin) {
+      return;
+    }
+    var days = parseInt(slider.value, 10);
+    if (!window.confirm(
+      'Delete all gift wraps older than ' + days + ' days now?\n'
+      + 'This runs immediately and cannot be undone from this UI.'
+    )) {
+      return;
+    }
+    purgeBtn.disabled = true;
+    purgeStatus.textContent = 'purging…';
+    s86SignAndPost('/api/giftwrap-retention/purge', { days: days })
+      .then(function (result) {
+        purgeBtn.disabled = false;
+        if (!result.ok) {
+          purgeStatus.textContent = 'failed — ' + s86ErrMsg(result);
+          return;
+        }
+        purgeStatus.textContent = 'purged gift wraps older than ' + days + ' days';
+        refreshEstimate();
+      })
+      .catch(function () {
+        purgeBtn.disabled = false;
+        purgeStatus.textContent = 'failed — request error';
+      });
+  });
+}
+
 function controlValue(control) {
   return control.type === 'checkbox' ? String(control.checked) : control.value;
 }
 
-function buildSection(container, target, title, subtitle, data) {
+function buildSection(container, target, title, data) {
   container.textContent = '';
 
   var head = s86El('div', null, 'page-head');
-  var titles = document.createElement('div');
-  titles.appendChild(s86El('h2', title));
-  titles.appendChild(s86El('p', subtitle, 'muted'));
-  head.appendChild(titles);
+  head.appendChild(s86El('h2', title));
   var modeBtn = s86El('button', 'Edit raw');
   modeBtn.type = 'button';
   head.appendChild(modeBtn);
   container.appendChild(head);
 
-  // Where this file was found, and how — the whole point of the line. A relay
-  // has no fixed config location, and reading the wrong one is silent: strfry
-  // opens whatever database THAT file names, so every scan comes back
-  // confident and wrong.
-  if (data.source || data.detected || data.candidates) {
-    var prov = s86El('p', null, 'muted');
-    if (data.path) {
-      prov.appendChild(s86El('span', data.path, 'mono'));
-      prov.appendChild(document.createTextNode(
-        ' — ' + ({
-          'config.json': 'set explicitly below',
-          'relay process': 'read from the running relay\'s own --config argument',
-          'default location': 'found at a default location; the relay is not running, or its --config was unreadable'
-        }[data.source] || 'source unknown')
-      ));
-    } else {
-      prov.appendChild(document.createTextNode('not found. Tried: '));
-      prov.appendChild(s86El('span', (data.candidates || []).join(', '), 'mono'));
-    }
-    container.appendChild(prov);
-    if (data.detected && data.source !== 'relay process') {
-      var det = s86El('p', 'The running relay was started with ', 'muted');
-      det.appendChild(s86El('span', data.detected, 'mono'));
-      det.appendChild(document.createTextNode('.'));
-      container.appendChild(det);
-    }
-    if (data.warning) {
-      container.appendChild(s86El('p', data.warning));
-    }
+  // Path only in the happy path. Narrate source only when something is
+  // wrong or ambiguous (not found, path mismatch, not writable).
+  if (data.path) {
+    container.appendChild(s86El('p', data.path, 'mono muted'));
+  } else if (data.candidates && data.candidates.length) {
+    var miss = s86El('p', 'not found — tried ', 'muted');
+    miss.appendChild(s86El('span', data.candidates.join(', '), 'mono'));
+    container.appendChild(miss);
+  }
+  if (data.warning) {
+    container.appendChild(s86El('p', data.warning));
+  }
+  if (data.writable === false && data.path && !data.error) {
+    container.appendChild(s86El('p', 'readable, not writable'));
   }
 
   if (data.error) {
-    container.appendChild(s86El('p', 'could not read it — ' + data.error));
-    container.appendChild(s86El('p', 'Set "strfry.conf path" under Admin console below, then reload. '
-      + 'Nothing on this page will write until it can read first.'));
+    container.appendChild(s86El('p', data.error));
+    if (target === 'relay') {
+      container.appendChild(s86El('p',
+        'Set strfry.conf path under Admin console, then reload.', 'muted'));
+    }
     return;
   }
 
@@ -391,14 +532,11 @@ function buildSection(container, target, title, subtitle, data) {
   });
   container.appendChild(structured);
 
-  rawWrap.appendChild(s86El('p',
-    'Editing raw config directly bypasses the per-field validation above — the structured controls are the recommended path.',
-    'muted'));
   var textarea = document.createElement('textarea');
   textarea.rows = 22;
   textarea.value = data.raw || '';
   textarea.spellcheck = false;
-  textarea.setAttribute('aria-label', 'raw contents of ' + data.path);
+  textarea.setAttribute('aria-label', 'raw contents of ' + (data.path || title));
   textarea.addEventListener('input', function () {
     saveBtn.disabled = textarea.value === (data.raw || '');
     statusLine.textContent = saveBtn.disabled ? '' : 'unsaved changes';
@@ -452,8 +590,7 @@ function buildSection(container, target, title, subtitle, data) {
         }
         var changed = result.body.changed || [];
         statusLine.textContent = changed.length
-          ? ('saved ' + changed.length + ' change' + (changed.length === 1 ? '' : 's')
-             + (target === 'relay' ? ' — strfry re-reads its config on its own' : ''))
+          ? ('saved ' + changed.length + ' change' + (changed.length === 1 ? '' : 's'))
           : (result.body.note || 'no field differed');
         return loadSettings();
       })
@@ -465,16 +602,8 @@ function buildSection(container, target, title, subtitle, data) {
 }
 
 function render() {
-  buildSection(
-    document.getElementById('relay-section'), 'relay',
-    'Relay', 'strfry.conf — the relay reads this file itself; saving does not restart anything',
-    payload.relay
-  );
-  buildSection(
-    document.getElementById('app-section'), 'app',
-    'Admin console', 'config.json — this admin UI\'s own settings',
-    payload.app
-  );
+  buildSection(document.getElementById('relay-section'), 'relay', 'Relay', payload.relay);
+  buildSection(document.getElementById('app-section'), 'app', 'Admin console', payload.app);
 }
 
 function loadSettings() {

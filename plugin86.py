@@ -139,6 +139,15 @@ def spawn_server():
         log(f"plugin86: failed to spawn server86: {e}")
 
 
+# NIP-16 ephemeral kinds (20000–29999) are intentionally NOT rejected here.
+# strfry only broadcasts events that pass the write policy and are written;
+# a plugin reject would also kill live fan-out to open WebSocket subscriptions.
+# strfry itself marks those kinds with expiration=1, serves them to matching
+# REQs, and RelayCron deletes them after events.ephemeralEventsLifetimeSeconds
+# (default 300). That is the supported "do not keep" path in this stack —
+# not a write-policy reject.
+
+
 def process_event(event, admin_pubkey):
     event_id = event.get("id")
     pubkey = event.get("pubkey")

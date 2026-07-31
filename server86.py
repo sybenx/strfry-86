@@ -423,14 +423,12 @@ def strfry_conf_status():
         status.update({"path": override, "source": "config.json",
                        "exists": os.path.isfile(override)})
         if not status["exists"]:
-            status["error"] = (f"strfry_conf_path in config.json points at {override}, "
-                               "which does not exist")
+            status["error"] = f"{override} does not exist"
         elif detected and os.path.realpath(detected) != os.path.realpath(override):
             # Not an error — an operator may deliberately point here — but it
             # is exactly the situation that produces figures from the wrong
             # database, so it is never left unsaid.
-            status["error"] = (f"the running relay was started with {detected}, "
-                               f"not the {override} configured here")
+            status["error"] = f"relay is using {detected}, not this file"
         return status
 
     if detected and os.path.isfile(detected):
@@ -441,14 +439,11 @@ def strfry_conf_status():
         if os.path.isfile(candidate):
             status.update({"path": candidate, "source": "default location", "exists": True})
             if detected:
-                status["error"] = (f"the running relay was started with {detected}, "
-                                   f"which is not readable from here; using {candidate}")
+                status["error"] = f"relay is using {detected}, not this file"
             return status
 
     status.update({"path": detected, "source": None, "exists": False})
-    status["error"] = ("no strfry.conf found — the relay is not running with a readable "
-                       "--config, and none of " + ", ".join(STRFRY_CONF_CANDIDATES)
-                       + " exists. Set strfry_conf_path in Settings.")
+    status["error"] = "no strfry.conf found"
     return status
 
 
@@ -747,6 +742,105 @@ def _live_poll_loop():
         except Exception as e:
             log(f"server86: live poll tick failed: {type(e).__name__}: {e}")
         time.sleep(LIVE_POLL_INTERVAL)
+
+
+def clamp_giftwrap_retention_days(days):
+    """Coerce a client-supplied day count into [MIN, MAX]. None → default."""
+    if days is None or days == "":
+        return GIFTWRAP_RETENTION_DEFAULT
+    try:
+        n = int(days)
+    except (TypeError, ValueError):
+        return GIFTWRAP_RETENTION_DEFAULT
+    return max(GIFTWRAP_RETENTION_MIN, min(GIFTWRAP_RETENTION_MAX, n))
+
+
+def giftwrap_retention_filter(now=None, days=None):
+    """Filter object for the automatic kind-1059 age purge. Pure function so
+    tests can pin `now` and `days` without a live config or clock."""
+    days = clamp_giftwrap_retention_days(days if days is not None else get_giftwrap_retention_days())
+    if now is None:
+        now = int(time.time())
+    return {"kinds": [1059], "until": int(now) - int(days) * 86400}
+
+
+def estimate_giftwrap_retention(days, now=None):
+    """How many kind-1059 events a purge at `days` would delete, plus a
+    proportional storage estimate. Event count is exact (index --count);
+    bytes are estimated as delete_count/total × db_bytes — gift wraps are
+    not uniform in size, so this is a planning figure, not a promise."""
+    days = clamp_giftwrap_retention_days(days)
+    filt = giftwrap_retention_filter(now=now, days=days)
+    delete_count = run_strfry_count(filt)
+    totals = (get_report_status().get("totals") or {})
+    total_events = totals.get("total_events")
+    if total_events is None:
+        total_events = run_strfry_count({})
+    giftwrap_events = totals.get("giftwrap_events")
+    if giftwrap_events is None:
+        giftwrap_events = run_strfry_count({"kinds": [1059]})
+    db_bytes, _ = _strfry_db_bytes()
+    event_share = (delete_count / total_events) if total_events else None
+    giftwrap_share = (delete_count / giftwrap_events) if giftwrap_events else None
+    bytes_est = int(db_bytes * event_share) if db_bytes is not None and event_share is not None else None
+    return {
+        "days": days,
+        "until": filt["until"],
+        "delete_events": delete_count,
+        "total_events": total_events,
+        "giftwrap_events": giftwrap_events,
+        "event_share": event_share,
+        "giftwrap_share": giftwrap_share,
+        "bytes_estimate": bytes_est,
+        "db_bytes": db_bytes,
+        "estimate_note": "storage is proportional to event count, not measured free space",
+    }
+
+
+def run_giftwrap_retention_purge(days=None):
+    """Delete kind-1059 events older than the retention window. `days`
+    overrides the saved setting (Purge now on Settings); the hourly loop
+    leaves it None and uses config. Blanket form — no subscriber exemption.
+    Failures are returned (and logged) so a stuck delete never kills the
+    server process."""
+    days = clamp_giftwrap_retention_days(days if days is not None else get_giftwrap_retention_days())
+    try:
+        strfry_bin = require_strfry_bin()
+        conf = require_strfry_conf()
+    except RuntimeError as e:
+        log(f"server86: giftwrap retention skipped: {e}")
+        return False, str(e)
+    filt = giftwrap_retention_filter(days=days)
+    filter_json = json.dumps(filt, separators=(",", ":"))
+    argv = [strfry_bin, "--config", conf, "delete", "--filter", filter_json]
+    try:
+        result = subprocess.run(
+            argv, cwd=get_relay_cwd(), capture_output=True,
+            timeout=GIFTWRAP_RETENTION_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"server86: giftwrap retention timed out after {GIFTWRAP_RETENTION_TIMEOUT}s")
+        return False, "timeout"
+    except Exception as e:
+        log(f"server86: giftwrap retention failed: {type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", "replace")[-300:]
+        log(f"server86: giftwrap retention exit {result.returncode}: {err}")
+        return False, err or f"exit {result.returncode}"
+    log(f"server86: giftwrap retention ok (until={filt['until']}, days={days})")
+    return True, None
+
+
+def _giftwrap_retention_loop():
+    # First pass waits a full interval so a restart storm cannot pile up
+    # concurrent deletes against a just-starting LMDB.
+    while True:
+        time.sleep(GIFTWRAP_RETENTION_INTERVAL)
+        try:
+            run_giftwrap_retention_purge()
+        except Exception as e:
+            log(f"server86: giftwrap retention loop: {type(e).__name__}: {e}")
 
 
 def live_subscribe():
@@ -1414,6 +1508,15 @@ def write_strfry_conf(text):
 # structured view can only offer what the parser recognised and the operator
 # must always be able to reach the rest.
 
+# Gift-wrap auto-retention. Default keeps kind-1059 for 30 days; the Settings
+# slider only goes as aggressive as 7 days (never shorter — a mis-click must
+# not empty the DM inbox of every subscriber overnight).
+GIFTWRAP_RETENTION_DEFAULT = 30
+GIFTWRAP_RETENTION_MIN = 7
+GIFTWRAP_RETENTION_MAX = 30
+GIFTWRAP_RETENTION_INTERVAL = 3600   # seconds between purge attempts
+GIFTWRAP_RETENTION_TIMEOUT = 3600   # hard cap on one strfry delete run
+
 CONFIG_EDITABLE_FIELDS = {
     # config.json keys the Settings page may write. admin_pubkey_hex is
     # deliberately NOT here: it is the credential that authorises the very
@@ -1424,8 +1527,25 @@ CONFIG_EDITABLE_FIELDS = {
                          "detection picks the wrong file"),
     "relay_url": ("string", "Relay URL", "wss:// URL this relay answers on — used to find its own subscribers"),
     "contact_appeal": ("string", "Contact appeal", "shown publicly to banned pubkeys on the Banlist"),
+    "giftwrap_retention_days": ("range", "Gift-wrap retention",
+                                "kind-1059 older than this is deleted automatically (default 30 days, "
+                                "minimum 7)"),
     "port": ("int", "Admin UI port", "port server86 binds; takes effect on next start"),
     "bind": ("string", "Admin UI bind address", "interface server86 binds; takes effect on next start"),
+}
+
+# Help text for strfry.conf fields whose blank value means "use the default"
+# rather than "set this empty". Sourced from strfry's own distributed conf:
+# `nips = ""` is documented as "empty string to use default".
+CONF_FIELD_HELP = {
+    "relay.info.nips": "leave blank for strfry's default NIP list",
+    # strfry marks kinds 20000–29999 with expiration=1, writes them so open
+    # subscriptions can receive them, then RelayCron deletes them after this
+    # many seconds. Lower = less ephemeral disk residency; 0 is not "never
+    # write" — the write is what enables live broadcast.
+    "events.ephemeralEventsLifetimeSeconds":
+        "seconds kind-20000–29999 stay on disk before cron deletes them "
+        "(default 300; live broadcast still requires a brief write)",
 }
 
 
@@ -1437,10 +1557,38 @@ def _config_raw():
         return ""
 
 
+def _path_writable(path):
+    """True when this process can open the path for writing. Used only to
+    tell the Settings page up front; the write itself still fails loud if
+    permissions change between the check and the save."""
+    return bool(path) and os.path.isfile(path) and os.access(path, os.W_OK)
+
+
+def get_giftwrap_retention_days():
+    """Days of kind-1059 history to keep. Missing/invalid config → default 30.
+    Clamped to [GIFTWRAP_RETENTION_MIN, GIFTWRAP_RETENTION_MAX]."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh).get("giftwrap_retention_days")
+    except (OSError, ValueError):
+        return GIFTWRAP_RETENTION_DEFAULT
+    if raw is None or raw == "":
+        return GIFTWRAP_RETENTION_DEFAULT
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return GIFTWRAP_RETENTION_DEFAULT
+    return max(GIFTWRAP_RETENTION_MIN, min(GIFTWRAP_RETENTION_MAX, days))
+
+
 def get_settings_payload():
     conf_status = strfry_conf_status()
     conf_text, conf_err = read_strfry_conf()
     conf_fields, conf_balanced = parse_strfry_conf(conf_text or "")
+    for f in conf_fields:
+        help_text = CONF_FIELD_HELP.get(f["path"])
+        if help_text:
+            f["help"] = help_text
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             cfg_data = json.load(fh)
@@ -1448,26 +1596,35 @@ def get_settings_payload():
         cfg_data = {}
     app_fields = []
     for key, (ftype, label, help_text) in CONFIG_EDITABLE_FIELDS.items():
-        app_fields.append({
+        if key == "giftwrap_retention_days":
+            value = get_giftwrap_retention_days()
+        else:
+            value = cfg_data.get(key, "") if cfg_data.get(key) is not None else ""
+        field = {
             "path": key, "key": key, "section": "strfry-86", "label": label,
             "help": help_text, "type": ftype,
-            "value": cfg_data.get(key, "") if cfg_data.get(key) is not None else "",
-        })
+            "value": value,
+        }
+        if ftype == "range":
+            field["min"] = GIFTWRAP_RETENTION_MIN
+            field["max"] = GIFTWRAP_RETENTION_MAX
+            field["step"] = 1
+        app_fields.append(field)
+    conf_path = conf_status.get("path")
     return {
         "relay": {
-            "path": conf_status.get("path"), "fields": conf_fields,
+            "path": conf_path, "fields": conf_fields,
             "raw": conf_text or "", "error": conf_err, "balanced": conf_balanced,
-            # How that path was decided, so "these figures come from the wrong
-            # database" is a visible statement rather than a silent condition.
-            "source": conf_status.get("source"),
-            "detected": conf_status.get("detected"),
-            "override": conf_status.get("override"),
             "candidates": conf_status.get("candidates"),
+            # Ambiguity only: mismatch between override/fallback and the
+            # running relay. Happy-path source narration stays off the page.
             "warning": conf_status.get("error") if conf_status.get("exists") else None,
+            "writable": (_path_writable(conf_path) if conf_status.get("exists") else None),
         },
         "app": {
             "path": CONFIG_PATH, "fields": app_fields, "raw": _config_raw(),
             "error": None, "balanced": True,
+            "writable": _path_writable(CONFIG_PATH),
         },
     }
 
@@ -1501,11 +1658,16 @@ def write_app_config(edits=None, raw=None):
             spec = CONFIG_EDITABLE_FIELDS.get(key)
             if spec is None:
                 continue
-            if spec[0] == "int":
+            if spec[0] in ("int", "range"):
                 try:
-                    new_data[key] = int(str(value).strip())
+                    n = int(str(value).strip())
                 except ValueError:
                     return False, f"{key} must be a whole number"
+                if key == "giftwrap_retention_days":
+                    n = max(GIFTWRAP_RETENTION_MIN, min(GIFTWRAP_RETENTION_MAX, n))
+                new_data[key] = n
+            elif key == "strfry_conf_path" and not str(value).strip():
+                new_data.pop(key, None)
             else:
                 new_data[key] = str(value)
 
@@ -1596,9 +1758,19 @@ def get_relay_metrics():
     # explanation of how one was chosen, live in the admin-only settings
     # payload where disclosing them is already the point.
     conf = strfry_conf_status()
+    baseline_at = totals.get("scanned_at") or walk.get("scanned_at")
+    events_total = totals.get("total_events")
+    # Live-up the headline total: baseline + events seen since − kind-5
+    # deletes since. Matches the stats tile, so a metrics poll alone keeps
+    # the number moving even if the SSE stream is stalled.
+    with _live_lock:
+        if (events_total is not None
+                and baseline_at is not None
+                and _live_delta_baseline_at == baseline_at):
+            events_total = events_total + _live_new_events - _live_deletes
     return {
         "events_per_sec": _events_per_sec(),
-        "events_total": totals.get("total_events"),
+        "events_total": events_total,
         "db_bytes": db_bytes,
         "conf_ok": bool(conf.get("exists")),
         "conf_source": conf.get("source"),
@@ -1611,7 +1783,11 @@ def get_relay_metrics():
                           if top_kind_count and walk.get("events_read") else None,
         "giftwrap_events": totals.get("giftwrap_events"),
         "giftwrap_share": totals.get("giftwrap_share"),
-        "baseline_at": totals.get("scanned_at") or walk.get("scanned_at"),
+        "gap_events": totals.get("gap_events"),
+        "gap_share": totals.get("gap_share"),
+        "gap_level": totals.get("gap_level"),
+        "giftwrap_retention_days": get_giftwrap_retention_days(),
+        "baseline_at": baseline_at,
     }
 
 
@@ -3338,6 +3514,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/report/walk", "/api/relay-url", "/api/reports",
             "/api/console", "/api/undo",
             "/api/settings", "/api/settings/save", "/api/domain-unban",
+            "/api/giftwrap-retention/estimate", "/api/giftwrap-retention/purge",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -3487,6 +3664,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             self._send_json(200, get_settings_payload())
+            return
+
+        if path == "/api/giftwrap-retention/estimate":
+            try:
+                est = estimate_giftwrap_retention(body.get("days"))
+            except Exception as e:
+                self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
+                return
+            self._send_json(200, est)
+            return
+
+        if path == "/api/giftwrap-retention/purge":
+            days = clamp_giftwrap_retention_days(body.get("days"))
+            ok_purge, perr = run_giftwrap_retention_purge(days=days)
+            if not ok_purge:
+                self._send_json(500, {"error": perr or "purge failed", "days": days})
+                return
+            audit_append({
+                "type": "giftwrap_purge", "actor": auth.get("pubkey"),
+                "days": days, "via": "settings purge now",
+            })
+            self._send_json(200, {"ok": True, "days": days})
             return
 
         if path == "/api/settings/save":
@@ -3774,7 +3973,9 @@ def main():
 
     httpd.strfry86_config = cfg
     threading.Thread(target=_live_poll_loop, daemon=True).start()
-    log(f"server86: listening on {cfg['bind']}:{cfg['port']}")
+    threading.Thread(target=_giftwrap_retention_loop, daemon=True).start()
+    log(f"server86: listening on {cfg['bind']}:{cfg['port']}"
+        f" (gift-wrap retention {get_giftwrap_retention_days()}d)")
     httpd.serve_forever()
 
 

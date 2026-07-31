@@ -195,6 +195,28 @@ LINE="$(mkevent e1 "$OTHER_HEX" 1 '[]' hello 1700000000)"
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "normal event accepted"; else fail "normal event should be accepted, got: $OUT"; fi
 
+# 1b. NIP-16 ephemeral kinds must be ACCEPTED by the plugin so strfry can
+# broadcast them to open subscriptions. Persistence is strfry's job
+# (expiration=1 + ephemeralEventsLifetimeSeconds cron), not a write-policy reject
+# — a reject would also suppress live fan-out.
+LINE="$(mkevent e1b "$OTHER_HEX" 20000 '[]' typing 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "ephemeral kind 20000 accepted (broadcast path)"; else fail "ephemeral kind 20000 should be accepted so strfry can fan out, got: $OUT"; fi
+LINE="$(mkevent e1c "$OTHER_HEX" 29999 '[]' presence 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "ephemeral kind 29999 accepted (broadcast path)"; else fail "ephemeral kind 29999 should be accepted so strfry can fan out, got: $OUT"; fi
+# Banned authors still lose, including ephemeral — ban is about the author,
+# not the kind.
+python3 - "$BANNED_HEX" "$TESTDIR/blacklist.json" <<'PYEOF'
+import json, sys
+pubkey, path = sys.argv[1], sys.argv[2]
+json.dump({pubkey: {"banned_at": 1, "report_event_id": "r1", "reason": "spam"}}, open(path, "w"))
+PYEOF
+LINE="$(mkevent e1d "$BANNED_HEX" 22242 '[]' auth 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" reject; then pass "banned author ephemeral still rejected"; else fail "banned author ephemeral should still be rejected, got: $OUT"; fi
+echo '{}' > "$TESTDIR/blacklist.json"
+
 # 2. banned author rejected
 python3 - "$BANNED_HEX" "$TESTDIR/blacklist.json" <<'PYEOF'
 import json, sys
@@ -987,9 +1009,74 @@ try:
           "a field edit writes the field it names")
     check(_after_cfg["admin_pubkey_hex"] == "cc" * 32,
           "admin_pubkey_hex is NOT editable from Settings, even when the request asks")
+
+    # Gift-wrap retention: default 30, clamp to [7, 30], filter is pure.
+    check(server86.get_giftwrap_retention_days() == 30,
+          "giftwrap retention defaults to 30 days when unset")
+    _ok, _err = server86.write_app_config(edits={"giftwrap_retention_days": "3"})
+    check(_ok and server86.get_giftwrap_retention_days() == 7,
+          "giftwrap retention clamps below the floor up to 7 days")
+    _ok, _err = server86.write_app_config(edits={"giftwrap_retention_days": "99"})
+    check(_ok and server86.get_giftwrap_retention_days() == 30,
+          "giftwrap retention clamps above the ceiling down to 30 days")
+    _ok, _err = server86.write_app_config(edits={"giftwrap_retention_days": "14"})
+    check(_ok and server86.get_giftwrap_retention_days() == 14,
+          "giftwrap retention accepts a value inside the range")
+    _filt = server86.giftwrap_retention_filter(now=1_700_000_000, days=14)
+    check(_filt == {"kinds": [1059], "until": 1_700_000_000 - 14 * 86400},
+          "giftwrap retention filter is kinds:[1059] until now−days")
+
+    # Estimate: event count is exact; storage is proportional to db_bytes.
+    _orig_count = server86.run_strfry_count
+    _orig_report = server86.get_report_status
+    _orig_db = server86._strfry_db_bytes
+    server86.run_strfry_count = lambda filt, timeout=10: (
+        100 if filt.get("until") else (1000 if filt == {} else 400)
+    )
+    server86.get_report_status = lambda: {
+        "totals": {"total_events": 1000, "giftwrap_events": 400, "scanned_at": 1},
+        "walk": {},
+    }
+    server86._strfry_db_bytes = lambda: (10_000_000, "/tmp/db")
+    try:
+        _est = server86.estimate_giftwrap_retention(14, now=1_700_000_000)
+        check(_est["delete_events"] == 100 and _est["event_share"] == 0.1,
+              "giftwrap retention estimate reports exact delete count and event share")
+        check(_est["bytes_estimate"] == 1_000_000,
+              "giftwrap retention storage estimate is delete/total × db_bytes")
+        check(_est["days"] == 14 and "proportional" in (_est.get("estimate_note") or "").lower(),
+              "giftwrap retention estimate labels storage as proportional, not measured")
+    finally:
+        server86.run_strfry_count = _orig_count
+        server86.get_report_status = _orig_report
+        server86._strfry_db_bytes = _orig_db
 finally:
     server86.CONFIG_PATH = _orig_cfg_path
     shutil.rmtree(_cfg_dir, ignore_errors=True)
+
+
+# strfry.conf: blank nips means strfry's default NIP list (upstream conf
+# comment: "empty string to use default"). Settings must say so.
+_nips_dir = tempfile.mkdtemp()
+_orig_cfg_nips = server86.CONFIG_PATH
+_nips_conf = os.path.join(_nips_dir, "strfry.conf")
+with open(_nips_conf, "w") as _fh:
+    _fh.write('relay {\n  info {\n    nips = ""\n  }\n}\n')
+server86.CONFIG_PATH = os.path.join(_nips_dir, "config.json")
+with open(server86.CONFIG_PATH, "w") as _fh:
+    json.dump({"strfry_conf_path": _nips_conf, "admin_pubkey_hex": "aa" * 32}, _fh)
+try:
+    _payload = server86.get_settings_payload()
+    _nips_fields = [f for f in _payload["relay"]["fields"] if f["path"] == "relay.info.nips"]
+    check(len(_nips_fields) == 1 and "blank" in (_nips_fields[0].get("help") or "").lower(),
+          "Settings labels blank nips as leave-blank-for-default")
+    _ret = [f for f in _payload["app"]["fields"] if f["path"] == "giftwrap_retention_days"]
+    check(len(_ret) == 1 and _ret[0]["type"] == "range"
+          and _ret[0]["min"] == 7 and _ret[0]["max"] == 30,
+          "Settings exposes giftwrap retention as a 7–30 day range control")
+finally:
+    server86.CONFIG_PATH = _orig_cfg_nips
+    shutil.rmtree(_nips_dir, ignore_errors=True)
 
 
 # --- Phase 3: POST /api/reason (server86.py + lib86/blacklist.py) --------

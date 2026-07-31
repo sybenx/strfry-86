@@ -122,6 +122,40 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Range shares the same chrome as settings buttons: ink border, 8px radius,
+   sans label weight. The native track is replaced so it does not look like a
+   browser default next to Save / Edit raw. */
+.field-control input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  flex:1; min-width:10em; max-width:18em; height:2.35em; margin:0;
+  font-family:var(--sans); font-size:.82rem; font-weight:600;
+  color:var(--ink); background:transparent;
+  border:1px solid var(--ink); border-radius:8px; cursor:pointer;
+  padding:0 .7em;
+}
+.field-control input[type="range"]::-webkit-slider-runnable-track {
+  height:2px; background:var(--rule); border-radius:1px;
+}
+.field-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width:1em; height:1em; margin-top:-.4em;
+  background:var(--ink); border:1px solid var(--ink); border-radius:4px;
+  cursor:pointer;
+}
+.field-control input[type="range"]::-moz-range-track {
+  height:2px; background:var(--rule); border:none; border-radius:1px;
+}
+.field-control input[type="range"]::-moz-range-thumb {
+  width:1em; height:1em;
+  background:var(--ink); border:1px solid var(--ink); border-radius:4px;
+  cursor:pointer;
+}
+.field-control .range-days {
+  font-family:var(--sans); font-size:.82rem; font-weight:600;
+  padding:.5em 1em; color:var(--ink); background:transparent;
+  border:1px solid var(--ink); border-radius:8px; min-width:5.5em;
+  text-align:center; white-space:nowrap;
+}
 textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.6;
            padding:1em; resize:vertical; background:var(--term-bg); color:var(--term-fg);
            border:1px solid var(--term-edge); border-radius:14px; }
@@ -211,10 +245,6 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 </div>
 <p id="status"></p>
 <div id="tiles-container"></div>
-<p id="baseline-line"></p>
-<div id="totals-container"></div>
-<div id="gap-container"></div>
-<div id="kinds-container"></div>
 
 <div id="admin-section" style="display:none">
   <div id="command-block-container"></div>
@@ -228,7 +258,8 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 
   <hr>
   <h2>Gift wrap storage</h2>
-  <p>A safe gift-wrap retention purge needs both scans below: recipients, so the purge command can name whose gift wraps it would delete, and subscribers, so it can exempt the ones this relay is their own DM inbox for.</p>
+  <p id="giftwrap-retention-line" class="muted"></p>
+  <p class="muted">Recipient and subscriber scans feed the exempt-purge form and the Users table — this page shows counts only, never the member list.</p>
   <div id="recipients-panel-container"></div>
   <div id="subscribers-panel-container"></div>
 
@@ -277,6 +308,8 @@ var lastBanned = [];
 var lastTotals = null;
 var lastWalk = null;
 var lastBaselineAt = null;
+var lastMetrics = null;
+var lastLive = null;
 
 var statusEl = document.getElementById('status');
 var livePill = document.getElementById('live-pill');
@@ -287,10 +320,7 @@ var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var authorPointerLine = document.getElementById('author-pointer-line');
 var tilesContainer = document.getElementById('tiles-container');
-var baselineLine = document.getElementById('baseline-line');
-var totalsContainer = document.getElementById('totals-container');
-var kindsContainer = document.getElementById('kinds-container');
-var gapContainer = document.getElementById('gap-container');
+var giftwrapRetentionLine = document.getElementById('giftwrap-retention-line');
 var decisionLog = document.getElementById('decision-log');
 var logDot = document.getElementById('log-dot');
 var consoleLog = document.getElementById('console-log');
@@ -316,16 +346,41 @@ function shortKindLabel(kind) {
 }
 
 // --- headline tiles ---------------------------------------------------------
-// Six figures, none of which starts a scan: five are already in a cache this
-// server keeps, and the sixth is the size of the LMDB directory. A page of
-// headline numbers must never be the most expensive thing on the relay.
+// Six figures, none of which starts a scan. Events in DB is baseline PLUS
+// the live layer's delta (new − kind-5), so the number itself counts up —
+// not a paragraph of "+N events since" under it. NIP-40 expiry is invisible
+// to the live layer; only the next totals/walk corrects that.
 
-function renderTiles(m) {
+function liveEventsTotal(m, live) {
+  if (!m || m.events_total == null) {
+    return null;
+  }
+  // /api/metrics already folds the live delta in; SSE may still hold a
+  // fresher tick between metrics polls, so prefer live when baselines match.
+  if (live && m.baseline_at != null && live.baseline_at === m.baseline_at
+      && live.new_events != null) {
+    // metrics value may already include a previous delta; reconstruct from
+    // baseline cache when we still have lastTotals.
+    var base = (lastTotals && lastTotals.total_events != null)
+      ? lastTotals.total_events
+      : null;
+    if (base != null) {
+      return base + (live.new_events || 0) - (live.deletes || 0);
+    }
+  }
+  return m.events_total;
+}
+
+function renderTiles(m, live) {
+  if (!m) {
+    return;
+  }
+  lastMetrics = m;
+  if (live) {
+    lastLive = live;
+  }
+  live = live || lastLive;
   tilesContainer.textContent = '';
-  // Every figure on this page comes from `strfry --config <path> scan`, so a
-  // config that could not be resolved does not make the numbers late — it
-  // makes them absent, or worse, taken from a database the running relay
-  // never writes to. Say so above the tiles rather than under them.
   if (!m.conf_ok) {
     var warn = s86El('p', 'No strfry.conf could be found, so nothing on this page can read the '
       + 'relay\'s database. Set its path in ');
@@ -336,8 +391,14 @@ function renderTiles(m) {
     warn.appendChild(document.createTextNode('.'));
     tilesContainer.appendChild(warn);
   }
+  if (live && live.error) {
+    setLivePill('STALLED', false);
+  } else if (live) {
+    setLivePill('LIVE', true);
+  }
+  var eventsTotal = liveEventsTotal(m, live);
   var accept = m.accept_rate != null ? (m.accept_rate * 100).toFixed(1) + '%' : null;
-  tilesContainer.appendChild(s86BuildTiles([
+  var tiles = [
     {
       label: 'Events / sec',
       value: m.events_per_sec != null ? m.events_per_sec.toFixed(1) : null,
@@ -345,15 +406,15 @@ function renderTiles(m) {
     },
     {
       label: 'Events in DB',
-      value: m.events_total != null ? m.events_total.toLocaleString() : null,
-      note: m.baseline_at ? ('baseline ' + s86FormatRelativeAge(m.baseline_at)) : 'no walk or totals yet'
+      value: eventsTotal != null ? eventsTotal.toLocaleString() : null,
+      note: m.baseline_at
+        ? (live && live.baseline_at === m.baseline_at ? 'live' : s86FormatRelativeAge(m.baseline_at))
+        : 'refresh totals below'
     },
     {
       label: 'DB size',
       value: s86FormatBytes(m.db_bytes),
-      note: m.db_bytes != null
-        ? ('on disk, via strfry.conf from the ' + (m.conf_source || 'default location'))
-        : (m.conf_ok ? 'db path in strfry.conf is unreadable' : 'no strfry.conf found'),
+      note: m.db_bytes != null ? 'on disk' : (m.conf_ok ? 'db path unreadable' : 'no strfry.conf'),
       tone: m.db_bytes == null ? 'bad' : null
     },
     {
@@ -375,97 +436,51 @@ function renderTiles(m) {
       label: 'Gift-wrap storage',
       value: m.giftwrap_events != null ? m.giftwrap_events.toLocaleString() : null,
       note: m.giftwrap_share != null
-        ? ((m.giftwrap_share * 100).toFixed(1) + '% of all events')
-        : 'needs a totals refresh'
+        ? ((m.giftwrap_share * 100).toFixed(1) + '% · auto-delete after '
+           + (m.giftwrap_retention_days != null ? m.giftwrap_retention_days : 30) + 'd')
+        : ('auto-delete after '
+           + (m.giftwrap_retention_days != null ? m.giftwrap_retention_days : 30) + 'd')
     }
-  ]));
+  ];
+  // Author-scan kind coverage gap — NOT "events from banned users". The
+  // Users page's author scan only watches AUTHOR_SCAN_KINDS; anything else
+  // (except gift wraps) is the gap. Surface it only when it is large enough
+  // to act on; the full breakdown lives under Database → refresh totals.
+  if (m.gap_level === 'stale' && m.gap_events != null) {
+    tiles.push({
+      label: 'Unlisted kinds',
+      value: m.gap_events.toLocaleString(),
+      note: 'one kind is large enough to add to the author scan — see Database walk',
+      tone: 'bad'
+    });
+  } else if (m.gap_level === 'notice' && m.gap_events != null) {
+    tiles.push({
+      label: 'Other kinds',
+      value: m.gap_events.toLocaleString(),
+      note: ((m.gap_share * 100).toFixed(1) + '% of non-gift-wrap · not banned users'),
+      tone: null
+    });
+  }
+  tilesContainer.appendChild(s86BuildTiles(tiles));
+  if (giftwrapRetentionLine) {
+    giftwrapRetentionLine.textContent = 'Auto-deletes kind-1059 older than '
+      + (m.giftwrap_retention_days != null ? m.giftwrap_retention_days : 30)
+      + ' days (Settings → Gift-wrap retention).';
+  }
 }
 
 function loadMetrics() {
   return fetch('/api/metrics')
     .then(function (res) { return res.json(); })
-    .then(renderTiles)
+    .then(function (m) { renderTiles(m, lastLive); })
     .catch(function () {});
 }
 
-// --- baseline + delta -------------------------------------------------------
-// Figures are the last walk/totals cache PLUS the live layer's running delta
-// since that cache's own scanned_at. Kind-5 deletes are shown alongside new
-// events, never netted into one number — strfry-internal NIP-40 expiry does
-// NOT appear here at all; only the next walk corrects for it.
-
-function renderBaselineLine(live) {
-  var totals = lastTotals;
-  var baselineAt = (totals && totals.scanned_at != null) ? totals.scanned_at
-    : (lastWalk && lastWalk.scanned_at != null ? lastWalk.scanned_at : null);
-  if (baselineAt == null) {
-    baselineLine.textContent = 'no walk/totals baseline yet — run a full database walk or refresh totals below to establish one.';
-    return;
-  }
-  var line = 'baseline ' + s86FormatDate(baselineAt) + ' (' + s86FormatRelativeAge(baselineAt) + ')';
-  if (live && live.baseline_at === baselineAt) {
-    var sign = live.new_events >= 0 ? '+' : '';
-    line += ' · ' + sign + live.new_events.toLocaleString() + ' events, -'
-      + live.deletes.toLocaleString() + ' deletes since';
-  }
-  if (live && live.error) {
-    setLivePill('STALLED', false);
-    line += ' — live layer could not run: ' + live.error;
-  } else if (live) {
-    setLivePill('LIVE', true);
-  }
-  line += '. Events strfry expired on its own (NIP-40) do not appear here; only the next walk corrects for them.';
-  baselineLine.textContent = line;
-}
-
 function renderStats(data) {
-  totalsContainer.textContent = '';
-  kindsContainer.textContent = '';
-  gapContainer.textContent = '';
   lastTotals = data.totals;
   lastWalk = data.walk;
-
-  var totals = data.totals;
-  if (totals && totals.scanned_at != null) {
-    var nonGw = totals.total_events - totals.giftwrap_events;
-    totalsContainer.appendChild(s86BuildKeyValueTable([
-      ['all events', totals.total_events, ''],
-      ['gift wraps', totals.giftwrap_events, (totals.giftwrap_share * 100).toFixed(1) + '% of all'],
-      ['non-gift-wrap', nonGw, ''],
-      ['— in allowlist', totals.allowlist_events, ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap'],
-      ['— not in allowlist', totals.gap_events, (totals.gap_share * 100).toFixed(1) + '% of non-gift-wrap']
-    ]));
-    if (totals.gap_level === 'stale') {
-      gapContainer.appendChild(s86El('p', 'allowlist alarm: a single unlisted kind is large enough to act on — see the database walk below.'));
-    } else if (totals.gap_level === 'notice') {
-      gapContainer.appendChild(s86El('p', 'allowlist covers '
-        + ((1 - totals.gap_share) * 100).toFixed(1)
-        + '% of non-gift-wrap; remaining share is long-tail shaped (see the walk below).'));
-    } else if (totals.gap_level === 'ok') {
-      gapContainer.appendChild(s86El('p', 'allowlist covers '
-        + ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap events.'));
-    }
-  }
-
-  var walk = data.walk;
-  if (walk && walk.kinds) {
-    var kindRows = Object.keys(walk.kinds).map(function (k) {
-      return [shortKindLabel(parseInt(k, 10)), walk.kinds[k]];
-    }).sort(function (a, b) { return b[1] - a[1]; });
-    if (kindRows.length) {
-      kindsContainer.appendChild(s86El('h2', 'Kinds (walk baseline)'));
-      kindsContainer.appendChild(s86BuildRankedFigureTable(kindRows, {
-        unit: 'kinds',
-        grandTotal: walk.events_read || null
-      }));
-    }
-    if (walk.expired_events != null) {
-      kindsContainer.appendChild(s86El('p', walk.expired_events.toLocaleString()
-        + ' expired events on disk (NIP-40) — a size figure, not an alarm; purge only via the walk-driven forms.'));
-    }
-  }
-
-  renderBaselineLine(null);
+  // Headline figures come from /api/metrics + the live layer; this path only
+  // keeps the report caches for the Database panels below.
 }
 
 function loadStats() {
@@ -551,12 +566,15 @@ var totalsPanel = s86BuildScanPanel({
   lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration)) : null; },
   renderResult: function (container, record) {
     var nonGiftwrap = record.total_events - record.giftwrap_events;
+    // "Other kinds" is AUTHOR_SCAN_KINDS coverage, not a ban count. Banned
+    // authors are already blocked at write time; residual storage from
+    // before a ban is a different purge, not this figure.
     container.appendChild(s86BuildKeyValueTable([
       ['all events', record.total_events, ''],
       ['gift wraps', record.giftwrap_events, (record.giftwrap_share * 100).toFixed(1) + '% of all'],
       ['non-gift-wrap', nonGiftwrap, ''],
-      ['— in allowlist', record.allowlist_events, (100 - record.gap_share * 100).toFixed(1) + '%'],
-      ['— not in allowlist', record.gap_events, (record.gap_share * 100).toFixed(1) + '%']
+      ['author-scan kinds', record.allowlist_events, (100 - record.gap_share * 100).toFixed(1) + '% of non-gift-wrap'],
+      ['other kinds', record.gap_events, (record.gap_share * 100).toFixed(1) + '% of non-gift-wrap']
     ]));
     renderGapVerdict(container, record, lastReportData && lastReportData.walk);
   }
@@ -724,44 +742,9 @@ relayUrlSaveBtn.addEventListener('click', function () {
     });
 });
 
-// --- § Gift wrap storage: recipients + subscribers, each its own endpoint --
-// Beneath the counts table: the actual pubkeys, capped and clickable, same
-// shape s86BuildRecordDetailList already renders for a ban record's expand
-// arrow. `countField`/`countUnit`, when given, append that row's own count
-// after the npub — the rows already arrive ranked highest first (server-side
-// sort), so truncating this array top-down is already "top N by amount";
-// nothing here re-sorts.
-
-function appendPubkeyList(container, rows, label, countField, countUnit) {
-  if (rows.length === 0) {
-    return;
-  }
-  if (label) {
-    container.appendChild(s86El('p', label));
-  }
-  var truncation = s86TruncateForRender(rows, S86_RENDER_MAX);
-  if (countField) {
-    var ul = document.createElement('ul');
-    truncation.shown.forEach(function (r) {
-      var li = document.createElement('li');
-      if (r.name) {
-        li.appendChild(s86El('b', r.name + ' '));
-      }
-      if (r.nip05) {
-        li.appendChild(document.createTextNode(r.nip05 + ' '));
-      }
-      li.appendChild(s86NpubLink(r.npub || r.pubkey, r.pubkey, true));
-      li.appendChild(document.createTextNode(' — ' + r[countField].toLocaleString() + ' ' + countUnit));
-      ul.appendChild(li);
-    });
-    container.appendChild(ul);
-  } else {
-    container.appendChild(s86BuildRecordDetailList(truncation.shown));
-  }
-  if (truncation.truncatedCount > 0) {
-    container.appendChild(s86El('p', 'showing top ' + S86_RENDER_MAX + ' of ' + truncation.totalCount));
-  }
-}
+// --- § Gift wrap storage: recipients + subscribers ------------------------
+// Counts only. The member table lives on Users; CLAUDE.md forbids a list or
+// set-bound control on these panels (same invariant the old Report page had).
 
 var recipientsPanel = s86BuildScanPanel({
   heading: 'gift-wrap recipients',
@@ -774,7 +757,6 @@ var recipientsPanel = s86BuildScanPanel({
       ['distinct recipients', record.recipients.length, ''],
       ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
     ]));
-    appendPubkeyList(container, record.recipients, null, 'count', 'gift wraps');
   }
 });
 
@@ -789,8 +771,6 @@ var subscribersPanel = s86BuildScanPanel({
       ['DM-inbox subscribers', record.subscribers.length, record.saturated ? 'SATURATED — floor, not a count' : ''],
       ['general relay-list subscribers', record.general_subscribers.length, '']
     ]));
-    appendPubkeyList(container, record.subscribers, 'DM-inbox subscribers:');
-    appendPubkeyList(container, record.general_subscribers, 'general relay-list subscribers:');
   },
   // Saturation is a REFUSAL of the exempt-purge command, not a label — a
   // saturated subscriber list is a FLOOR, so missing subscribers means
@@ -961,19 +941,22 @@ loadStats();
 loadMetrics();
 setInterval(loadMetrics, METRICS_INTERVAL);
 
-// Live layer: the shared SSE connection drives the delta line and the
-// write-policy log continuously. If its baseline_at ever differs from what we
-// last rendered (an admin pressed refresh totals / run walk, here or on
-// another tab), the report cache moved — pull the new totals/walk record once
-// rather than trying to reconstruct it from deltas.
+// Live layer: drives Events-in-DB counting and the write-policy log. When
+// baseline_at moves (refresh totals / walk), re-pull caches so the live
+// delta re-anchors on the new baseline.
 s86ConnectLive(function (live) {
+  lastLive = live;
   renderDecisionLog(live.events);
   if (live.baseline_at !== lastBaselineAt) {
     lastBaselineAt = live.baseline_at;
-    loadStats().then(function () { renderBaselineLine(live); });
+    loadStats().then(function () {
+      loadMetrics();
+    });
     return;
   }
-  renderBaselineLine(live);
+  if (lastMetrics) {
+    renderTiles(lastMetrics, live);
+  }
 }, function () {
   setLivePill('RECONNECTING', false);
   setStatus('live layer disconnected — retrying');
