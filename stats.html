@@ -884,9 +884,11 @@ function runConsole(command) {
 QUICK_COMMANDS.forEach(function (cmd) {
   var btn = s86El('button', cmd, 'chip cmd');
   btn.type = 'button';
+  // Chips only fill the input — Run (or Enter) is the deliberate press that
+  // executes. Auto-running a chip would skip that second look at the command.
   btn.addEventListener('click', function () {
     consoleInput.value = cmd;
-    runConsole(cmd);
+    consoleInput.focus();
   });
   quickCmds.appendChild(btn);
 });
