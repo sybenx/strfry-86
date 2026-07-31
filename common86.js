@@ -187,6 +187,58 @@ function s86BuildIdentityDot(pubkeyHex) {
   return dot;
 }
 
+// Copy plain text to the clipboard. Prefer the async Clipboard API when the
+// page is a secure context; otherwise (and on API failure) fall back to a
+// short-lived <textarea> + document.execCommand('copy'). The fallback is
+// what makes copy work on plain-http admin UIs — navigator.clipboard is
+// simply absent there, and the old writeText-only path failed silently.
+// Returns true when the write was initiated (async) or succeeded (sync).
+function s86CopyText(text) {
+  if (text == null || text === '') {
+    return false;
+  }
+  var canAsync = !!(window.isSecureContext
+    && navigator.clipboard
+    && typeof navigator.clipboard.writeText === 'function');
+  if (canAsync) {
+    navigator.clipboard.writeText(text).catch(function () {
+      s86CopyTextFallback(text);
+    });
+    return true;
+  }
+  return s86CopyTextFallback(text);
+}
+
+function s86CopyTextFallback(text) {
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    // Keep it in-viewport but invisible — some browsers refuse to copy from
+    // display:none / off-screen-far elements during a user gesture.
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.width = '1px';
+    ta.style.height = '1px';
+    ta.style.padding = '0';
+    ta.style.border = 'none';
+    ta.style.outline = 'none';
+    ta.style.boxShadow = 'none';
+    ta.style.background = 'transparent';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    var ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Name cell as the design draws it: identity dot, then the best label this
 // row has — display name, else nip-05, else a truncated npub — never a raw
 // 64-hex key, which is unreadable at row height.
@@ -206,26 +258,40 @@ function s86BuildIdentityCell(row, linkIt) {
   } else {
     var span = s86El('span', label);
     if (row.npub) {
-      span.title = row.npub + ' — click to copy';
+      var idleTitle = row.npub + ' — click to copy';
+      span.title = idleTitle;
       span.style.cursor = 'pointer';
       span.setAttribute('role', 'button');
       span.tabIndex = 0;
-      var copyNpub = function () {
-        if (!(navigator.clipboard && navigator.clipboard.writeText)) {
-          return;
-        }
-        navigator.clipboard.writeText(row.npub).then(function () {
-          span.title = 'copied';
-          setTimeout(function () {
-            span.title = row.npub + ' — click to copy';
-          }, 1200);
-        }).catch(function () {});
+      var setTitles = function (t) {
+        span.title = t;
+        td.title = t;
       };
-      span.addEventListener('click', copyNpub);
+      var flashTitle = function (ok) {
+        setTitles(ok ? 'copied' : 'copy failed');
+        setTimeout(function () {
+          setTitles(idleTitle);
+        }, 1200);
+      };
+      var copyNpub = function (e) {
+        if (e) {
+          e.preventDefault();
+        }
+        // Secure-context path is async; flash "copied" optimistically — the
+        // fallback inside s86CopyText recovers if writeText rejects.
+        // Non-secure path is sync and reports real success/failure.
+        var ok = s86CopyText(row.npub);
+        flashTitle(ok);
+      };
+      // Whole cell is the hit target — the truncated label is easy to miss
+      // between the identity dot and the ellipsis edge.
+      td.style.cursor = 'pointer';
+      td.title = idleTitle;
+      td.addEventListener('click', copyNpub);
       span.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          copyNpub();
+          copyNpub(e);
         }
       });
     }
@@ -970,9 +1036,7 @@ function s86WireCopyPurge(buttonEl, preEl, listEl, checkboxClass) {
     var cmd = s86BuildPurgeCommand(pubkeys);
     preEl.textContent = cmd;
     preEl.style.display = '';
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(cmd).catch(function () {});
-    }
+    s86CopyText(cmd);
   });
 }
 
@@ -1038,9 +1102,7 @@ function s86AppendCommandBox(container, text) {
   copyBtn.type = 'button';
   copyBtn.textContent = 'Copy';
   copyBtn.addEventListener('click', function () {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).catch(function () {});
-    }
+    s86CopyText(text);
   });
   box.appendChild(copyBtn);
 
