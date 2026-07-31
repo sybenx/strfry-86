@@ -65,6 +65,71 @@ code { font-family:var(--mono); font-size:.85em; }
         border:1px solid currentColor; border-radius:8px; color:var(--muted); }
 .pill.live { color:var(--good); }
 .pill .dot { width:.45em; height:.45em; border-radius:50%; background:currentColor; }
+.chip { display:inline-block; font-family:var(--mono); font-size:.7rem; padding:.2em .6em;
+        border:1px solid currentColor; border-radius:6px; color:var(--muted); }
+.chip.good { color:var(--good); }
+.chip.bad { color:var(--accent); }
+.chips { display:flex; flex-wrap:wrap; gap:.4em; margin:.6rem 0; }
+button.chip.cmd { font-weight:400; background:transparent; color:var(--ink);
+                  border-color:var(--rule); }
+button.chip.cmd:hover { background:var(--ink); color:var(--paper); }
+/* Identity dot, never an avatar: the hue comes from the pubkey itself, so no
+   row on any page ever fetches an image from a stranger's host. */
+.idot { width:.75em; height:.75em; border-radius:50%; flex:none;
+        background:oklch(.65 .11 var(--h, 0)); }
+.idot.unknown { background:var(--rule); }
+.idot.big { width:4.5em; height:4.5em; }
+.profile-head { display:flex; gap:1.5em; align-items:flex-start; padding-bottom:1.4rem;
+                margin-bottom:1.2rem; border-bottom:1px solid var(--rule); }
+.profile-head .profile-id { flex:1; min-width:0; }
+.profile-head .profile-id > * { margin:.25rem 0; }
+.profile-head h2 { font-size:1.5rem; margin:0; }
+td.identity { display:flex; align-items:center; gap:.5em; white-space:nowrap;
+              max-width:15em; }
+td.identity > :last-child { overflow:hidden; text-overflow:ellipsis; }
+td.num { font-family:var(--mono); font-size:.9em; }
+td.num.bad { color:var(--accent); }
+td.pick { width:1.5em; }
+td.action { text-align:right; white-space:nowrap; }
+/* A clipped cell must not be allowed to size its column, or one long note
+   pushes every other column off the page. max-width:0 hands the column its
+   width from the table instead; `.grow` then gives it whatever is left. */
+td.clip { max-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+th.grow, td.grow { width:100%; }
+.struck { text-decoration:line-through; }
+/* A control that reads as a link but IS a button — it performs an action, so
+   it must be a button for the keyboard and the screen reader both. */
+button.linky { font-size:.78rem; font-weight:400; padding:.15em .3em; border:none;
+               background:none; color:var(--accent); text-decoration:underline;
+               text-underline-offset:2px; }
+button.linky:hover:not(:disabled) { background:none; color:var(--accent); opacity:.7; }
+.toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:.6em; margin:.7rem 0; }
+.toolbar > input[type="search"], .toolbar > input[type="text"] { flex:1; min-width:12em; }
+.modes { display:flex; flex-direction:column; gap:.3em; }
+.modes label { display:flex; align-items:baseline; gap:.5em; font-size:.88rem; }
+dl.tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(11em, 1fr));
+           gap:1px; margin:1.2rem 0; background:var(--rule);
+           border:1px solid var(--rule); border-radius:10px; overflow:hidden; }
+dl.tiles .tile { background:var(--surface); padding:.9em 1em; }
+dl.tiles dt { font-size:.68rem; font-weight:600; text-transform:uppercase;
+              letter-spacing:.08em; color:var(--muted); }
+dl.tiles dd { margin:.3rem 0 0; font-family:var(--serif); font-size:1.5rem;
+              font-weight:700; letter-spacing:-.02em; }
+dl.tiles .note { margin:.2rem 0 0; font-family:var(--mono); font-size:.68rem; color:var(--muted); }
+dl.tiles .note.bad { color:var(--accent); }
+.field-row { display:grid; grid-template-columns:16em 1fr; gap:1.2em;
+             align-items:baseline; padding:.45em 0; }
+.field-label { font-size:.85rem; color:var(--muted); }
+.field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
+.field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.6;
+           padding:1em; resize:vertical; background:var(--term-bg); color:var(--term-fg);
+           border:1px solid var(--term-edge); border-radius:14px; }
+.console-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.2em; align-items:start; }
+.console-grid h3 { display:flex; align-items:center; gap:.5em; }
+.dot-inline { width:.5em; height:.5em; border-radius:50%; background:var(--good); flex:none; }
+.dot-inline.warn { background:light-dark(oklch(.6 .14 80), oklch(.8 .14 80)); }
+.dot-inline.off { background:var(--rule); }
 table { width:100%; border-collapse:collapse; margin:.8rem 0 1.4rem; font-size:.92em; }
 th, td { text-align:left; padding:.6em .7em; border-bottom:1px solid var(--hair);
          font-variant-numeric:tabular-nums; }
@@ -91,9 +156,16 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere;                /* commands o
       font-family:var(--mono); font-size:.8rem; line-height:1.65; padding:1em 1.1em;
       background:var(--term-bg); color:var(--term-fg);
       border:1px solid var(--term-edge); border-radius:14px; }
-pre#console-log { min-height:6em; max-height:26em; overflow:auto; }
+pre#console-log, pre#decision-log { min-height:12em; max-height:26em; overflow:auto; }
+/* A log line is one line. Wrapping a key across two rows makes a tail
+   unreadable, so this panel scrolls sideways inside its own box — which the
+   no-horizontal-scroll rule is about the PAGE, not about a terminal. */
+pre#decision-log { white-space:pre; overflow-wrap:normal; }
 pre#console-log:empty::before { content:"strfry console — read-only verbs only";
                                 color:oklch(.6 .01 60); }
+pre .good { color:oklch(.78 .1 145); }
+pre .bad { color:oklch(.72 .16 25); }
+pre .dim { color:oklch(.6 .01 60); }
 .console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
 .console-row .prompt { font-family:var(--mono); color:var(--good); }
 .console-row input { flex:1; }
@@ -124,6 +196,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
      a nip-05 address — rather than let the table overflow. */
   th, td { padding:.5em .35em; overflow-wrap:anywhere; }
   .nowrap { white-space:normal; }
+  td.clip { max-width:none; white-space:normal; }
+  .console-grid { grid-template-columns:1fr; }
+  .field-row { grid-template-columns:1fr; gap:.2em; }
   header#s86 .tagline { display:none; }
   header#s86 input#q { max-width:none; margin:0 0 .5em; }
 }
@@ -139,17 +214,23 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 </div>
 
 <div id="content" style="display:none">
-  <p><span id="npub-text"></span> <a id="njump-link" target="_blank">njump</a></p>
-  <p id="nip05-line" style="display:none"></p>
-  <p id="ban-status-line"></p>
-  <p id="ban-controls" style="display:none">
-    <input id="reason-input" type="text" placeholder="reason (optional)">
-    <button id="ban-toggle-btn" type="button"></button>
-  </p>
+  <div class="profile-head">
+    <span id="profile-dot" class="idot big"></span>
+    <div class="profile-id">
+      <h2 id="profile-name"></h2>
+      <p class="mono"><span id="npub-text"></span> <a id="njump-link" target="_blank">njump</a></p>
+      <p id="nip05-line" class="mono" style="display:none"></p>
+      <p id="ban-status-line"></p>
+      <div id="profile-fields"></div>
+    </div>
+    <p id="ban-controls" style="display:none">
+      <input id="reason-input" type="text" placeholder="reason (optional)">
+      <button id="ban-toggle-btn" type="button"></button>
+    </p>
+  </div>
   <div id="reason-edit-container"></div>
 
-  <div id="profile-fields"></div>
-
+  <div id="profile-tiles"></div>
   <p id="counts-line"></p>
   <p id="kinds-line"></p>
 
@@ -197,6 +278,9 @@ var reasonInput = document.getElementById('reason-input');
 var banToggleBtn = document.getElementById('ban-toggle-btn');
 var reasonEditContainer = document.getElementById('reason-edit-container');
 var profileFieldsEl = document.getElementById('profile-fields');
+var profileName = document.getElementById('profile-name');
+var profileDot = document.getElementById('profile-dot');
+var profileTiles = document.getElementById('profile-tiles');
 var countsLine = document.getElementById('counts-line');
 var kindsLine = document.getElementById('kinds-line');
 var reportsCountLine = document.getElementById('reports-count-line');
@@ -313,7 +397,15 @@ function runProfilePage() {
   function renderProfile() {
     var p = profileData;
 
-    pageTitle.textContent = 'strfry-86 — ' + (p.name || truncatedNpub(p.npub));
+    // The heading is who this is; the document title is where you are. They
+    // used to be the same string, which made the page shout its own name at
+    // the operator instead of the account's.
+    document.title = 'strfry-86 — ' + (p.name || truncatedNpub(p.npub));
+    pageTitle.textContent = 'Profile';
+    profileName.textContent = p.name || p.nip05 || truncatedNpub(p.npub);
+    profileDot.replaceWith(s86BuildIdentityDot(p.pubkey));
+    profileDot = document.querySelector('.profile-head .idot');
+    profileDot.classList.add('big');
 
     npubTextEl.textContent = p.npub;
     njumpLink.href = 'https://njump.me/' + p.npub;
@@ -329,6 +421,7 @@ function runProfilePage() {
 
     renderBanStatus();
     renderProfileFields();
+    renderProfileTiles();
     renderCounts();
     renderKinds();
     renderReports();
@@ -443,6 +536,43 @@ function runProfilePage() {
       line.appendChild(document.createTextNode(pair[1]));
       profileFieldsEl.appendChild(line);
     });
+  }
+
+  // The design's four figures, from data this page already has. Every one of
+  // them can legitimately be unknown — the profile endpoint is bounded — and
+  // an unknown renders `—`, never 0 (rule 9).
+  function renderProfileTiles() {
+    var p = profileData;
+    var distinctReporters = {};
+    (p.reports || []).forEach(function (r) { distinctReporters[r.reporter] = true; });
+    var reporterCount = Object.keys(distinctReporters).length;
+    var kindsSeen = Object.keys(p.kinds || {}).length;
+    var newest = (p.previews && p.previews.length) ? p.previews[0].created_at : null;
+
+    profileTiles.textContent = '';
+    profileTiles.appendChild(s86BuildTiles([
+      {
+        label: 'Events published',
+        value: p.total_events == null ? null : (p.total_events.toLocaleString() + (p._countsUncertain ? '?' : '')),
+        note: p.scan_count != null ? ('rank ' + p.scan_rank + ' in the last author scan') : 'lifetime, from the index'
+      },
+      {
+        label: 'Reports against',
+        value: reporterCount,
+        note: p.reports_saturated ? 'floor — report scan capped' : 'distinct reporters (kind 1984)',
+        tone: reporterCount ? 'bad' : null
+      },
+      {
+        label: 'Kinds seen',
+        value: kindsSeen || null,
+        note: 'in the newest ' + (p.kinds_window || 0).toLocaleString() + ' events'
+      },
+      {
+        label: 'Last active',
+        value: newest ? s86FormatRelativeAge(newest) : null,
+        note: newest ? s86FormatDate(newest) : 'no events read yet'
+      }
+    ]));
   }
 
   function renderCounts() {

@@ -22,11 +22,11 @@ ROOT = os.path.dirname(TOOLS_DIR)
 CSS_PATH = os.path.join(TOOLS_DIR, "style86.css")
 
 PAGES = [
-    "home.html", "stats.html", "userlist.html", "report.html",
-    "authors.html", "bans.html", "audit.html", "profile.html", "domain.html",
+    "home.html", "stats.html", "users.html", "bans.html",
+    "audit.html", "settings.html", "profile.html", "domain.html",
 ]
 
-BLOCK = re.compile(r"<style>\n.*?\n</style>", re.DOTALL)
+BLOCK = re.compile(r"<style>.*?</style>", re.DOTALL)
 
 
 def main(argv):

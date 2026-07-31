@@ -825,17 +825,171 @@ check(server86.STATIC_ROUTES["/home"][0] == "home.html",
       "STATIC_ROUTES maps /home to home.html (public landing)")
 check(server86.STATIC_ROUTES["/bans"][0] == "bans.html",
       "STATIC_ROUTES maps /bans to bans.html")
-for _path, _file in (("/stats", "stats.html"), ("/userlist", "userlist.html"), ("/audit", "audit.html")):
+for _path, _file in (("/stats", "stats.html"), ("/users", "users.html"),
+                     ("/audit", "audit.html"), ("/settings", "settings.html")):
     check(server86.STATIC_ROUTES.get(_path, (None,))[0] == _file,
           f"STATIC_ROUTES maps {_path} to {_file}")
 check("/" not in server86.STATIC_ROUTES,
       "'/' is not a static route — do_GET redirects it to /home instead")
 
-# --- Authors empty state: recent is the default radio --------------------
+# --- Merged pages: the old paths redirect, they do not 404 or double-serve
+# Report became a section of Stats & Console and Authors became Users. A
+# bookmark that 404s teaches the operator the feature was deleted.
+for _old, _new in (("/report", "/stats"), ("/authors", "/users"), ("/userlist", "/users")):
+    check(server86.LEGACY_REDIRECTS.get(_old) == _new,
+          f"{_old} redirects to {_new} rather than serving or 404ing")
+    check(_old not in server86.STATIC_ROUTES,
+          f"{_old} is NOT also a static route — one page, one path")
+
+# --- Users empty state: recent is the default radio ----------------------
 import re as _re
-_authors_html = open(os.path.join(REPO_ROOT, "authors.html")).read()
-check(bool(_re.search(r'value="recent"\s+checked', _authors_html)),
-      "authors.html offers recent as the default (checked) scan mode")
+_users_html = open(os.path.join(REPO_ROOT, "users.html")).read()
+check(bool(_re.search(r'value="recent"\s+checked', _users_html)),
+      "users.html offers recent as the default (checked) scan mode")
+
+
+import shutil
+import tempfile
+
+# --- decision log: the only channel that can see a REJECT ----------------
+# A blocked event never enters the database, so no scan can report one. If
+# this reader silently returns nothing, the Result column quietly reads
+# "unknown" forever and nobody notices the write policy stopped being visible.
+_dec_dir = tempfile.mkdtemp()
+_orig_dec, _orig_dec_prev = server86.DECISION_LOG_PATH, server86.DECISION_LOG_PREV_PATH
+server86.DECISION_LOG_PATH = os.path.join(_dec_dir, "decisions.jsonl")
+server86.DECISION_LOG_PREV_PATH = server86.DECISION_LOG_PATH + ".1"
+try:
+    _pk_ok = "aa" * 32
+    _pk_bad = "bb" * 32
+    with open(server86.DECISION_LOG_PREV_PATH, "w") as _fh:
+        _fh.write(json.dumps({"at": 1, "id": "a" * 64, "pubkey": _pk_ok, "kind": 1,
+                              "created_at": 1, "action": "accept", "msg": "",
+                              "content": "hello"}) + "\n")
+    with open(server86.DECISION_LOG_PATH, "w") as _fh:
+        _fh.write(json.dumps({"at": 2, "id": "b" * 64, "pubkey": _pk_bad, "kind": 1,
+                              "created_at": 2, "action": "reject",
+                              "msg": "blocked: banned pubkey", "content": "spam"}) + "\n")
+        _fh.write("this line is not json\n")
+
+    _recs = server86.read_decisions()
+    check(len(_recs) == 2,
+          "read_decisions reads BOTH log segments and skips unparseable lines")
+    check([r["action"] for r in _recs] == ["accept", "reject"],
+          "read_decisions returns records oldest-first across the rotation boundary")
+
+    _rows, _accepted, _blocked, _judged = server86._live_feed_state()
+    check(_judged is True and _accepted == 1 and _blocked == 1,
+          "the feed counts one accept and one block — a reject is visible nowhere else")
+    _rejected = [r for r in _rows if r["result"] == "blocked"][0]
+    check(_rejected["content"] == "spam" and _rejected["npub"].startswith("npub1"),
+          "a blocked row still carries its content preview and an encoded npub")
+
+    # The fallback: no decision log at all must NOT claim everything was
+    # accepted. An event nothing judged is unknown, and rule 9 says unknown
+    # renders as unknown.
+    os.remove(server86.DECISION_LOG_PATH)
+    os.remove(server86.DECISION_LOG_PREV_PATH)
+    with server86._live_lock:
+        server86._live_recent.append({"id": "c" * 64, "kind": 1, "created_at": 3})
+    _rows, _accepted, _blocked, _judged = server86._live_feed_state()
+    check(_judged is False and _accepted is None and _blocked is None,
+          "with no decision log the feed reports nothing judged, rather than a made-up rate")
+    check(all(r["result"] is None for r in _rows),
+          "scan-fed rows render Result unknown — never 'accepted' for an event nothing judged")
+    with server86._live_lock:
+        server86._live_recent.clear()
+finally:
+    server86.DECISION_LOG_PATH, server86.DECISION_LOG_PREV_PATH = _orig_dec, _orig_dec_prev
+    shutil.rmtree(_dec_dir, ignore_errors=True)
+
+
+# --- strfry.conf: a field edit rewrites ONE line, and nothing else --------
+# The whole reason Settings parses line-by-line instead of reserialising: an
+# operator's comments, ordering and spacing must survive a visit to the page.
+_CONF = """# my relay
+db = "./strfry-db/"
+
+relay {
+    bind = "0.0.0.0"
+    port = 7777          # HTTP port
+
+    info {
+        name = "My Relay"
+    }
+
+    writePolicy {
+        plugin = "./plugin86.py"
+    }
+}
+"""
+_fields, _balanced = server86.parse_strfry_conf(_CONF)
+_by_path = {f["path"]: f for f in _fields}
+check(_balanced, "parse_strfry_conf reports balanced braces for a well-formed file")
+check(_by_path["relay.info.name"]["value"] == "My Relay"
+      and _by_path["relay.port"]["type"] == "int"
+      and _by_path["db"]["section"] == "general",
+      "parse_strfry_conf recovers dotted paths, values and types from nested blocks")
+
+_new_text, _changed = server86.apply_strfry_conf_edits(_CONF, {"relay.port": "7778"})
+check(_changed == ["relay.port"], "one edit reports exactly one changed path")
+_before, _after = _CONF.split("\n"), _new_text.split("\n")
+_diff = [i for i in range(len(_before)) if _before[i] != _after[i]]
+check(len(_diff) == 1 and "7778" in _after[_diff[0]],
+      "a field edit changes exactly ONE line of strfry.conf")
+check("# HTTP port" in _after[_diff[0]] and "# my relay" in _new_text,
+      "the edited line keeps its trailing comment, and the rest of the file keeps its own")
+
+_, _unbalanced = server86.parse_strfry_conf("relay {\n  port = 1\n")
+check(not _unbalanced, "parse_strfry_conf reports UNBALANCED braces rather than guessing")
+
+_conf_dir = tempfile.mkdtemp()
+_conf_file = os.path.join(_conf_dir, "strfry.conf")
+_orig_cfg_for_conf = server86.CONFIG_PATH
+# strfry.conf is resolved, not a constant: point config.json at a temp file
+# so the write path exercises the same resolver the live server uses.
+server86.CONFIG_PATH = os.path.join(_conf_dir, "config.json")
+try:
+    with open(_conf_file, "w") as _fh:
+        _fh.write(_CONF)
+    with open(server86.CONFIG_PATH, "w") as _fh:
+        json.dump({"strfry_conf_path": _conf_file, "admin_pubkey_hex": "aa" * 32}, _fh)
+    _ok, _err = server86.write_strfry_conf("relay {\n  port = 1\n")
+    check(_ok is False and "brace" in (_err or ""),
+          "write_strfry_conf REFUSES an unbalanced file")
+    check(open(_conf_file).read() == _CONF,
+          "a refused write leaves strfry.conf byte-identical — no partial write")
+finally:
+    server86.CONFIG_PATH = _orig_cfg_for_conf
+    shutil.rmtree(_conf_dir, ignore_errors=True)
+
+
+# --- config.json: a raw save can never lock the operator out -------------
+_cfg_dir = tempfile.mkdtemp()
+_orig_cfg_path = server86.CONFIG_PATH
+server86.CONFIG_PATH = os.path.join(_cfg_dir, "config.json")
+try:
+    _good_cfg = {"admin_pubkey_hex": "cc" * 32, "relay_url": "wss://a.example",
+                 "contact_appeal": "admin@a.example", "port": 8686, "bind": "0.0.0.0"}
+    with open(server86.CONFIG_PATH, "w") as _fh:
+        json.dump(_good_cfg, _fh)
+
+    _ok, _err = server86.write_app_config(raw=json.dumps({"relay_url": "wss://b.example"}))
+    check(_ok is False and "admin_pubkey_hex" in (_err or ""),
+          "a raw config.json save without a valid admin_pubkey_hex is REFUSED")
+    check(json.load(open(server86.CONFIG_PATH)) == _good_cfg,
+          "the refused save left config.json untouched — the operator is still admin")
+
+    _ok, _err = server86.write_app_config(edits={"relay_url": "wss://c.example",
+                                                 "admin_pubkey_hex": "dd" * 32})
+    _after_cfg = json.load(open(server86.CONFIG_PATH))
+    check(_ok and _after_cfg["relay_url"] == "wss://c.example",
+          "a field edit writes the field it names")
+    check(_after_cfg["admin_pubkey_hex"] == "cc" * 32,
+          "admin_pubkey_hex is NOT editable from Settings, even when the request asks")
+finally:
+    server86.CONFIG_PATH = _orig_cfg_path
+    shutil.rmtree(_cfg_dir, ignore_errors=True)
 
 
 # --- Phase 3: POST /api/reason (server86.py + lib86/blacklist.py) --------
@@ -930,8 +1084,10 @@ class _FakeCompleted:
 
 _orig_subprocess_run = _subprocess.run
 _orig_require_strfry_bin = server86.require_strfry_bin
+_orig_require_strfry_conf = server86.require_strfry_conf
 _orig_get_relay_cwd = server86.get_relay_cwd
 server86.require_strfry_bin = lambda: "/fake/strfry"
+server86.require_strfry_conf = lambda: "/fake/strfry.conf"
 server86.get_relay_cwd = lambda: "/tmp"
 
 _subprocess.run = lambda argv, **kw: _FakeCompleted(0, b"42\n")
@@ -954,6 +1110,7 @@ except RuntimeError:
 
 _subprocess.run = _orig_subprocess_run
 server86.require_strfry_bin = _orig_require_strfry_bin
+server86.require_strfry_conf = _orig_require_strfry_conf
 server86.get_relay_cwd = _orig_get_relay_cwd
 
 # _report_type_for_target: same dual lookup as plugin86.py's hot path,
@@ -1566,7 +1723,7 @@ def _get_bytes(path):
 
 
 try:
-    for route, label in (("/profile", "profile.html"), ("/domain", "domain.html"), ("/report", "report.html")):
+    for route, label in (("/profile", "profile.html"), ("/domain", "domain.html"), ("/settings", "settings.html")):
         status_plain, body_plain = _get_bytes(route)
         status_query, body_query = _get_bytes(route + "?d=../../../../etc/passwd&npub=../../../../etc/passwd")
         check(status_plain == 200 and status_query == 200 and body_plain == body_query,
@@ -1632,25 +1789,30 @@ else:
     try:
         import subprocess
 
-        def count(filter_obj):
-            argv = [strfry_bin, "--config", server86.STRFRY_CONF_PATH, "scan", "--count",
-                    json.dumps(filter_obj, separators=(",", ":"))]
-            result = subprocess.run(argv, cwd=server86.get_relay_cwd(), capture_output=True,
-                                     timeout=server86.SCAN_TIMEOUT)
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.decode("utf-8", "replace")[-300:])
-            lines = [ln.strip() for ln in result.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
-            return int(lines[-1])
+        conf_path = server86.get_strfry_conf_path()
+        if conf_path is None:
+            print(f"SKIP: AUTHOR_SCAN_KINDS gap check (no strfry.conf found; "
+                  f"set strfry_conf_path or start the relay with --config)")
+        else:
+            def count(filter_obj):
+                argv = [strfry_bin, "--config", conf_path, "scan", "--count",
+                        json.dumps(filter_obj, separators=(",", ":"))]
+                result = subprocess.run(argv, cwd=server86.get_relay_cwd(), capture_output=True,
+                                         timeout=server86.SCAN_TIMEOUT)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.decode("utf-8", "replace")[-300:])
+                lines = [ln.strip() for ln in result.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+                return int(lines[-1])
 
-        total = count({})
-        allowlisted = count({"kinds": list(server86.AUTHOR_SCAN_KINDS)})
-        giftwraps = count({"kinds": [1059]})
-        non_giftwrap = total - giftwraps
-        gap = non_giftwrap - allowlisted
-        gap_pct = (gap / non_giftwrap * 100) if non_giftwrap else 0.0
-        ok = gap_pct <= 2.0
-        check(ok, f"AUTHOR_SCAN_KINDS gap check ({gap} missing of {non_giftwrap} non-giftwrap events, {gap_pct:.2f}%)",
-              None if ok else "allowlist is stale — extend AUTHOR_SCAN_KINDS (see CLAUDE.md 'Auditing the allowlist')")
+            total = count({})
+            allowlisted = count({"kinds": list(server86.AUTHOR_SCAN_KINDS)})
+            giftwraps = count({"kinds": [1059]})
+            non_giftwrap = total - giftwraps
+            gap = non_giftwrap - allowlisted
+            gap_pct = (gap / non_giftwrap * 100) if non_giftwrap else 0.0
+            ok = gap_pct <= 2.0
+            check(ok, f"AUTHOR_SCAN_KINDS gap check ({gap} missing of {non_giftwrap} non-giftwrap events, {gap_pct:.2f}%)",
+                  None if ok else "allowlist is stale — extend AUTHOR_SCAN_KINDS (see CLAUDE.md 'Auditing the allowlist')")
     except Exception as e:
         check(False, "AUTHOR_SCAN_KINDS gap check", f"error running against live db: {type(e).__name__}: {e}")
 
@@ -1930,19 +2092,32 @@ echo "$UPDATER_OUTPUT"
 UPDATER_FAIL_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^FAIL: ')"
 FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
 
-# --- report.html has no control bound to a page-assembled set ------------
-# Static-source check: every checkbox in this project (author-checkbox,
-# ban-checkbox, select-all, the command generator's exempt-subscribers
-# field) is created via document.createElement in common86.js, never as a
-# literal <input> in an .html file — so a literal type="checkbox" in
-# report.html's own source would mean a NEW, page-specific control, which
-# is exactly what this rule forbids.
-if grep -q 'type="checkbox"' "$REPO_ROOT/report.html"; then
+# --- the scan sections have no control bound to a page-assembled set -----
+# The invariant moved with the panels: Report's rule was that the page which
+# renders scan RESULTS never also acts on a set it assembled. Those panels now
+# live in stats.html, so stats.html inherits the rule. Its only literal
+# checkboxes would have to be new, page-specific controls — every checkbox in
+# this project is built with document.createElement in common86.js or in the
+# pages that legitimately own a selectable list (users, bans, domain).
+if grep -q 'type="checkbox"' "$REPO_ROOT/stats.html"; then
     FAILURES=$((FAILURES + 1))
-    echo 'FAIL: report.html contains no control bound to a page-assembled set (found a literal checkbox in report.html source)'
+    echo 'FAIL: the scan sections contain no control bound to a page-assembled set (found a literal checkbox in stats.html source)'
 else
-    echo 'PASS: report.html contains no control bound to a page-assembled set (no literal checkbox in report.html source)'
+    echo 'PASS: the scan sections contain no control bound to a page-assembled set (no literal checkbox in stats.html source)'
 fi
+
+# --- the removed pages are actually removed ------------------------------
+# A leftover report.html/authors.html/userlist.html on disk is a second copy
+# of a page that is no longer reachable — it drifts silently and gets edited
+# by mistake.
+for _stale in report.html authors.html userlist.html; do
+    if [ -e "$REPO_ROOT/$_stale" ]; then
+        FAILURES=$((FAILURES + 1))
+        echo "FAIL: $_stale was merged away but still exists on disk"
+    else
+        echo "PASS: $_stale is gone, not left behind as a second copy"
+    fi
+done
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

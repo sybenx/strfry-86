@@ -1,3 +1,12 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
+<title>strfry-86 — settings</title>
+<style>
 /* strfry-86 style block — canonical source. tools/stamp_style.py copies this
    file verbatim into every page's <style>, so "identical character-for-character
    on every page" is enforced by a command, not by discipline. Edit here only.
@@ -193,3 +202,312 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   header#s86 .tagline { display:none; }
   header#s86 input#q { max-width:none; margin:0 0 .5em; }
 }
+</style>
+</head>
+<body>
+<h1>Settings</h1>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <div id="relay-section"></div>
+  <hr>
+  <div id="app-section"></div>
+</div>
+<script src="/common86.js"></script>
+<script>
+// Two config files, one control: the relay's own strfry.conf and strfry-86's
+// config.json render through the same builder, because they are the same
+// question asked twice and an operator should not have to learn two editors.
+//
+// Nothing here restarts anything. strfry re-reads its config on its own, and
+// the one setting that genuinely needs a restart (the admin UI's own port and
+// bind address) says so on its row rather than pretending otherwise.
+//
+// Saving a field writes ONLY that field's line: the server rewrites the value
+// token in place and leaves comments, ordering and everything its parser does
+// not model byte-identical. A hand-tuned config survives a visit here.
+var adminPubkey = null;
+var isAdmin = false;
+var payload = null;
+
+var statusEl = document.getElementById('status');
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
+var adminSection = document.getElementById('admin-section');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function sectionTitle(raw) {
+  if (!raw || raw === 'general') {
+    return 'General';
+  }
+  return raw.split('.').map(function (part) {
+    return part.replace(/([a-z])([A-Z])/g, '$1 $2');
+  }).join(' → ').replace(/^./, function (c) { return c.toUpperCase(); });
+}
+
+function fieldLabel(field) {
+  if (field.label) {
+    return field.label;
+  }
+  return field.key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/^./, function (c) { return c.toUpperCase(); });
+}
+
+// One row: label on the left, the control the value's own type deserves on
+// the right. A bool gets a real checkbox rather than a painted div — it has
+// to be reachable by keyboard and readable by a screen reader, and the design
+// language is carried by CSS, not by giving up the element.
+function buildFieldRow(field, onDirty) {
+  var row = s86El('div', null, 'field-row');
+  var label = document.createElement('label');
+  label.className = 'field-label';
+  label.textContent = fieldLabel(field);
+  var id = 'f-' + field.path.replace(/[^a-zA-Z0-9]/g, '-');
+  label.setAttribute('for', id);
+  row.appendChild(label);
+
+  var control;
+  if (field.type === 'bool') {
+    control = document.createElement('input');
+    control.type = 'checkbox';
+    control.checked = String(field.value) === 'true';
+    control.className = 'toggle';
+  } else {
+    control = document.createElement('input');
+    control.type = field.type === 'int' ? 'number' : 'text';
+    control.value = field.value == null ? '' : String(field.value);
+  }
+  control.id = id;
+  control.setAttribute('data-path', field.path);
+  control.addEventListener('input', onDirty);
+  control.addEventListener('change', onDirty);
+
+  var right = s86El('div', null, 'field-control');
+  right.appendChild(control);
+  if (field.help) {
+    right.appendChild(s86El('p', field.help, 'note'));
+  }
+  row.appendChild(right);
+  return row;
+}
+
+function controlValue(control) {
+  return control.type === 'checkbox' ? String(control.checked) : control.value;
+}
+
+function buildSection(container, target, title, subtitle, data) {
+  container.textContent = '';
+
+  var head = s86El('div', null, 'page-head');
+  var titles = document.createElement('div');
+  titles.appendChild(s86El('h2', title));
+  titles.appendChild(s86El('p', subtitle, 'muted'));
+  head.appendChild(titles);
+  var modeBtn = s86El('button', 'Edit raw');
+  modeBtn.type = 'button';
+  head.appendChild(modeBtn);
+  container.appendChild(head);
+
+  // Where this file was found, and how — the whole point of the line. A relay
+  // has no fixed config location, and reading the wrong one is silent: strfry
+  // opens whatever database THAT file names, so every scan comes back
+  // confident and wrong.
+  if (data.source || data.detected || data.candidates) {
+    var prov = s86El('p', null, 'muted');
+    if (data.path) {
+      prov.appendChild(s86El('span', data.path, 'mono'));
+      prov.appendChild(document.createTextNode(
+        ' — ' + ({
+          'config.json': 'set explicitly below',
+          'relay process': 'read from the running relay\'s own --config argument',
+          'default location': 'found at a default location; the relay is not running, or its --config was unreadable'
+        }[data.source] || 'source unknown')
+      ));
+    } else {
+      prov.appendChild(document.createTextNode('not found. Tried: '));
+      prov.appendChild(s86El('span', (data.candidates || []).join(', '), 'mono'));
+    }
+    container.appendChild(prov);
+    if (data.detected && data.source !== 'relay process') {
+      var det = s86El('p', 'The running relay was started with ', 'muted');
+      det.appendChild(s86El('span', data.detected, 'mono'));
+      det.appendChild(document.createTextNode('.'));
+      container.appendChild(det);
+    }
+    if (data.warning) {
+      container.appendChild(s86El('p', data.warning));
+    }
+  }
+
+  if (data.error) {
+    container.appendChild(s86El('p', 'could not read it — ' + data.error));
+    container.appendChild(s86El('p', 'Set "strfry.conf path" under Admin console below, then reload. '
+      + 'Nothing on this page will write until it can read first.'));
+    return;
+  }
+
+  var structured = s86El('div', null, 'structured');
+  var rawWrap = s86El('div', null, 'raw');
+  rawWrap.style.display = 'none';
+  var statusLine = s86El('p', '', 'muted');
+  var saveBtn = s86El('button', 'Save');
+  saveBtn.type = 'button';
+  saveBtn.disabled = true;
+
+  var original = {};
+  var controls = [];
+
+  function markDirty() {
+    var dirty = controls.some(function (c) {
+      return controlValue(c) !== original[c.getAttribute('data-path')];
+    });
+    saveBtn.disabled = !dirty && rawWrap.style.display === 'none';
+    statusLine.textContent = dirty ? 'unsaved changes' : '';
+  }
+
+  // Group in file order — the order the operator's own file already has, not
+  // an order invented here.
+  var groups = [];
+  var byName = {};
+  (data.fields || []).forEach(function (f) {
+    if (!byName[f.section]) {
+      byName[f.section] = { name: f.section, fields: [] };
+      groups.push(byName[f.section]);
+    }
+    byName[f.section].fields.push(f);
+  });
+
+  if (groups.length === 0) {
+    structured.appendChild(s86El('p', 'no scalar settings were recognised in this file — use the raw editor.'));
+  }
+  groups.forEach(function (group) {
+    structured.appendChild(s86El('h3', sectionTitle(group.name)));
+    group.fields.forEach(function (f) {
+      var row = buildFieldRow(f, markDirty);
+      structured.appendChild(row);
+      var control = row.querySelector('[data-path]');
+      original[f.path] = controlValue(control);
+      controls.push(control);
+    });
+  });
+  container.appendChild(structured);
+
+  rawWrap.appendChild(s86El('p',
+    'Editing raw config directly bypasses the per-field validation above — the structured controls are the recommended path.',
+    'muted'));
+  var textarea = document.createElement('textarea');
+  textarea.rows = 22;
+  textarea.value = data.raw || '';
+  textarea.spellcheck = false;
+  textarea.setAttribute('aria-label', 'raw contents of ' + data.path);
+  textarea.addEventListener('input', function () {
+    saveBtn.disabled = textarea.value === (data.raw || '');
+    statusLine.textContent = saveBtn.disabled ? '' : 'unsaved changes';
+  });
+  rawWrap.appendChild(textarea);
+  container.appendChild(rawWrap);
+
+  var actions = s86El('div', null, 'toolbar');
+  actions.appendChild(saveBtn);
+  actions.appendChild(statusLine);
+  container.appendChild(actions);
+
+  modeBtn.addEventListener('click', function () {
+    var showingRaw = rawWrap.style.display !== 'none';
+    rawWrap.style.display = showingRaw ? 'none' : '';
+    structured.style.display = showingRaw ? '' : 'none';
+    modeBtn.textContent = showingRaw ? 'Edit raw' : 'Back to structured view';
+    markDirty();
+  });
+
+  saveBtn.addEventListener('click', function () {
+    if (!isAdmin) {
+      return;
+    }
+    var usingRaw = rawWrap.style.display !== 'none';
+    var body = { target: target };
+    if (usingRaw) {
+      body.raw = textarea.value;
+    } else {
+      var edits = {};
+      controls.forEach(function (c) {
+        var path = c.getAttribute('data-path');
+        if (controlValue(c) !== original[path]) {
+          edits[path] = controlValue(c);
+        }
+      });
+      if (Object.keys(edits).length === 0) {
+        statusLine.textContent = 'nothing changed';
+        return;
+      }
+      body.edits = edits;
+    }
+    saveBtn.disabled = true;
+    statusLine.textContent = 'saving…';
+    s86SignAndPost('/api/settings/save', body)
+      .then(function (result) {
+        if (!result.ok) {
+          statusLine.textContent = 'not saved — ' + s86ErrMsg(result);
+          saveBtn.disabled = false;
+          return;
+        }
+        var changed = result.body.changed || [];
+        statusLine.textContent = changed.length
+          ? ('saved ' + changed.length + ' change' + (changed.length === 1 ? '' : 's')
+             + (target === 'relay' ? ' — strfry re-reads its config on its own' : ''))
+          : (result.body.note || 'no field differed');
+        return loadSettings();
+      })
+      .catch(function () {
+        statusLine.textContent = 'not saved — request failed';
+        saveBtn.disabled = false;
+      });
+  });
+}
+
+function render() {
+  buildSection(
+    document.getElementById('relay-section'), 'relay',
+    'Relay', 'strfry.conf — the relay reads this file itself; saving does not restart anything',
+    payload.relay
+  );
+  buildSection(
+    document.getElementById('app-section'), 'app',
+    'Admin console', 'config.json — this admin UI\'s own settings',
+    payload.app
+  );
+}
+
+function loadSettings() {
+  return s86SignAndPost('/api/settings', {})
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('could not load settings: ' + s86ErrMsg(result));
+        return;
+      }
+      payload = result.body;
+      render();
+    })
+    .catch(function () {
+      setStatus('could not load settings');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  setStatus('');
+  loadSettings();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+
+fetch('/api/banned')
+  .then(function (res) { return res.json(); })
+  .then(function (data) {
+    adminPubkey = data.admin;
+    s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+  })
+  .catch(function () {});
+</script>
+</body>
+</html>

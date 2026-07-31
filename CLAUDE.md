@@ -13,6 +13,8 @@ KIND_ALARM_SHARE       = 0.005   # ONE unlisted kind this big = the actionable a
 SUBSCRIBER_SCAN_LIMIT  = 50000   # saturation here REFUSES the exempt purge (WHY.md §5)
 RECIPIENT_SCAN_LIMIT   = 250000  # permanently saturated; safe direction only (WHY.md §5)
 CONSOLE_VERBS          = ("scan", "info", "export")  # --count/read-only; all else refused
+DECISION_LOG_MAX_LINES = 2000    # plugin86.py: decision records per segment before rotation
+DECISION_TAIL_MAX      = 500     # decision records server86 reads back per poll
 ```
 
 ## Rendering results — project-wide; every page and future page inherits this
@@ -91,68 +93,117 @@ tab carries `aria-current="page"` and the accent underline.
 
 ## Pages
 
-### `/home` — activity feed (public landing page)
-Logged out this IS the site. It renders kind, human kind label, timestamp, truncated event
-id — **no pubkeys, no content, no links to profiles** while logged out; the no-leak rule
-holds. Logged in, rows add author npub linked to `/profile`. Fed by the live layer,
-newest first, capped at `RENDER_MAX`, no history fetch.
+Six, and only six. `/report` and `/authors` are gone as pages: Report's scan panels are
+sections of Stats & Console, Authors is the Users page. Both old paths, plus `/userlist`,
+302 to their new home via `LEGACY_REDIRECTS` — never by serving a second copy of a page.
+`/profile` and `/domain` are detail pages reached from a row or the search box, never
+from the nav.
 
-### `/stats`
-- Totals table + per-kind table, kinds labelled from the bundled nostrbook kind map
-  (`kinds86.json`, vendored, never fetched at runtime), unknown kinds shown as `kind N`.
+### `/home` — Live Event Feed (public landing page)
+Logged out this IS the site, and it shows the relay working: Time · Kind · Author ·
+Content · Result. Author and content are public — the earlier no-leak rule is
+**withdrawn**, deliberately; a relay's accepted events are already readable by any client
+that connects to it, and a landing page that hid them was hiding nothing. Filter by
+pubkey and by kind are client-side over the whole buffer. Fed by the live layer, newest
+first, capped at `RENDER_MAX`, no history fetch.
+
+`Result` comes from the decision log, never from a scan — see "Write policy decisions"
+below. With no decision log the column renders `—` for every row and the age line says
+why; it must NEVER render "accepted" for an event nothing judged (rule 9).
+
+### `/stats` — Relay Statistics & Console
+- **Six headline tiles** (`<dl class="tiles">`, the `<dl>` half of rendering rule 2):
+  events/sec · events in DB · DB size · accept rate · top kind · gift-wrap storage. Every
+  one is a cache read or a `stat()`; none starts a scan. Connected-client count is NOT
+  here — nothing in the stack can measure it, and an invented number is worse than none.
+- Totals table + per-kind table, unknown kinds shown as `kind N`.
 - **Baseline + delta model**: figures = last walk/totals cache PLUS live deltas since.
   Header line: `baseline <abs> (<rel>) · +N events, −M deletes since`. Never present a
   session-relative number as a database total. Kind-5 deletes decrement; strfry-internal
   expiry does NOT appear live and is only corrected by the next walk — say so on the page.
-- Surfaces only excess worth noticing: the gap ladder verdict, saturation notices, expired
-  events. Everything else is a figure, not an alarm.
-- **Console box**: live tail of strfry stderr/stdout (server-sent events, ring buffer,
-  `RENDER_MAX` lines). Input runs `strfry <verb> …` only when the first token is in
-  `CONSOLE_VERBS` and no write flag is present; anything else renders the refusal and the
-  reason, executes nothing. The console NEVER runs `delete` — purges go through the
-  guarded forms only (WHY.md §5). Global job lock applies to console commands too.
+- **§ Database** and **§ Gift wrap storage**: the cached-scan panels, moved here whole
+  from `/report`. Panel shape unchanged: heading `<h3>` · cost line · last-run line (THIS
+  relay's measured duration) · button · status line · message slot · figures table, `<hr>`
+  between sections. `refresh totals` (seconds) and `run full database walk` (minutes) stay
+  two buttons; walk refreshes totals as a byproduct, never the reverse. When walk and
+  totals timestamps differ, state `figures taken <n> min apart` — never reconcile.
+  Global lock: while any job runs, every other button disables and says what it waits on.
+- Neither scan section has a list, a checkbox, or any control acting on a set the page
+  assembled. That invariant moved here with the panels and still holds.
+- **Console**, two dark panels side by side:
+  - *write policy* — the plugin86 decision stream, newest first, from the live layer.
+    NOT strfry's own stderr: server86 is a sibling process, not the relay's parent, and
+    cannot read it. Saying "tail of strfry stdout" would be a lie about the source.
+  - *console* — input runs `strfry <verb> …` only when the first token is in
+    `CONSOLE_VERBS` and no write flag is present; anything else renders the refusal and
+    the reason, executes nothing. Quick-command chips may only contain `CONSOLE_VERBS`
+    commands. The console NEVER runs `delete` — purges go through the guarded forms only
+    (WHY.md §5). Global job lock applies to console commands too.
 
-### `/userlist`
-One dedicated page: list every known member as fast as possible, filter instantly.
-Columns: name · nip-05 · npub (truncated, full on hover/copy) · event count ·
-gift-wrap p-tag count · reports by others (kind 1984).
-- Rows appear immediately from cache; unknown cells render `—` and fill in as endpoints
-  answer (rule 9). Filter is client-side over ALL rows, instant, no debounce fetch.
+### `/users` — Users (the member table and the scan that fills it, one page)
+Columns: User (identity dot + best label) · NIP-05 · Events · Reports · Gift-wraps
+(p-tag) · Last active · row `Ban`. Above them, the author scan panel: two modes with
+`recent` the default radio, durations from `modes` in `GET /api/authors` measured on THIS
+relay, never a developer-relay number.
+- Logged out: heading, header, login button only — no list, no control, no filter.
+- Rows come from `GET /api/userlist` (the join of the authors, recipients and reports
+  caches). Unknown cells render `—` and fill in as scans answer (rule 9). Search is
+  client-side over ALL rows, instant, no debounce fetch.
 - Gift-wrap column is a FLOOR while the recipient scan saturates: render `≥ n` and label
   the column header `(floor — scan capped)`. Never render a saturated count bare.
 - Report counts come from `POST /api/reports` (index count of kind 1984 per p-tag, cached).
-- Render cap `RENDER_MAX`; filter matches against the full set.
+- Render cap `RENDER_MAX`; search matches against the full set.
+- There is **no First seen column**. Nothing measures it without a whole-database walk per
+  pubkey, and a column that is permanently `—` is worse than a column that isn't there.
 
-### `/report`
-Shared cached-scan panel (also used by `/authors`): heading `<h3>` · cost line ·
-last-run line (THIS relay's measured duration) · button · status line · message slot ·
-figures table. `<hr>` between panels, `<h2>` for sections. Two buttons in § Database:
-`refresh totals` (seconds, exact) and `run full database walk` (minutes); walk refreshes
-totals as a byproduct, never the reverse. Totals table = five rows with per-row
-denominators; walk panel = aggregate table (incl. split author counts and `expired
-events`, rendered only when non-null), then top-`FIGURE_HEAD_MAX` unlisted kinds with
-shares, then `<details>` full histogram. When walk and totals timestamps differ, state
-`figures taken <n> min apart` — never reconcile by adjusting either. Author-list pointer
-is one sentence + link naming the cheap press. Global lock: while any job runs, every
-other button disables and says what it is waiting on. Undo history here is ONE line:
-`last action: <summary> — full log → /audit`.
+### `/bans` — Banlist
+Two tables. **Banned Pubkeys** is what enforces: plugin86 checks it on every event.
+**Banned NIP-05 Domains** is a receipt, not a rule — it records that a domain's roster was
+read and banned, and its Unban reverses that set. Deciding domain membership at write time
+would mean fetching `/.well-known/nostr.json` per event from inside the relay's blocking
+path; this project does not make external requests there. The page says so under the
+table, so no row is mistaken for protection it does not provide. A domain row shows
+`n of m still banned`, because individual unbans since then are exactly what a snapshot
+count would hide.
 
-`report.html` has no list, no checkbox, no selection, and no control acting on a set the
-page assembled. Its only write is the undo of an action recorded in the audit log,
-against pubkeys named on the record itself.
+### `/audit` — Audit Log
+Server-side log of every admin action (bans, unbans, reason edits, settings writes),
+newest first, capped at `RENDER_MAX`, full set behind filter. Table: Time (relative, absolute
+on hover) · Admin · Action (badge) · Detail · Undo where the inverse exists; undone rows
+render struck through and say `Undone`. Every other page shows at most ONE undo line at
+top linking here. The audit log is the authority for undo — localStorage undo state is
+dead; do not resurrect it.
 
-### `/audit`
-Server-side log of every admin action (bans, unbans, purges, reason edits, console
-commands), newest first, capped at `RENDER_MAX`, full set behind filter. Each record:
-absolute+relative time, action, pubkeys/args, and `Undo` where the inverse exists.
-Every other page shows at most ONE undo line at top linking here. The audit log is the
-authority for undo — localStorage undo state is dead; do not resurrect it.
+### `/settings` — Settings
+Two config files through one builder: the relay's `strfry.conf` and strfry-86's
+`config.json`. Each renders structured fields grouped in **file order** plus a raw editor
+behind `Edit raw`, and each has its own Save.
+- A field save rewrites only that field's value token, in place. Comments, ordering,
+  indentation and everything the parser does not model stay byte-identical — a hand-tuned
+  config must survive a visit to this page.
+- Nothing restarts the relay. strfry re-reads its own config; the two settings that do
+  need a restart (this UI's port and bind) say so on their own rows.
+- `strfry.conf` is checked for balanced braces before any write, and the previous copy is
+  kept at `strfry.conf.bak`. `config.json` raw saves are refused unless the result still
+  carries a valid `admin_pubkey_hex`.
+- `admin_pubkey_hex` is **not** editable here. It authorises the request doing the
+  writing; a UI that can change it can lock the operator out in one keystroke.
 
-### `/authors`
-Logged out: heading, header, login button only — no list, no control, no filter.
-Logged in, empty: full scan panel (`never run`, both cost lines, both buttons) above one
-sentence naming contents and the cheap press; durations from `modes` in `GET /api/authors`,
-measured on THIS relay, never a developer-relay number. `recent` is the default radio.
+### Write policy decisions — the only channel that sees a REJECT
+A blocked event never reaches the database, so no `strfry scan` can report one. plugin86
+appends one line per decision to `decisions.jsonl`, from inside strfry's blocking write
+path, which makes every rule about it a latency rule: one short append, content truncated
+by the plugin, rotation by `os.replace` (O(1), two segments retained), and any failure
+disables logging for the life of the process rather than retrying. server86 reads a
+bounded tail of both segments. Feed rows, the Result column and the accept-rate tile all
+come from this; with no log they degrade to unknown, never to a guess.
+
+### Identity — never an avatar
+A row identifies a pubkey with a coloured dot whose hue is folded from the whole key, plus
+the best label the row has (name → nip-05 → truncated npub). No `<img>`: rendering a
+profile picture means fetching an arbitrary URL from an arbitrary host for every row, and
+on `/profile` the `picture` and `website` fields stay plain text for the same reason — an
+automatic load discloses the admin's IP to the account under investigation.
 
 ### Record lines — every page
 At most three controls: `↩`, `Undo`, expand arrow. No `<input>`, no reason field, ever.
@@ -182,8 +233,20 @@ older than itself. `test.sh` fails only on the single-kind alarm.
 - `GET /api/authors`: empty response starts nothing; carries `modes` with measured
   durations (null until a run exists).
 - `GET /api/audit` (paged, newest first) and `POST /api/undo` back `/audit`.
-- Live layer: one server-side strfry subscription fanned out over SSE to `/home` and
-  `/stats`; deltas only, no history replay, reconnect resets deltas and re-reads baseline.
+- `GET /api/userlist`: carries `last_seen` per row (Last active); no `first_seen` exists.
+- `GET /api/metrics`: the six tiles. Cache reads and one `stat()` of the LMDB directory —
+  never a scan. `events_per_sec` is null until two poll ticks have landed; `accept_rate`
+  and `blocked` are null with no decision log. Nothing here is ever 0-by-default.
+- `GET /api/domain-bans` and `POST /api/domain-unban`: the domain receipts. Unban removes
+  the record AND unbans its snapshot of pubkeys. `POST /api/ban` takes an optional
+  `domain`, which writes the receipt; it changes nothing about enforcement.
+- `POST /api/settings` (read) and `POST /api/settings/save` (write) — POST for both,
+  because every admin-only read in this project carries its NIP-98 auth in the body.
+  `save` takes `target:"relay"|"app"` and either `edits` (per-path) or `raw`.
+- Live layer: one server-side strfry poll fanned out over SSE to `/home` and `/stats`;
+  deltas only, no history replay, reconnect resets deltas and re-reads baseline. Its
+  `events` are decision-log rows when one exists (carrying `pubkey`, `npub`, `content`,
+  `result`, `msg`) and scan-ring rows otherwise (with `result` null, never "accepted").
 
 ## test.sh — every assertion covers a silent failure
 
@@ -194,9 +257,13 @@ purge form only; emitted command has NO `#p` list. Caps hold (444 keys → head 
 whose total equals omitted sum; 12,481 rows → `RENDER_MAX` shown, all filtered). No record
 line contains an `<input>`. `report.html` DOM has no checkbox and no set-bound handler.
 Empty authors page: both buttons, `recent` checked, duration sourced from `modes`.
-Console: a `delete` verb is refused and nothing executes. Userlist: saturated gift-wrap
-cell renders `≥`. `/home` logged-out DOM contains no npub and no profile link.
-Style block byte-identical across all nine pages (`tools/stamp_style.py --check`).
+Console: a `delete` verb is refused and nothing executes. Users: saturated gift-wrap
+cell renders `≥`. Style block byte-identical across every page
+(`tools/stamp_style.py --check`). Legacy paths `/report`, `/authors`, `/userlist` each 302
+rather than 404. A feed row with no decision renders `—` in Result, never "accepted".
+`strfry.conf` field edits change ONE line and leave every comment and blank line intact;
+an unbalanced-brace raw save writes nothing. `config.json` raw save without a valid
+`admin_pubkey_hex` is refused.
 
 ## Reference (2026-07-30, this relay; every figure states DB-wide vs window)
 

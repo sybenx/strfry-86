@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/favicon.ico">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>strfry-86 — stats</title>
+<title>strfry-86 — stats &amp; console</title>
 <style>
 /* strfry-86 style block — canonical source. tools/stamp_style.py copies this
    file verbatim into every page's <style>, so "identical character-for-character
@@ -65,6 +65,71 @@ code { font-family:var(--mono); font-size:.85em; }
         border:1px solid currentColor; border-radius:8px; color:var(--muted); }
 .pill.live { color:var(--good); }
 .pill .dot { width:.45em; height:.45em; border-radius:50%; background:currentColor; }
+.chip { display:inline-block; font-family:var(--mono); font-size:.7rem; padding:.2em .6em;
+        border:1px solid currentColor; border-radius:6px; color:var(--muted); }
+.chip.good { color:var(--good); }
+.chip.bad { color:var(--accent); }
+.chips { display:flex; flex-wrap:wrap; gap:.4em; margin:.6rem 0; }
+button.chip.cmd { font-weight:400; background:transparent; color:var(--ink);
+                  border-color:var(--rule); }
+button.chip.cmd:hover { background:var(--ink); color:var(--paper); }
+/* Identity dot, never an avatar: the hue comes from the pubkey itself, so no
+   row on any page ever fetches an image from a stranger's host. */
+.idot { width:.75em; height:.75em; border-radius:50%; flex:none;
+        background:oklch(.65 .11 var(--h, 0)); }
+.idot.unknown { background:var(--rule); }
+.idot.big { width:4.5em; height:4.5em; }
+.profile-head { display:flex; gap:1.5em; align-items:flex-start; padding-bottom:1.4rem;
+                margin-bottom:1.2rem; border-bottom:1px solid var(--rule); }
+.profile-head .profile-id { flex:1; min-width:0; }
+.profile-head .profile-id > * { margin:.25rem 0; }
+.profile-head h2 { font-size:1.5rem; margin:0; }
+td.identity { display:flex; align-items:center; gap:.5em; white-space:nowrap;
+              max-width:15em; }
+td.identity > :last-child { overflow:hidden; text-overflow:ellipsis; }
+td.num { font-family:var(--mono); font-size:.9em; }
+td.num.bad { color:var(--accent); }
+td.pick { width:1.5em; }
+td.action { text-align:right; white-space:nowrap; }
+/* A clipped cell must not be allowed to size its column, or one long note
+   pushes every other column off the page. max-width:0 hands the column its
+   width from the table instead; `.grow` then gives it whatever is left. */
+td.clip { max-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+th.grow, td.grow { width:100%; }
+.struck { text-decoration:line-through; }
+/* A control that reads as a link but IS a button — it performs an action, so
+   it must be a button for the keyboard and the screen reader both. */
+button.linky { font-size:.78rem; font-weight:400; padding:.15em .3em; border:none;
+               background:none; color:var(--accent); text-decoration:underline;
+               text-underline-offset:2px; }
+button.linky:hover:not(:disabled) { background:none; color:var(--accent); opacity:.7; }
+.toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:.6em; margin:.7rem 0; }
+.toolbar > input[type="search"], .toolbar > input[type="text"] { flex:1; min-width:12em; }
+.modes { display:flex; flex-direction:column; gap:.3em; }
+.modes label { display:flex; align-items:baseline; gap:.5em; font-size:.88rem; }
+dl.tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(11em, 1fr));
+           gap:1px; margin:1.2rem 0; background:var(--rule);
+           border:1px solid var(--rule); border-radius:10px; overflow:hidden; }
+dl.tiles .tile { background:var(--surface); padding:.9em 1em; }
+dl.tiles dt { font-size:.68rem; font-weight:600; text-transform:uppercase;
+              letter-spacing:.08em; color:var(--muted); }
+dl.tiles dd { margin:.3rem 0 0; font-family:var(--serif); font-size:1.5rem;
+              font-weight:700; letter-spacing:-.02em; }
+dl.tiles .note { margin:.2rem 0 0; font-family:var(--mono); font-size:.68rem; color:var(--muted); }
+dl.tiles .note.bad { color:var(--accent); }
+.field-row { display:grid; grid-template-columns:16em 1fr; gap:1.2em;
+             align-items:baseline; padding:.45em 0; }
+.field-label { font-size:.85rem; color:var(--muted); }
+.field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
+.field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.6;
+           padding:1em; resize:vertical; background:var(--term-bg); color:var(--term-fg);
+           border:1px solid var(--term-edge); border-radius:14px; }
+.console-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.2em; align-items:start; }
+.console-grid h3 { display:flex; align-items:center; gap:.5em; }
+.dot-inline { width:.5em; height:.5em; border-radius:50%; background:var(--good); flex:none; }
+.dot-inline.warn { background:light-dark(oklch(.6 .14 80), oklch(.8 .14 80)); }
+.dot-inline.off { background:var(--rule); }
 table { width:100%; border-collapse:collapse; margin:.8rem 0 1.4rem; font-size:.92em; }
 th, td { text-align:left; padding:.6em .7em; border-bottom:1px solid var(--hair);
          font-variant-numeric:tabular-nums; }
@@ -91,9 +156,16 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere;                /* commands o
       font-family:var(--mono); font-size:.8rem; line-height:1.65; padding:1em 1.1em;
       background:var(--term-bg); color:var(--term-fg);
       border:1px solid var(--term-edge); border-radius:14px; }
-pre#console-log { min-height:6em; max-height:26em; overflow:auto; }
+pre#console-log, pre#decision-log { min-height:12em; max-height:26em; overflow:auto; }
+/* A log line is one line. Wrapping a key across two rows makes a tail
+   unreadable, so this panel scrolls sideways inside its own box — which the
+   no-horizontal-scroll rule is about the PAGE, not about a terminal. */
+pre#decision-log { white-space:pre; overflow-wrap:normal; }
 pre#console-log:empty::before { content:"strfry console — read-only verbs only";
                                 color:oklch(.6 .01 60); }
+pre .good { color:oklch(.78 .1 145); }
+pre .bad { color:oklch(.72 .16 25); }
+pre .dim { color:oklch(.6 .01 60); }
 .console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
 .console-row .prompt { font-family:var(--mono); color:var(--good); }
 .console-row input { flex:1; }
@@ -124,6 +196,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
      a nip-05 address — rather than let the table overflow. */
   th, td { padding:.5em .35em; overflow-wrap:anywhere; }
   .nowrap { white-space:normal; }
+  td.clip { max-width:none; white-space:normal; }
+  .console-grid { grid-template-columns:1fr; }
+  .field-row { grid-template-columns:1fr; gap:.2em; }
   header#s86 .tagline { display:none; }
   header#s86 input#q { max-width:none; margin:0 0 .5em; }
 }
@@ -131,34 +206,74 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 </head>
 <body>
 <div class="page-head">
-  <h1>Stats</h1>
+  <h1>Relay Statistics</h1>
   <span id="live-pill"></span>
 </div>
 <p id="status"></p>
+<div id="tiles-container"></div>
 <p id="baseline-line"></p>
 <div id="totals-container"></div>
-<div id="kinds-container"></div>
 <div id="gap-container"></div>
-<div id="console-section" style="display:none">
+<div id="kinds-container"></div>
+
+<div id="admin-section" style="display:none">
+  <div id="command-block-container"></div>
+  <div id="records-list"></div>
+
+  <hr>
+  <h2>Database</h2>
+  <div id="totals-panel-container"></div>
+  <div id="walk-panel-container"></div>
+  <p id="author-pointer-line"></p>
+
+  <hr>
+  <h2>Gift wrap storage</h2>
+  <p>A safe gift-wrap retention purge needs both scans below: recipients, so the purge command can name whose gift wraps it would delete, and subscribers, so it can exempt the ones this relay is their own DM inbox for.</p>
+  <div id="recipients-panel-container"></div>
+  <div id="subscribers-panel-container"></div>
+
+  <hr>
   <h2>Console</h2>
-  <p>Read-only verbs only: <code>scan</code>, <code>info</code>, <code>export</code>. Everything else is refused.</p>
-  <pre id="console-log"></pre>
-  <div class="console-row">
-    <span class="prompt" aria-hidden="true">❯</span>
-    <input id="console-input" type="text" placeholder="scan --count {}"
-           aria-label="strfry console command">
-    <button id="console-run" type="button">Run</button>
+  <div class="console-grid">
+    <section>
+      <h3><span id="log-dot" class="dot-inline"></span> write policy — plugin86 decisions</h3>
+      <pre id="decision-log"></pre>
+    </section>
+    <section>
+      <h3><span class="dot-inline warn"></span> console — strfry CLI</h3>
+      <pre id="console-log"></pre>
+      <div class="console-row">
+        <span class="prompt" aria-hidden="true">❯</span>
+        <input id="console-input" type="text" placeholder="scan --count {}" aria-label="strfry console command">
+        <button id="console-run" type="button">Run</button>
+      </div>
+      <div id="quick-cmds" class="chips"></div>
+      <p class="muted">Read-only verbs only: <code>scan</code>, <code>info</code>, <code>export</code>. Everything else is refused, and the console never runs <code>delete</code> — purges go through the guarded forms above.</p>
+    </section>
   </div>
 </div>
 <script src="/common86.js"></script>
 <script>
+// Stats & Console is also where the Report page's scan panels now live: the
+// figures at the top of this page ARE what those panels produce, and a
+// number and the button that refreshes it belong on one page.
 var KNOWN_KINDS = {
-  0: 'profile', 1: 'note', 5: 'deletion', 6: 'repost', 7: 'reaction',
+  0: 'profile', 1: 'note', 3: 'contacts', 5: 'deletion', 6: 'repost', 7: 'reaction',
   1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt',
   10002: 'relay list', 10050: 'DM relay list', 30023: 'long-form'
 };
+var QUICK_COMMANDS = [
+  'info',
+  'scan --count {}',
+  'scan --count {"kinds":[1]}',
+  'scan --count {"kinds":[1059]}'
+];
+var METRICS_INTERVAL = 15000;
+var DECISION_LOG_LINES = 40;
+
 var adminPubkey = null;
 var isAdmin = false;
+var lastBanned = [];
 var lastTotals = null;
 var lastWalk = null;
 var lastBaselineAt = null;
@@ -167,14 +282,21 @@ var statusEl = document.getElementById('status');
 var livePill = document.getElementById('live-pill');
 var chrome = s86BuildPageChrome(statusEl);
 var loginBtn = chrome.loginBtn;
+var adminSection = document.getElementById('admin-section');
+var commandBlockContainer = document.getElementById('command-block-container');
+var recordsList = document.getElementById('records-list');
+var authorPointerLine = document.getElementById('author-pointer-line');
+var tilesContainer = document.getElementById('tiles-container');
 var baselineLine = document.getElementById('baseline-line');
 var totalsContainer = document.getElementById('totals-container');
 var kindsContainer = document.getElementById('kinds-container');
 var gapContainer = document.getElementById('gap-container');
-var consoleSection = document.getElementById('console-section');
+var decisionLog = document.getElementById('decision-log');
+var logDot = document.getElementById('log-dot');
 var consoleLog = document.getElementById('console-log');
 var consoleInput = document.getElementById('console-input');
 var consoleRun = document.getElementById('console-run');
+var quickCmds = document.getElementById('quick-cmds');
 
 function setStatus(text) { statusEl.textContent = text; }
 
@@ -186,20 +308,98 @@ function setLivePill(label, isLive) {
 setLivePill('CONNECTING', false);
 
 function kindLabel(kind) {
+  return 'kind ' + kind + (KNOWN_KINDS[kind] ? ' (' + KNOWN_KINDS[kind] + ')' : '');
+}
+
+function shortKindLabel(kind) {
   return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
 }
 
-// Baseline + delta model (CLAUDE.md "/stats"): figures are the last
-// walk/totals cache PLUS the live layer's running delta since that cache's
-// own scanned_at. Kind-5 deletes are shown alongside new events, never
-// netted into one number — strfry-internal NIP-40 expiry does NOT appear
-// here at all; only the next walk corrects for it.
+// --- headline tiles ---------------------------------------------------------
+// Six figures, none of which starts a scan: five are already in a cache this
+// server keeps, and the sixth is the size of the LMDB directory. A page of
+// headline numbers must never be the most expensive thing on the relay.
+
+function renderTiles(m) {
+  tilesContainer.textContent = '';
+  // Every figure on this page comes from `strfry --config <path> scan`, so a
+  // config that could not be resolved does not make the numbers late — it
+  // makes them absent, or worse, taken from a database the running relay
+  // never writes to. Say so above the tiles rather than under them.
+  if (!m.conf_ok) {
+    var warn = s86El('p', 'No strfry.conf could be found, so nothing on this page can read the '
+      + 'relay\'s database. Set its path in ');
+    var link = document.createElement('a');
+    link.href = '/settings';
+    link.textContent = 'Settings';
+    warn.appendChild(link);
+    warn.appendChild(document.createTextNode('.'));
+    tilesContainer.appendChild(warn);
+  }
+  var accept = m.accept_rate != null ? (m.accept_rate * 100).toFixed(1) + '%' : null;
+  tilesContainer.appendChild(s86BuildTiles([
+    {
+      label: 'Events / sec',
+      value: m.events_per_sec != null ? m.events_per_sec.toFixed(1) : null,
+      note: m.events_per_sec != null ? 'live, trailing 60s' : 'measuring…'
+    },
+    {
+      label: 'Events in DB',
+      value: m.events_total != null ? m.events_total.toLocaleString() : null,
+      note: m.baseline_at ? ('baseline ' + s86FormatRelativeAge(m.baseline_at)) : 'no walk or totals yet'
+    },
+    {
+      label: 'DB size',
+      value: s86FormatBytes(m.db_bytes),
+      note: m.db_bytes != null
+        ? ('on disk, via strfry.conf from the ' + (m.conf_source || 'default location'))
+        : (m.conf_ok ? 'db path in strfry.conf is unreadable' : 'no strfry.conf found'),
+      tone: m.db_bytes == null ? 'bad' : null
+    },
+    {
+      label: 'Accept rate',
+      value: accept,
+      note: m.judged
+        ? (m.blocked.toLocaleString() + ' blocked of ' + m.judged.toLocaleString() + ' judged')
+        : 'no decision log yet',
+      tone: m.blocked ? 'bad' : null
+    },
+    {
+      label: 'Top kind',
+      value: m.top_kind != null ? ('kind:' + m.top_kind) : null,
+      note: m.top_kind_share != null
+        ? ((m.top_kind_share * 100).toFixed(1) + '% of events walked')
+        : 'needs a database walk'
+    },
+    {
+      label: 'Gift-wrap storage',
+      value: m.giftwrap_events != null ? m.giftwrap_events.toLocaleString() : null,
+      note: m.giftwrap_share != null
+        ? ((m.giftwrap_share * 100).toFixed(1) + '% of all events')
+        : 'needs a totals refresh'
+    }
+  ]));
+}
+
+function loadMetrics() {
+  return fetch('/api/metrics')
+    .then(function (res) { return res.json(); })
+    .then(renderTiles)
+    .catch(function () {});
+}
+
+// --- baseline + delta -------------------------------------------------------
+// Figures are the last walk/totals cache PLUS the live layer's running delta
+// since that cache's own scanned_at. Kind-5 deletes are shown alongside new
+// events, never netted into one number — strfry-internal NIP-40 expiry does
+// NOT appear here at all; only the next walk corrects for it.
+
 function renderBaselineLine(live) {
   var totals = lastTotals;
   var baselineAt = (totals && totals.scanned_at != null) ? totals.scanned_at
     : (lastWalk && lastWalk.scanned_at != null ? lastWalk.scanned_at : null);
   if (baselineAt == null) {
-    baselineLine.textContent = 'no walk/totals baseline yet — run a full database walk or refresh totals on Report to establish one.';
+    baselineLine.textContent = 'no walk/totals baseline yet — run a full database walk or refresh totals below to establish one.';
     return;
   }
   var line = 'baseline ' + s86FormatDate(baselineAt) + ' (' + s86FormatRelativeAge(baselineAt) + ')';
@@ -214,6 +414,7 @@ function renderBaselineLine(live) {
   } else if (live) {
     setLivePill('LIVE', true);
   }
+  line += '. Events strfry expired on its own (NIP-40) do not appear here; only the next walk corrects for them.';
   baselineLine.textContent = line;
 }
 
@@ -235,11 +436,11 @@ function renderStats(data) {
       ['— not in allowlist', totals.gap_events, (totals.gap_share * 100).toFixed(1) + '% of non-gift-wrap']
     ]));
     if (totals.gap_level === 'stale') {
-      gapContainer.appendChild(s86El('p', 'allowlist alarm: a single unlisted kind is large enough to act on — see Report.'));
+      gapContainer.appendChild(s86El('p', 'allowlist alarm: a single unlisted kind is large enough to act on — see the database walk below.'));
     } else if (totals.gap_level === 'notice') {
       gapContainer.appendChild(s86El('p', 'allowlist covers '
         + ((1 - totals.gap_share) * 100).toFixed(1)
-        + '% of non-gift-wrap; remaining share is long-tail shaped (see Report walk).'));
+        + '% of non-gift-wrap; remaining share is long-tail shaped (see the walk below).'));
     } else if (totals.gap_level === 'ok') {
       gapContainer.appendChild(s86El('p', 'allowlist covers '
         + ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap events.'));
@@ -249,7 +450,7 @@ function renderStats(data) {
   var walk = data.walk;
   if (walk && walk.kinds) {
     var kindRows = Object.keys(walk.kinds).map(function (k) {
-      return [kindLabel(parseInt(k, 10)), walk.kinds[k]];
+      return [shortKindLabel(parseInt(k, 10)), walk.kinds[k]];
     }).sort(function (a, b) { return b[1] - a[1]; });
     if (kindRows.length) {
       kindsContainer.appendChild(s86El('h2', 'Kinds (walk baseline)'));
@@ -274,20 +475,407 @@ function loadStats() {
     .catch(function () { setStatus('failed to load stats'); });
 }
 
+// --- § Database: totals + walk, sharing GET /api/report ---------------------
+// Two independent buttons, because independent persistence implies
+// independent triggers: 'refresh totals' is seconds-long, 'run full database
+// walk' is minutes-long, and a single button that takes three seconds on
+// Tuesday and nine minutes on Wednesday is how an operator learns to be
+// afraid of pressing it. The walk reads the same --count first for its own
+// denominator, so pressing it refreshes the totals above as a byproduct —
+// the reverse is never true.
+
+var lastReportData = null;
+
+function reportJobStatusFor(data, jobName) {
+  if (data.status === 'running') {
+    if (data.job === jobName) {
+      return { status: 'running', progress: data.progress, total: data.total, rate: data.rate, eta: data.eta, blocked_by: null };
+    }
+    return { status: 'idle', blocked_by: 'report-' + data.job };
+  }
+  return { status: 'idle', blocked_by: data.blocked_by };
+}
+
+// The three-level allowlist-gap ladder from CLAUDE.md's "Allowlist audit —
+// two questions, two thresholds". gap_level/needs_walk/gap_alarm_kind/
+// gap_alarm_events all come from POST /api/report/totals; the 'notice, walk
+// fresh, no alarm kind' case additionally names the gap's SHAPE from the
+// walk record, since an index count alone knows only the gap's size, never
+// its composition.
+function renderGapVerdict(container, totals, walk) {
+  var coveragePct = (100 - totals.gap_share * 100).toFixed(1);
+  var gapPct = (totals.gap_share * 100).toFixed(1);
+
+  if (totals.gap_level === 'ok') {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events.'));
+    return;
+  }
+
+  if (totals.gap_level === 'stale') {
+    var nonGiftwrap = totals.total_events - totals.giftwrap_events;
+    var alarmPct = nonGiftwrap > 0 ? (totals.gap_alarm_events / nonGiftwrap * 100).toFixed(1) : '0.0';
+    container.appendChild(s86El('p', kindLabel(totals.gap_alarm_kind) + ' holds ' + totals.gap_alarm_events.toLocaleString()
+      + ' events — ' + alarmPct + '% of non-gift-wrap — and is NOT in AUTHOR_SCAN_KINDS.'));
+    container.appendChild(s86El('p', 'The full author list is missing its authors. Add it.'));
+    return;
+  }
+
+  if (totals.needs_walk || !walk || !walk.unlisted_kinds) {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events. The remaining '
+      + gapPct + '% (' + totals.gap_events.toLocaleString() + ' events) has not been broken down by kind yet — '
+      + 'run the database walk to see whether this is one missing kind or the long tail.'));
+    return;
+  }
+  var unlisted = Object.keys(walk.unlisted_kinds)
+    .map(function (k) { return [parseInt(k, 10), walk.unlisted_kinds[k]]; })
+    .sort(function (a, b) { return b[1] - a[1]; });
+  if (unlisted.length === 0) {
+    container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events.'));
+    return;
+  }
+  var worst = unlisted[0];
+  var nonGiftwrapWalk = totals.total_events - totals.giftwrap_events;
+  var worstPct = nonGiftwrapWalk > 0 ? (worst[1] / nonGiftwrapWalk * 100).toFixed(2) : '0.00';
+  var kindCount = walk.unlisted_kind_count != null ? walk.unlisted_kind_count : unlisted.length;
+  container.appendChild(s86El('p', 'allowlist covers ' + coveragePct + '% of non-gift-wrap events. The remaining '
+    + gapPct + '% is spread across ' + kindCount.toLocaleString() + ' kinds; the largest is ' + kindLabel(worst[0])
+    + ' at ' + worst[1].toLocaleString() + ' events (' + worstPct + '%). This is the long tail, not staleness — '
+    + 'no single kind is worth adding.'));
+}
+
+var totalsPanel = s86BuildScanPanel({
+  heading: 'database totals',
+  costText: 'reads three index counts — exact, seconds even on a large relay',
+  buttonLabel: 'refresh totals',
+  onStart: function () { return startReportJob('/api/report/totals'); },
+  lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration)) : null; },
+  renderResult: function (container, record) {
+    var nonGiftwrap = record.total_events - record.giftwrap_events;
+    container.appendChild(s86BuildKeyValueTable([
+      ['all events', record.total_events, ''],
+      ['gift wraps', record.giftwrap_events, (record.giftwrap_share * 100).toFixed(1) + '% of all'],
+      ['non-gift-wrap', nonGiftwrap, ''],
+      ['— in allowlist', record.allowlist_events, (100 - record.gap_share * 100).toFixed(1) + '%'],
+      ['— not in allowlist', record.gap_events, (record.gap_share * 100).toFixed(1) + '%']
+    ]));
+    renderGapVerdict(container, record, lastReportData && lastReportData.walk);
+  }
+});
+
+var walkPanel = s86BuildScanPanel({
+  heading: 'whole-database walk',
+  costText: 'reads every event in the database — the estimate appears within a few seconds of starting; refreshes the totals above as a byproduct',
+  buttonLabel: 'run full database walk',
+  onStart: function () { return startReportJob('/api/report/walk'); },
+  lastRunNote: function (record) { return record.duration != null ? ('last run: ' + s86FormatDuration(record.duration) + ' at ' + s86FormatRate(record.rate)) : null; },
+  renderResult: function (container, record) {
+    var giftwraps = record.distinct_authors_giftwrap;
+    var kindsSeen = Object.keys(record.kinds || {}).length;
+    var unlistedCount = record.unlisted_kind_count != null ? record.unlisted_kind_count : Object.keys(record.unlisted_kinds || {}).length;
+    var unlistedTotal = record.unlisted_total != null ? record.unlisted_total : 0;
+    var rows = [
+      ['events walked', record.events_read, ''],
+      ['distinct authors', record.distinct_authors, ''],
+      ['— measured', record.distinct_authors_nongiftwrap, ''],
+      ['— gift wraps', giftwraps, 'one key per message'],
+      ['kinds seen', kindsSeen, ''],
+      ['unlisted kinds', unlistedCount, unlistedTotal.toLocaleString() + ' events']
+    ];
+    // NIP-40 expired events, like gift wraps, are purgeable storage the
+    // operator can weigh — surfaced here rather than in totals because a
+    // --count can't see a non-single-letter tag, only a full walk can.
+    // Guarded so a walk cached before this figure existed renders cleanly.
+    if (record.expired_events != null) {
+      var expiredShare = record.events_read > 0
+        ? (record.expired_events / record.events_read * 100).toFixed(2) + '% of all'
+        : '';
+      rows.push(['expired events', record.expired_events, expiredShare]);
+    }
+    container.appendChild(s86BuildKeyValueTable(rows));
+
+    var nonGiftwrap = record.events_read - giftwraps;
+    var unlisted = Object.keys(record.unlisted_kinds || {})
+      .map(function (k) {
+        var count = record.unlisted_kinds[k];
+        var pct = nonGiftwrap > 0 ? (count / nonGiftwrap * 100).toFixed(2) + '%' : '';
+        return [kindLabel(parseInt(k, 10)), count, pct];
+      })
+      .sort(function (a, b) { return b[1] - a[1]; });
+    container.appendChild(s86BuildRankedFigureTable(unlisted, {
+      unit: 'unlisted kinds',
+      grandTotal: record.unlisted_total,
+      emptyText: 'no event kinds outside AUTHOR_SCAN_KINDS were seen'
+    }));
+  },
+  extraNote: function (record) {
+    var totals = lastReportData && lastReportData.totals;
+    if (!totals || !totals.scanned_at || !record.scanned_at) {
+      return null;
+    }
+    var deltaMin = Math.round(Math.abs(record.scanned_at - totals.scanned_at) / 60);
+    if (deltaMin < 1) {
+      return null;
+    }
+    return 'figures taken ' + deltaMin + ' minute' + (deltaMin === 1 ? '' : 's')
+      + ' apart; events written in between account for small differences';
+  }
+});
+
+document.getElementById('totals-panel-container').appendChild(totalsPanel.el);
+document.getElementById('walk-panel-container').appendChild(walkPanel.el);
+
+function applyReportStatus(data) {
+  lastReportData = data;
+  totalsPanel.applyStatus(reportJobStatusFor(data, 'totals'), data.totals);
+  walkPanel.applyStatus(reportJobStatusFor(data, 'walk'), data.walk);
+}
+
+function fetchReport() {
+  return fetch('/api/report').then(function (res) { return res.json(); });
+}
+
+function startReportJob(endpoint) {
+  return s86SignAndPost(endpoint, {}).then(function (result) {
+    if (!result.ok) {
+      throw new Error(s86ErrMsg(result));
+    }
+    s86PollStatus(fetchReport, function (data) {
+      applyReportStatus(data);
+      if (data.status !== 'running') {
+        loadStats();
+        loadMetrics();
+      }
+    });
+  });
+}
+
+function loadAuthorPointer() {
+  fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      authorPointerLine.textContent = '';
+      var prefix;
+      if (data.scanned_at) {
+        prefix = 'full author list — ' + (data.authors || []).length.toLocaleString() + ' authors, ' + s86FormatRelativeAge(data.scanned_at) + ' → ';
+      } else {
+        var recentMode = (data.modes && data.modes.recent) || {};
+        var costPart = recentMode.typical_seconds
+          ? ('a recent scan takes about ' + s86FormatDuration(recentMode.typical_seconds))
+          : 'a recent scan takes about 3 seconds';
+        prefix = 'full author list — never run; ' + costPart + ' → ';
+      }
+      authorPointerLine.appendChild(document.createTextNode(prefix));
+      var link = document.createElement('a');
+      link.href = '/users';
+      link.textContent = 'Users';
+      authorPointerLine.appendChild(link);
+    })
+    .catch(function () {});
+}
+
+// --- § This relay's URL: config.json-backed, not strfry.conf ---------------
+// Exists solely so /api/subscribers can host-match a kind-10050/10002 relay
+// tag against THIS relay; strfry itself never reads this value. Spliced under
+// the subscribers panel's own heading rather than sitting in its own block.
+
+var relayUrlInput = document.createElement('input');
+relayUrlInput.type = 'text';
+relayUrlInput.placeholder = 'wss://relay.example.com';
+var relayUrlSaveBtn = document.createElement('button');
+relayUrlSaveBtn.type = 'button';
+relayUrlSaveBtn.textContent = 'Save';
+var relayUrlStatus = s86El('p', '', 'muted');
+
+var relayUrlBlock = document.createElement('div');
+var relayUrlRow = s86El('p', null, 'toolbar');
+relayUrlRow.appendChild(document.createTextNode('strfry url: '));
+relayUrlRow.appendChild(relayUrlInput);
+relayUrlRow.appendChild(relayUrlSaveBtn);
+relayUrlBlock.appendChild(relayUrlRow);
+relayUrlBlock.appendChild(relayUrlStatus);
+
+function loadRelayUrl() {
+  return fetch('/api/relay-url')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      relayUrlInput.value = data.relay_url || '';
+    })
+    .catch(function () {});
+}
+
+relayUrlSaveBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  relayUrlStatus.textContent = 'saving…';
+  s86SignAndPost('/api/relay-url', { relay_url: relayUrlInput.value })
+    .then(function (result) {
+      if (!result.ok) {
+        relayUrlStatus.textContent = 'save failed: ' + s86ErrMsg(result);
+        return;
+      }
+      relayUrlInput.value = result.body.relay_url || '';
+      relayUrlStatus.textContent = result.body.relay_url
+        ? 'saved — re-run the subscriber scan below to use it'
+        : 'cleared';
+    })
+    .catch(function () {
+      relayUrlStatus.textContent = 'save failed';
+    });
+});
+
+// --- § Gift wrap storage: recipients + subscribers, each its own endpoint --
+// Beneath the counts table: the actual pubkeys, capped and clickable, same
+// shape s86BuildRecordDetailList already renders for a ban record's expand
+// arrow. `countField`/`countUnit`, when given, append that row's own count
+// after the npub — the rows already arrive ranked highest first (server-side
+// sort), so truncating this array top-down is already "top N by amount";
+// nothing here re-sorts.
+
+function appendPubkeyList(container, rows, label, countField, countUnit) {
+  if (rows.length === 0) {
+    return;
+  }
+  if (label) {
+    container.appendChild(s86El('p', label));
+  }
+  var truncation = s86TruncateForRender(rows, S86_RENDER_MAX);
+  if (countField) {
+    var ul = document.createElement('ul');
+    truncation.shown.forEach(function (r) {
+      var li = document.createElement('li');
+      if (r.name) {
+        li.appendChild(s86El('b', r.name + ' '));
+      }
+      if (r.nip05) {
+        li.appendChild(document.createTextNode(r.nip05 + ' '));
+      }
+      li.appendChild(s86NpubLink(r.npub || r.pubkey, r.pubkey, true));
+      li.appendChild(document.createTextNode(' — ' + r[countField].toLocaleString() + ' ' + countUnit));
+      ul.appendChild(li);
+    });
+    container.appendChild(ul);
+  } else {
+    container.appendChild(s86BuildRecordDetailList(truncation.shown));
+  }
+  if (truncation.truncatedCount > 0) {
+    container.appendChild(s86El('p', 'showing top ' + S86_RENDER_MAX + ' of ' + truncation.totalCount));
+  }
+}
+
+var recipientsPanel = s86BuildScanPanel({
+  heading: 'gift-wrap recipients',
+  costText: 'reads the newest 250,000 gift-wrap events — a few seconds to a couple of minutes',
+  buttonLabel: 'scan gift-wrap recipients',
+  onStart: function () { return startSimpleJob('/api/recipients', fetchRecipients, applyRecipientsStatus); },
+  renderResult: function (container, record) {
+    container.appendChild(s86BuildKeyValueTable([
+      ['gift-wrap events read', record.events_read, record.saturated ? 'SATURATED — window limit reached' : ''],
+      ['distinct recipients', record.recipients.length, ''],
+      ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
+    ]));
+    appendPubkeyList(container, record.recipients, null, 'count', 'gift wraps');
+  }
+});
+
+var subscribersPanel = s86BuildScanPanel({
+  heading: 'DM-inbox subscribers',
+  costText: 'reads up to 50,000 DM-relay-list and general-relay-list events — a few seconds to a couple of minutes',
+  buttonLabel: 'scan subscribers',
+  onStart: function () { return startSimpleJob('/api/subscribers', fetchSubscribers, applySubscribersStatus); },
+  renderResult: function (container, record) {
+    container.appendChild(s86BuildKeyValueTable([
+      ['relay', record.relay_url, ''],
+      ['DM-inbox subscribers', record.subscribers.length, record.saturated ? 'SATURATED — floor, not a count' : ''],
+      ['general relay-list subscribers', record.general_subscribers.length, '']
+    ]));
+    appendPubkeyList(container, record.subscribers, 'DM-inbox subscribers:');
+    appendPubkeyList(container, record.general_subscribers, 'general relay-list subscribers:');
+  },
+  // Saturation is a REFUSAL of the exempt-purge command, not a label — a
+  // saturated subscriber list is a FLOOR, so missing subscribers means
+  // missing exemptions means MORE deletion, the opposite of a saturated
+  // recipient scan. Checked ahead of staleness since it matters even on a
+  // scan that just completed.
+  extraNote: function (record) {
+    if (record.saturated) {
+      return 'subscriber scan hit its ' + (record.scan_limit ? record.scan_limit.toLocaleString() + '-event ' : '')
+        + 'cap — the exempt purge command is unavailable until the cap is raised, because a floor cannot be used as an exemption list.';
+    }
+    if (!record.scanned_at) {
+      return null;
+    }
+    var ageSec = Math.floor(Date.now() / 1000) - record.scanned_at;
+    return ageSec > 7 * 24 * 3600
+      ? 'older than 7 days — the subscriber-exempt purge command is unavailable until this is re-run'
+      : null;
+  }
+});
+
+document.getElementById('recipients-panel-container').appendChild(recipientsPanel.el);
+document.getElementById('subscribers-panel-container').appendChild(subscribersPanel.el);
+// splice the relay-url field in right below the panel's own "DM-inbox
+// subscribers" <h3> — its first child — rather than above/below the panel.
+subscribersPanel.el.insertBefore(relayUrlBlock, subscribersPanel.el.children[1]);
+
+function fetchRecipients() { return fetch('/api/recipients').then(function (res) { return res.json(); }); }
+function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
+function applyRecipientsStatus(data) { recipientsPanel.applyStatus(data, data); }
+function applySubscribersStatus(data) { subscribersPanel.applyStatus(data, data); }
+
+function startSimpleJob(postEndpoint, fetchFn, applyFn) {
+  return s86SignAndPost(postEndpoint, {}).then(function (result) {
+    if (!result.ok) {
+      throw new Error(s86ErrMsg(result));
+    }
+    applyFn(result.body);
+    s86PollStatus(fetchFn, applyFn);
+  });
+}
+
+// --- write-policy log -------------------------------------------------------
+// NOT strfry's own stderr — server86 is a sibling process, not the relay's
+// parent, and cannot read it. This is plugin86's decision stream, which is
+// the part of that output an operator acts on, and the only place a REJECT
+// is visible at all.
+
+function renderDecisionLog(events) {
+  decisionLog.textContent = '';
+  var judged = (events || []).filter(function (ev) { return ev.result; });
+  logDot.className = 'dot-inline' + (judged.length ? '' : ' off');
+  if (judged.length === 0) {
+    decisionLog.appendChild(s86El('div', 'no decisions logged yet — plugin86 writes one line per event it judges', 'dim'));
+    return;
+  }
+  judged.slice(-DECISION_LOG_LINES).reverse().forEach(function (ev) {
+    var line = s86El('div', null, ev.result === 'blocked' ? 'bad' : 'good');
+    var at = ev.created_at ? new Date(ev.created_at * 1000).toISOString().slice(11, 19) : '--:--:--';
+    line.appendChild(s86El('span', at + ' ', 'dim'));
+    line.appendChild(document.createTextNode(
+      (ev.result === 'blocked' ? 'BLOCK' : 'ACCEPT') + ' kind:' + ev.kind
+      + ' ' + (ev.npub ? s86ShortKey(ev.npub) : '(no author)')
+      + (ev.msg ? ' — ' + ev.msg : '')
+    ));
+    decisionLog.appendChild(line);
+  });
+}
+
+// --- console ---------------------------------------------------------------
+
 function appendConsole(text) {
   consoleLog.textContent = (consoleLog.textContent ? consoleLog.textContent + '\n' : '') + text;
   consoleLog.scrollTop = consoleLog.scrollHeight;
 }
 
-function runConsole() {
+function runConsole(command) {
   if (!isAdmin) {
     return;
   }
-  var cmd = consoleInput.value.trim();
+  var cmd = (command != null ? command : consoleInput.value).trim();
   if (!cmd) {
     return;
   }
-  appendConsole('> ' + cmd);
+  appendConsole('❯ ' + cmd);
   s86SignAndPost('/api/console', { command: cmd })
     .then(function (result) {
       var body = result.body || {};
@@ -309,14 +897,17 @@ function runConsole() {
     });
 }
 
-function onLogin() {
-  isAdmin = true;
-  consoleSection.style.display = '';
-  setStatus('logged in as admin');
-}
+QUICK_COMMANDS.forEach(function (cmd) {
+  var btn = s86El('button', cmd, 'chip cmd');
+  btn.type = 'button';
+  btn.addEventListener('click', function () {
+    consoleInput.value = cmd;
+    runConsole(cmd);
+  });
+  quickCmds.appendChild(btn);
+});
 
-s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
-consoleRun.addEventListener('click', runConsole);
+consoleRun.addEventListener('click', function () { runConsole(); });
 consoleInput.addEventListener('keydown', function (evt) {
   if (evt.key === 'Enter') {
     evt.preventDefault();
@@ -324,22 +915,59 @@ consoleInput.addEventListener('keydown', function (evt) {
   }
 });
 
-fetch('/api/banned')
-  .then(function (res) { return res.json(); })
-  .then(function (data) {
-    adminPubkey = data.admin;
-    s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
-  })
-  .catch(function () {});
+// --- records / login --------------------------------------------------------
 
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () { loadBanned(); },
+    onError: setStatus
+  });
+}
+
+function loadBanned() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      lastBanned = data.banned;
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      } else {
+        renderRecords();
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  renderRecords();
+  fetchReport().then(applyReportStatus);
+  fetchRecipients().then(applyRecipientsStatus);
+  fetchSubscribers().then(applySubscribersStatus);
+  loadAuthorPointer();
+  loadRelayUrl();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+commandBlockContainer.appendChild(s86BuildCommandGenerator());
+
+loadBanned();
 loadStats();
+loadMetrics();
+setInterval(loadMetrics, METRICS_INTERVAL);
 
-// Live layer: the shared SSE connection drives the delta line continuously.
-// If its baseline_at ever differs from what we last rendered (an admin
-// pressed refresh totals / run walk, here or on another tab), that means
-// the report cache moved — pull the new totals/walk record once rather
-// than trying to reconstruct it from deltas.
+// Live layer: the shared SSE connection drives the delta line and the
+// write-policy log continuously. If its baseline_at ever differs from what we
+// last rendered (an admin pressed refresh totals / run walk, here or on
+// another tab), the report cache moved — pull the new totals/walk record once
+// rather than trying to reconstruct it from deltas.
 s86ConnectLive(function (live) {
+  renderDecisionLog(live.events);
   if (live.baseline_at !== lastBaselineAt) {
     lastBaselineAt = live.baseline_at;
     loadStats().then(function () { renderBaselineLine(live); });

@@ -67,7 +67,20 @@ if SCRIPT_DIR not in sys.path:
 from lib86 import bech32, bip340, blacklist, namecache  # noqa: E402
 
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-STRFRY_CONF_PATH = "/config/strfry.conf"
+# strfry.conf is NOT at a fixed path. Packages install it at /etc/strfry.conf,
+# the Docker images mount it at /config/strfry.conf, and a source build often
+# leaves it beside the binary — and pointing at the wrong one is silent, not
+# loud: strfry reads it happily and opens whatever `db` IT names, so scans
+# return counts from a database the running relay is not using. Resolution
+# order is in strfry_conf_status(); the running relay's own --config argument
+# is the authority, and an explicit path in config.json overrides everything.
+STRFRY_CONF_CANDIDATES = (
+    "/etc/strfry.conf",
+    "/etc/strfry/strfry.conf",
+    "/config/strfry.conf",
+    "/app/strfry.conf",
+    "/usr/local/etc/strfry.conf",
+)
 AUTHORS_CACHE_PATH = os.path.join(SCRIPT_DIR, "authors-cache.json")
 RECIPIENTS_CACHE_PATH = os.path.join(SCRIPT_DIR, "recipients-cache.json")
 SUBSCRIBERS_CACHE_PATH = os.path.join(SCRIPT_DIR, "subscribers-cache.json")
@@ -84,15 +97,23 @@ STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfr
 STATIC_ROUTES = {
     "/home": ("home.html", "text/html; charset=utf-8"),
     "/stats": ("stats.html", "text/html; charset=utf-8"),
-    "/report": ("report.html", "text/html; charset=utf-8"),
-    "/authors": ("authors.html", "text/html; charset=utf-8"),
-    "/userlist": ("userlist.html", "text/html; charset=utf-8"),
-    "/audit": ("audit.html", "text/html; charset=utf-8"),
+    "/users": ("users.html", "text/html; charset=utf-8"),
     "/bans": ("bans.html", "text/html; charset=utf-8"),
+    "/audit": ("audit.html", "text/html; charset=utf-8"),
+    "/settings": ("settings.html", "text/html; charset=utf-8"),
     "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/domain": ("domain.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
     "/favicon.ico": ("favicon.ico", "image/x-icon"),
+}
+
+# The Report and Authors pages became sections of Stats & Console and the
+# Users page respectively. Old links, bookmarks and the operator's muscle
+# memory keep working; nothing serves two copies of a page.
+LEGACY_REDIRECTS = {
+    "/report": "/stats",
+    "/authors": "/users",
+    "/userlist": "/users",
 }
 
 NIP98_KIND = 27235
@@ -151,12 +172,16 @@ CONSOLE_VERBS = ("scan", "info", "export")  # --count/read-only; all else refuse
 LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
 LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
 LIVE_RECENT_MAX = RENDER_MAX    # events kept in the shared ring buffer for new SSE clients
+# --- decision log: the only channel that can see a REJECT ------------------
+DECISION_TAIL_MAX = RENDER_MAX  # newest decision records read back per poll
+DECISION_READ_BYTES = 1 << 20   # bytes read from the tail of each log segment
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
 
 _relay_cwd_pid = None
 _relay_cwd_path = None
+_relay_conf_path = None
 
 # The author list is never recomputed on a timer or because it went stale
 # — only POST /api/authors/scan (an explicit admin button press) starts a
@@ -294,25 +319,28 @@ def require_strfry_bin():
     return bin_path
 
 
-def get_relay_cwd():
-    """Return the working directory `strfry scan` must run from.
+def _relay_conf_from_args(args):
+    """Pull the --config value out of a relay process's argv, in either the
+    `--config X` or `--config=X` form."""
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--config="):
+            return arg.split("=", 1)[1]
+    return None
 
-    strfry.conf commonly points `db` at a path relative to wherever the
-    relay process itself was launched (e.g. dockurr/strfry runs `./strfry`
-    from `/app` with `db = "./strfry-db/"`). server86 is spawned by
-    plugin86 with cwd=SCRIPT_DIR (/config/strfry86), which is NOT that
-    directory, so a scan subprocess with no cwd override resolves the
-    relative db path against the wrong directory and strfry exits 1 with
-    `mdb_env_open: No such file or directory`.
 
-    Find the running strfry relay process via /proc and reuse its cwd, so
-    every scan resolves relative paths exactly as the relay does. Falls
-    back to the discovered binary's parent directory if no relay process
-    is found (e.g. /proc unavailable, or the relay hasn't started yet).
-    Cached until the located pid disappears."""
-    global _relay_cwd_pid, _relay_cwd_path
+def locate_relay_process():
+    """Find the RUNNING strfry relay via /proc and return its cwd and its
+    --config path. This process is the authority on both questions: whatever
+    config the relay was started with is by definition the active one, and
+    whatever directory it was started from is where its relative `db` path
+    resolves. Cached until the located pid disappears; falls back to the
+    binary's parent directory when /proc is unavailable or the relay has not
+    started yet."""
+    global _relay_cwd_pid, _relay_cwd_path, _relay_conf_path
     if _relay_cwd_pid is not None and os.path.isdir(f"/proc/{_relay_cwd_pid}"):
-        return _relay_cwd_path
+        return _relay_cwd_path, _relay_conf_path
 
     strfry_bin = require_strfry_bin()
     bin_name = os.path.basename(strfry_bin)
@@ -331,15 +359,112 @@ def get_relay_cwd():
                 cwd = os.readlink(f"/proc/{entry}/cwd")
             except OSError:
                 continue
+            conf = _relay_conf_from_args(args)
+            if conf and not os.path.isabs(conf):
+                conf = os.path.normpath(os.path.join(cwd, conf))
             _relay_cwd_pid = entry
             _relay_cwd_path = cwd
-            return cwd
+            _relay_conf_path = conf
+            return cwd, conf
     except OSError:
         pass
 
     _relay_cwd_pid = None
     _relay_cwd_path = os.path.dirname(strfry_bin)
-    return _relay_cwd_path
+    _relay_conf_path = None
+    return _relay_cwd_path, None
+
+
+def get_relay_cwd():
+    """The working directory `strfry scan` must run from.
+
+    strfry.conf commonly points `db` at a path relative to wherever the relay
+    process itself was launched (e.g. dockurr/strfry runs `./strfry` from
+    `/app` with `db = "./strfry-db/"`). server86 is spawned by plugin86 with
+    cwd=SCRIPT_DIR, which is NOT that directory, so a scan subprocess with no
+    cwd override resolves the relative db path against the wrong directory and
+    strfry exits 1 with `mdb_env_open: No such file or directory`."""
+    return locate_relay_process()[0]
+
+
+def strfry_conf_status():
+    """Where strfry.conf is, and how that was decided.
+
+    Returns {path, source, exists, candidates, detected, error}. `source` is
+    one of 'config.json' (an explicit strfry_conf_path override), 'relay
+    process' (read from the running relay's own --config argument), 'default
+    location' (the first candidate that exists), or None when nothing was
+    found. Pointing at the wrong file is the failure this exists to prevent:
+    strfry will happily read any valid config and open whatever database THAT
+    one names, so a scan can return a confident count from a database the
+    running relay has never written to."""
+    override = None
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh).get("strfry_conf_path")
+        if isinstance(raw, str) and raw.strip():
+            override = raw.strip()
+    except (OSError, ValueError):
+        pass
+
+    try:
+        detected = locate_relay_process()[1]
+    except RuntimeError:
+        detected = None
+
+    status = {
+        "candidates": list(STRFRY_CONF_CANDIDATES),
+        "detected": detected,
+        "override": override,
+        "error": None,
+    }
+
+    if override:
+        status.update({"path": override, "source": "config.json",
+                       "exists": os.path.isfile(override)})
+        if not status["exists"]:
+            status["error"] = (f"strfry_conf_path in config.json points at {override}, "
+                               "which does not exist")
+        elif detected and os.path.realpath(detected) != os.path.realpath(override):
+            # Not an error — an operator may deliberately point here — but it
+            # is exactly the situation that produces figures from the wrong
+            # database, so it is never left unsaid.
+            status["error"] = (f"the running relay was started with {detected}, "
+                               f"not the {override} configured here")
+        return status
+
+    if detected and os.path.isfile(detected):
+        status.update({"path": detected, "source": "relay process", "exists": True})
+        return status
+
+    for candidate in STRFRY_CONF_CANDIDATES:
+        if os.path.isfile(candidate):
+            status.update({"path": candidate, "source": "default location", "exists": True})
+            if detected:
+                status["error"] = (f"the running relay was started with {detected}, "
+                                   f"which is not readable from here; using {candidate}")
+            return status
+
+    status.update({"path": detected, "source": None, "exists": False})
+    status["error"] = ("no strfry.conf found — the relay is not running with a readable "
+                       "--config, and none of " + ", ".join(STRFRY_CONF_CANDIDATES)
+                       + " exists. Set strfry_conf_path in Settings.")
+    return status
+
+
+def get_strfry_conf_path():
+    status = strfry_conf_status()
+    return status["path"] if status.get("exists") else None
+
+
+def require_strfry_conf():
+    """Return the active strfry.conf path or raise naming what was tried, so a
+    scan failure says "I could not find your config" rather than handing back
+    strfry's own error about a file the operator never chose."""
+    status = strfry_conf_status()
+    if not status.get("exists"):
+        raise RuntimeError(status.get("error") or "strfry.conf not found")
+    return status["path"]
 
 
 STDERR_TAIL_CHARS = 300
@@ -372,7 +497,7 @@ def _run_strfry(filter_obj, timeout):
     invokes it as a subprocess."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
-    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json]
+    argv = [strfry_bin, "--config", require_strfry_conf(), "scan", filter_json]
     result = subprocess.run(argv, cwd=get_relay_cwd(), capture_output=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"strfry scan exited {result.returncode}: {stderr_tail(result.stderr)}")
@@ -444,11 +569,114 @@ def _live_broadcast(msg):
                     _live_subscribers.remove(q)
 
 
+DECISION_LOG_PATH = os.path.join(SCRIPT_DIR, "decisions.jsonl")
+DECISION_LOG_PREV_PATH = DECISION_LOG_PATH + ".1"
+
+
+def _read_log_segment_tail(path):
+    """Return the decoded tail of one decision-log segment, at most
+    DECISION_READ_BYTES. Seeking to the end and reading backwards keeps the
+    cost independent of how long the relay has been up; the first line of
+    the result may be a fragment, so the caller drops it."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "", False
+    truncated = size > DECISION_READ_BYTES
+    try:
+        with open(path, "rb") as fh:
+            if truncated:
+                fh.seek(size - DECISION_READ_BYTES)
+            raw = fh.read()
+    except OSError:
+        return "", False
+    return raw.decode("utf-8", "replace"), truncated
+
+
+def read_decisions(limit=DECISION_TAIL_MAX):
+    """Newest-LAST list of plugin86's accept/reject records.
+
+    This is the only place in the project where a REJECT is observable: a
+    blocked event is never written to the database, so no `strfry scan` —
+    which is everything else server86 has — can report one. Reading is
+    bounded on both axes (bytes per segment, records returned) and never
+    fails loudly: a missing log just means the relay has not decided
+    anything since plugin86 last started, which is a normal state, not an
+    error to render."""
+    records = []
+    for path in (DECISION_LOG_PREV_PATH, DECISION_LOG_PATH):
+        text, truncated = _read_log_segment_tail(path)
+        if not text:
+            continue
+        lines = text.split("\n")
+        if truncated and lines:
+            lines = lines[1:]        # first line is a fragment of a record
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("id"), str):
+                records.append(rec)
+    return records[-limit:]
+
+
+def _feed_row_from_decision(rec):
+    pubkey = rec.get("pubkey")
+    npub = None
+    if is_hex64(pubkey):
+        try:
+            npub = bech32.npub_encode(pubkey)
+        except (ValueError, TypeError):
+            npub = None
+    content = rec.get("content")
+    return {
+        "id": rec.get("id"),
+        "kind": rec.get("kind"),
+        "created_at": rec.get("created_at") or rec.get("at"),
+        "pubkey": pubkey if is_hex64(pubkey) else None,
+        "npub": npub,
+        "content": content if isinstance(content, str) else "",
+        "result": "blocked" if rec.get("action") == "reject" else "accepted",
+        "msg": rec.get("msg") or "",
+    }
+
+
+def _live_feed_state():
+    """Feed rows plus the accept/blocked tally they were counted from.
+
+    Prefers the decision log, because it is the only source that contains
+    blocked events at all. Falls back to the scan-fed ring buffer — which
+    by construction holds accepted events only — when no decision log
+    exists yet, so a relay whose plugin86 has not restarted still shows a
+    feed rather than an empty page. In that fallback every `result` is
+    null, never "accepted": the ring cannot distinguish an event that was
+    accepted from one that was never judged, and rule 9 says an unknown
+    renders as unknown."""
+    decisions = read_decisions()
+    if decisions:
+        rows = [_feed_row_from_decision(r) for r in decisions]
+        accepted = sum(1 for r in rows if r["result"] == "accepted")
+        return rows, accepted, len(rows) - accepted, True
+    with _live_lock:
+        ring = list(_live_recent)
+    rows = [{
+        "id": ev.get("id"), "kind": ev.get("kind"), "created_at": ev.get("created_at"),
+        "pubkey": None, "npub": None, "content": "", "result": None, "msg": "",
+    } for ev in ring]
+    return rows, None, None, False
+
+
 def _live_state_snapshot():
+    rows, accepted, blocked, judged = _live_feed_state()
     with _live_lock:
         return {
             "new_events": _live_new_events, "deletes": _live_deletes,
-            "baseline_at": _live_delta_baseline_at, "events": list(_live_recent),
+            "baseline_at": _live_delta_baseline_at, "events": rows,
+            "accepted": accepted, "blocked": blocked, "judged": judged,
             "error": _live_error, "at": int(time.time()),
         }
 
@@ -480,6 +708,7 @@ def _live_poll_tick():
         return
 
     events.sort(key=lambda ev: ev.get("created_at") or 0)
+    folded = 0
     with _live_lock:
         _live_error = None
         new_high_water = _live_since
@@ -496,6 +725,7 @@ def _live_poll_tick():
             row = {"id": eid, "kind": kind, "created_at": created_at}
             _live_recent.append(row)
             _live_new_events += 1
+            folded += 1
             if kind == 5:
                 _live_deletes += 1
             if created_at > new_high_water:
@@ -506,6 +736,7 @@ def _live_poll_tick():
         _live_since = new_high_water
         del _live_recent[:-LIVE_RECENT_MAX]
 
+    _record_rate_sample(folded)
     _live_broadcast(_live_state_snapshot())
 
 
@@ -578,6 +809,7 @@ def get_userlist_snapshot():
             "name": a.get("name"),
             "nip05": a.get("nip05"),
             "event_count": a.get("count"),
+            "last_seen": a.get("last_seen"),
             "giftwrap_count": recipient_counts.get(pk),
             "reporters": report_counts.get(pk),
         })
@@ -634,7 +866,16 @@ def validate_console_command(raw):
             f"refused: '{verb}' is not on the read-only allowlist "
             f"(allowed: {', '.join(CONSOLE_VERBS)})"
         )
-    return ["strfry", "--config", STRFRY_CONF_PATH] + parts, None
+    # The allowlist decision is independent of whether the conf file exists
+    # on this host — validation answers "may this verb run", and the path
+    # is only a preview of what would be invoked. run_console_command
+    # re-resolves and refuses if nothing is found.
+    conf = get_strfry_conf_path()
+    if conf is None:
+        status = strfry_conf_status()
+        conf = (status.get("path") or status.get("override")
+                or status.get("detected") or STRFRY_CONF_CANDIDATES[0])
+    return ["strfry", "--config", conf] + parts, None
 
 
 def run_console_command(raw):
@@ -645,7 +886,10 @@ def run_console_command(raw):
         return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "", "exit_code": None}
     try:
         strfry_bin = require_strfry_bin()
-        argv = [strfry_bin] + argv[1:]  # replace literal 'strfry' with discovered path
+        conf = require_strfry_conf()
+        # Rebuild with the resolved binary and the actively-found conf —
+        # validate may have filled a candidate path that is not present here.
+        argv = [strfry_bin, "--config", conf] + argv[3:]
         result = subprocess.run(
             argv, cwd=get_relay_cwd(), capture_output=True, timeout=CONSOLE_TIMEOUT
         )
@@ -677,7 +921,7 @@ def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
     rules."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
-    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", "--count", filter_json]
+    argv = [strfry_bin, "--config", require_strfry_conf(), "scan", "--count", filter_json]
     result = subprocess.run(argv, cwd=get_relay_cwd(), capture_output=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(f"strfry scan --count exited {result.returncode}: {stderr_tail(result.stderr)}")
@@ -702,7 +946,7 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
     exit, or exceeding the wall-clock budget)."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
-    argv = [strfry_bin, "--config", STRFRY_CONF_PATH, "scan", filter_json]
+    argv = [strfry_bin, "--config", require_strfry_conf(), "scan", filter_json]
     deadline = time.monotonic() + timeout
 
     proc = subprocess.Popen(
@@ -940,6 +1184,435 @@ def audit_mark_undone(record_id):
                     log(f"server86: failed to persist audit-log.json: {e}")
                 return dict(r)
     return None
+
+
+# --- domain bans -------------------------------------------------------------
+# NOT a new enforcement primitive, and deliberately so. Deciding whether an
+# event's author belongs to a NIP-05 domain means fetching that domain's
+# /.well-known/nostr.json — an external HTTP request, in strfry's blocking
+# write path, per event. This project does not make external queries there
+# and will not start.
+#
+# What this file records is what the operator actually did: they looked up a
+# domain's roster on the Domain page and banned it. The pubkeys are what
+# enforce; this is the receipt, so the Banlist can name the domain, show its
+# reason, and undo the whole set in one press. A pubkey that joins the domain
+# tomorrow is NOT banned by an entry here, and the page says so.
+
+DOMAIN_BANS_PATH = os.path.join(SCRIPT_DIR, "domain-bans.json")
+
+_domain_bans_lock = threading.Lock()
+_domain_bans = _load_cache_or(DOMAIN_BANS_PATH, {"domains": {}})
+if not isinstance(_domain_bans.get("domains"), dict):
+    _domain_bans = {"domains": {}}
+
+
+def domain_ban_record(domain, pubkeys, reason, actor):
+    """Record (or extend) one domain's banned roster. Returns the stored entry."""
+    now = int(time.time())
+    with _domain_bans_lock:
+        domains = dict(_domain_bans.get("domains") or {})
+        prior = domains.get(domain) or {}
+        merged = list(dict.fromkeys(list(prior.get("pubkeys") or []) + list(pubkeys)))
+        entry = {
+            "domain": domain,
+            "banned_at": prior.get("banned_at") or now,
+            "updated_at": now,
+            "reason": reason or prior.get("reason") or "",
+            "pubkeys": merged,
+            "actor": actor or prior.get("actor"),
+        }
+        domains[domain] = entry
+        _domain_bans["domains"] = domains
+        try:
+            _save_cache_atomic(DOMAIN_BANS_PATH, _domain_bans)
+        except OSError as e:
+            log(f"server86: failed to persist domain-bans.json: {e}")
+    return entry
+
+
+def domain_ban_remove(domain):
+    """Drop one domain's record. Returns its pubkeys, or None if unknown."""
+    with _domain_bans_lock:
+        domains = dict(_domain_bans.get("domains") or {})
+        entry = domains.pop(domain, None)
+        if entry is None:
+            return None
+        _domain_bans["domains"] = domains
+        try:
+            _save_cache_atomic(DOMAIN_BANS_PATH, _domain_bans)
+        except OSError as e:
+            log(f"server86: failed to persist domain-bans.json: {e}")
+    return list(entry.get("pubkeys") or [])
+
+
+def get_domain_bans():
+    """Domain records, newest first, each carrying how many of its pubkeys
+    are STILL banned — the roster is a snapshot from ban time, and an
+    individual unban since then must not be hidden by this page."""
+    with _domain_bans_lock:
+        domains = list((_domain_bans.get("domains") or {}).values())
+    current = blacklist.load()
+    out = []
+    for entry in domains:
+        pubkeys = list(entry.get("pubkeys") or [])
+        out.append({
+            "domain": entry.get("domain"),
+            "banned_at": entry.get("banned_at"),
+            "reason": entry.get("reason") or "",
+            "pubkey_count": len(pubkeys),
+            "still_banned": sum(1 for pk in pubkeys if pk in current),
+        })
+    out.sort(key=lambda e: e.get("banned_at") or 0, reverse=True)
+    return out
+
+
+# --- strfry.conf ------------------------------------------------------------
+# Parsed by scanning lines, never by reserialising. Every edit rewrites the
+# value token on one line and leaves the entire rest of the file — comments,
+# blank lines, ordering, indentation, anything this parser does not model —
+# byte-identical. A config file the operator hand-tuned must survive a visit
+# to the Settings page unchanged except for what they changed.
+
+_CONF_ASSIGN = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*?)(\s*(?:#.*)?)$")
+_CONF_BLOCK_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
+
+
+def _conf_value_type(raw):
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        return "string"
+    if raw in ("true", "false"):
+        return "bool"
+    try:
+        int(raw)
+        return "int"
+    except ValueError:
+        return "string"
+
+
+def _conf_unquote(raw):
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        return raw[1:-1]
+    return raw
+
+
+def parse_strfry_conf(text):
+    """Return (fields, balanced). `fields` is every scalar assignment in
+    file order, each with its dotted path, section, value, type and line
+    index. `balanced` is False when braces do not close — the one structural
+    check worth making before allowing a write."""
+    fields = []
+    stack = []
+    depth_ok = True
+    for i, line in enumerate(text.split("\n")):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        opened = _CONF_BLOCK_OPEN.match(line)
+        if opened:
+            stack.append(opened.group(1))
+            continue
+        if stripped == "}" or stripped.startswith("}"):
+            if not stack:
+                depth_ok = False
+            else:
+                stack.pop()
+            continue
+        m = _CONF_ASSIGN.match(line)
+        if not m:
+            continue
+        key, raw = m.group(2), m.group(4).rstrip(";").strip()
+        if raw.endswith("{"):
+            stack.append(key)
+            continue
+        if not raw:
+            continue
+        fields.append({
+            "path": ".".join(stack + [key]),
+            "section": ".".join(stack) or "general",
+            "key": key,
+            "value": _conf_unquote(raw),
+            "type": _conf_value_type(raw),
+            "line": i,
+        })
+    return fields, depth_ok and not stack
+
+
+def apply_strfry_conf_edits(text, edits):
+    """Rewrite only the value token of the lines named by `edits`
+    ({path: new_value}). Returns (new_text, changed_paths)."""
+    fields, _ = parse_strfry_conf(text)
+    by_path = {f["path"]: f for f in fields}
+    lines = text.split("\n")
+    changed = []
+    for path, new_value in edits.items():
+        field = by_path.get(path)
+        if field is None:
+            continue
+        if str(field["value"]) == str(new_value):
+            continue
+        m = _CONF_ASSIGN.match(lines[field["line"]])
+        if not m:
+            continue
+        if field["type"] == "string":
+            rendered = '"' + str(new_value).replace('"', '\\"') + '"'
+        elif field["type"] == "bool":
+            rendered = "true" if str(new_value).lower() in ("1", "true", "yes", "on") else "false"
+        else:
+            try:
+                rendered = str(int(str(new_value).strip()))
+            except ValueError:
+                continue
+        trailing = m.group(4)[len(m.group(4).rstrip(";").strip()):]
+        lines[field["line"]] = m.group(1) + m.group(2) + m.group(3) + rendered + trailing + m.group(5)
+        changed.append(path)
+    return "\n".join(lines), changed
+
+
+def read_strfry_conf():
+    status = strfry_conf_status()
+    if not status.get("exists"):
+        return None, status.get("error") or "strfry.conf not found"
+    try:
+        with open(status["path"], "r", encoding="utf-8") as fh:
+            return fh.read(), None
+    except OSError as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def write_strfry_conf(text):
+    """Write the ACTIVE strfry.conf, keeping the previous copy alongside it.
+    strfry re-reads its config on its own, so nothing here restarts the relay
+    — which also means a broken file takes effect without a prompt. Braces
+    are checked before anything is written; that is the only structural
+    claim this project is willing to make about someone else's format."""
+    status = strfry_conf_status()
+    if not status.get("exists"):
+        return False, status.get("error") or "strfry.conf not found"
+    path = status["path"]
+    _, balanced = parse_strfry_conf(text)
+    if not balanced:
+        return False, "unbalanced braces — nothing written"
+    try:
+        current, _ = read_strfry_conf()
+        if current is not None:
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                fh.write(current)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, None
+
+
+# --- settings payload -------------------------------------------------------
+# Two files, one shape, so the page can render them with the same code: the
+# relay's own strfry.conf, and strfry-86's config.json. Both arrive as
+# structured fields AND as the raw text they were parsed from, because the
+# structured view can only offer what the parser recognised and the operator
+# must always be able to reach the rest.
+
+CONFIG_EDITABLE_FIELDS = {
+    # config.json keys the Settings page may write. admin_pubkey_hex is
+    # deliberately NOT here: it is the credential that authorises the very
+    # request doing the writing, and a UI that can change it is a UI that can
+    # lock the operator out of their own relay in one keystroke.
+    "strfry_conf_path": ("string", "strfry.conf path",
+                         "leave blank to detect it from the running relay; set it only when "
+                         "detection picks the wrong file"),
+    "relay_url": ("string", "Relay URL", "wss:// URL this relay answers on — used to find its own subscribers"),
+    "contact_appeal": ("string", "Contact appeal", "shown publicly to banned pubkeys on the Banlist"),
+    "port": ("int", "Admin UI port", "port server86 binds; takes effect on next start"),
+    "bind": ("string", "Admin UI bind address", "interface server86 binds; takes effect on next start"),
+}
+
+
+def _config_raw():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def get_settings_payload():
+    conf_status = strfry_conf_status()
+    conf_text, conf_err = read_strfry_conf()
+    conf_fields, conf_balanced = parse_strfry_conf(conf_text or "")
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg_data = json.load(fh)
+    except (OSError, ValueError):
+        cfg_data = {}
+    app_fields = []
+    for key, (ftype, label, help_text) in CONFIG_EDITABLE_FIELDS.items():
+        app_fields.append({
+            "path": key, "key": key, "section": "strfry-86", "label": label,
+            "help": help_text, "type": ftype,
+            "value": cfg_data.get(key, "") if cfg_data.get(key) is not None else "",
+        })
+    return {
+        "relay": {
+            "path": conf_status.get("path"), "fields": conf_fields,
+            "raw": conf_text or "", "error": conf_err, "balanced": conf_balanced,
+            # How that path was decided, so "these figures come from the wrong
+            # database" is a visible statement rather than a silent condition.
+            "source": conf_status.get("source"),
+            "detected": conf_status.get("detected"),
+            "override": conf_status.get("override"),
+            "candidates": conf_status.get("candidates"),
+            "warning": conf_status.get("error") if conf_status.get("exists") else None,
+        },
+        "app": {
+            "path": CONFIG_PATH, "fields": app_fields, "raw": _config_raw(),
+            "error": None, "balanced": True,
+        },
+    }
+
+
+def write_app_config(edits=None, raw=None):
+    """Write config.json — either field edits (validated against
+    CONFIG_EDITABLE_FIELDS) or a raw replacement (validated as JSON that
+    still carries a usable admin_pubkey_hex). Never drops a key it does not
+    know about; an operator's own additions survive a field edit."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            current = json.load(fh)
+        if not isinstance(current, dict):
+            return False, "config.json is not an object"
+    except (OSError, ValueError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    if raw is not None:
+        try:
+            parsed = json.loads(raw)
+        except ValueError as e:
+            return False, f"not valid JSON: {e}"
+        if not isinstance(parsed, dict):
+            return False, "config.json must be a JSON object"
+        if not is_hex64(parsed.get("admin_pubkey_hex")):
+            return False, "admin_pubkey_hex missing or not 64 hex characters — refusing to lock you out"
+        new_data = parsed
+    else:
+        new_data = dict(current)
+        for key, value in (edits or {}).items():
+            spec = CONFIG_EDITABLE_FIELDS.get(key)
+            if spec is None:
+                continue
+            if spec[0] == "int":
+                try:
+                    new_data[key] = int(str(value).strip())
+                except ValueError:
+                    return False, f"{key} must be a whole number"
+            else:
+                new_data[key] = str(value)
+
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(new_data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, None
+
+
+# --- relay metrics (the Stats page's headline figures) ----------------------
+# Every figure here is either already in a cache this server keeps, or is one
+# stat() away. Nothing in this function starts a scan, and nothing reaches the
+# network — a page of headline numbers must never be the most expensive thing
+# on the relay.
+
+_rate_samples = []          # (monotonic seconds, events counted in that tick)
+
+
+def _record_rate_sample(count):
+    now = time.monotonic()
+    _rate_samples.append((now, count))
+    cutoff = now - 60
+    while _rate_samples and _rate_samples[0][0] < cutoff:
+        _rate_samples.pop(0)
+
+
+def _events_per_sec():
+    """Trailing average over the samples still inside the window. None until
+    two polls have landed — rule 9: not yet known renders as `—`, never 0."""
+    if len(_rate_samples) < 2:
+        return None
+    span = _rate_samples[-1][0] - _rate_samples[0][0]
+    if span <= 0:
+        return None
+    return sum(c for _, c in _rate_samples[1:]) / span
+
+
+def _strfry_db_bytes():
+    """Size of the LMDB directory strfry.conf points at, resolved exactly
+    the way the relay resolves it (relative to the relay's own cwd)."""
+    text, err = read_strfry_conf()
+    if err or not text:
+        return None, None
+    fields, _ = parse_strfry_conf(text)
+    db_path = None
+    for f in fields:
+        if f["key"] == "db":
+            db_path = f["value"]
+            break
+    if not db_path:
+        return None, None
+    if not os.path.isabs(db_path):
+        try:
+            db_path = os.path.join(get_relay_cwd(), db_path)
+        except Exception:
+            return None, db_path
+    total = 0
+    try:
+        for entry in os.scandir(db_path):
+            if entry.is_file():
+                total += entry.stat().st_size
+    except OSError:
+        return None, db_path
+    return total, db_path
+
+
+def get_relay_metrics():
+    report = get_report_status()
+    totals = report.get("totals") or {}
+    walk = report.get("walk") or {}
+    rows, accepted, blocked, judged = _live_feed_state()
+    db_bytes, db_path = _strfry_db_bytes()
+
+    top_kind, top_kind_count = None, None
+    kinds = walk.get("kinds") if isinstance(walk.get("kinds"), dict) else None
+    if kinds:
+        top = max(kinds.items(), key=lambda kv: kv[1])
+        top_kind, top_kind_count = int(top[0]), top[1]
+
+    judged_total = (accepted or 0) + (blocked or 0) if judged else 0
+    # /api/metrics is a PUBLIC read, so it carries no filesystem paths — only
+    # whether the config was resolvable at all. The paths themselves, and the
+    # explanation of how one was chosen, live in the admin-only settings
+    # payload where disclosing them is already the point.
+    conf = strfry_conf_status()
+    return {
+        "events_per_sec": _events_per_sec(),
+        "events_total": totals.get("total_events"),
+        "db_bytes": db_bytes,
+        "conf_ok": bool(conf.get("exists")),
+        "conf_source": conf.get("source"),
+        "accept_rate": (accepted / judged_total) if judged_total else None,
+        "judged": judged_total or None,
+        "blocked": blocked if judged else None,
+        "top_kind": top_kind,
+        "top_kind_count": top_kind_count,
+        "top_kind_share": (top_kind_count / walk["events_read"])
+                          if top_kind_count and walk.get("events_read") else None,
+        "giftwrap_events": totals.get("giftwrap_events"),
+        "giftwrap_share": totals.get("giftwrap_share"),
+        "baseline_at": totals.get("scanned_at") or walk.get("scanned_at"),
+    }
 
 
 def _make_progress_cb(job):
@@ -2514,6 +3187,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if path in LEGACY_REDIRECTS:
+            self.send_response(302)
+            self.send_header("Location", LEGACY_REDIRECTS[path])
+            self.end_headers()
+            return
+
         if path in STATIC_ROUTES:
             filename, content_type = STATIC_ROUTES[path]
             try:
@@ -2567,6 +3246,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/reports":
             self._send_json(200, get_reports_status())
+            return
+
+        if path == "/api/metrics":
+            self._send_json(200, get_relay_metrics())
+            return
+
+        if path == "/api/domain-bans":
+            self._send_json(200, {"domains": get_domain_bans()})
             return
 
         if path == "/api/audit":
@@ -2650,6 +3337,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/profile/day", "/api/profile/new", "/api/pubkeys/lookup", "/api/report/totals",
             "/api/report/walk", "/api/relay-url", "/api/reports",
             "/api/console", "/api/undo",
+            "/api/settings", "/api/settings/save", "/api/domain-unban",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2795,6 +3483,76 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "restored": restored})
                 return
             self._send_json(400, {"error": f"cannot undo type {rtype!r}"})
+            return
+
+        if path == "/api/settings":
+            self._send_json(200, get_settings_payload())
+            return
+
+        if path == "/api/settings/save":
+            target = body.get("target")
+            raw = body.get("raw")
+            edits = body.get("edits")
+            if target not in ("relay", "app"):
+                self._send_json(400, {"error": "target must be 'relay' or 'app'"})
+                return
+            if raw is not None and not isinstance(raw, str):
+                self._send_json(400, {"error": "raw must be a string"})
+                return
+            if edits is not None and not isinstance(edits, dict):
+                self._send_json(400, {"error": "edits must be an object"})
+                return
+            if raw is None and not edits:
+                self._send_json(400, {"error": "nothing to save"})
+                return
+
+            if target == "relay":
+                current, err = read_strfry_conf()
+                if err:
+                    self._send_json(500, {"error": f"cannot read strfry.conf: {err}"})
+                    return
+                if raw is not None:
+                    new_text, changed = raw, ["<raw>"]
+                else:
+                    new_text, changed = apply_strfry_conf_edits(current, edits)
+                    if not changed:
+                        self._send_json(200, {"ok": True, "changed": [], "note": "no field differed"})
+                        return
+                ok_write, werr = write_strfry_conf(new_text)
+                if not ok_write:
+                    self._send_json(400, {"error": werr})
+                    return
+            else:
+                ok_write, werr = write_app_config(edits=edits, raw=raw)
+                if not ok_write:
+                    self._send_json(400, {"error": werr})
+                    return
+                changed = ["<raw>"] if raw is not None else sorted(edits.keys())
+
+            audit_append({
+                "type": "settings", "actor": auth.get("pubkey"),
+                "target": target, "changed": changed,
+                "via": "raw editor" if raw is not None else "structured fields",
+            })
+            self._send_json(200, {"ok": True, "changed": changed})
+            return
+
+        if path == "/api/domain-unban":
+            domain = body.get("domain")
+            if not isinstance(domain, str) or not domain.strip():
+                self._send_json(400, {"error": "domain required"})
+                return
+            domain = domain.strip().lower()
+            pubkeys = domain_ban_remove(domain)
+            if pubkeys is None:
+                self._send_json(404, {"error": "no record for that domain"})
+                return
+            removed = blacklist.remove(pubkeys)
+            audit_append({
+                "type": "unban", "actor": auth.get("pubkey"), "pubkeys": removed,
+                "via": f"domain {domain}",
+            })
+            self._send_json(200, {"ok": True, "domain": domain, "removed": removed})
             return
 
         if path == "/api/reason":
@@ -2978,14 +3736,25 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 skipped.append(raw_pk)
 
+        # An optional `domain` says these pubkeys were banned AS a domain's
+        # roster, on the Domain page. It changes nothing about enforcement —
+        # the pubkeys are what enforce — but it is what lets the Banlist name
+        # the domain and undo the whole set in one press.
+        domain = body.get("domain")
+        domain = domain.strip().lower() if isinstance(domain, str) and domain.strip() else None
+
         if added:
+            if domain:
+                domain_ban_record(domain, added, body.get("reason") or "", auth.get("pubkey"))
             audit_append({
                 "type": "ban",
                 "actor": auth.get("pubkey"),
                 "pubkeys": added,
+                "domain": domain,
+                "via": f"domain {domain}" if domain else None,
                 "entries": [{"pubkey": pk, "reason": reasons_by_pk.get(pk, "")} for pk in added],
             })
-        self._send_json(200, {"ok": True, "added": added, "skipped": skipped})
+        self._send_json(200, {"ok": True, "added": added, "skipped": skipped, "domain": domain})
 
 
 def main():

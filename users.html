@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
+<title>strfry-86 — users</title>
+<style>
+/* strfry-86 style block — canonical source. tools/stamp_style.py copies this
+   file verbatim into every page's <style>, so "identical character-for-character
+   on every page" is enforced by a command, not by discipline. Edit here only.
+
+   Colours resolve through light-dark(), which reads the SAME color-scheme value
+   the theme button and the anti-flash <script> already set on <html> — the
+   toggle mechanism of WHY.md §3 is unchanged, only its palette is now ours.
+   Where light-dark() is unsupported the @supports block below hands every token
+   back to a system colour, i.e. back to the browser-default rendering this
+   project shipped before the paint. */
+:root {
+  color-scheme: light dark;
+  --paper:   light-dark(oklch(.985 .004 60),        oklch(.155 .005 60));
+  --surface: light-dark(oklch(1 0 0),               oklch(.205 .005 60));
+  --ink:     light-dark(oklch(.18 .005 60),         oklch(.93 .004 60));
+  --muted:   light-dark(oklch(.18 .005 60 / .55),   oklch(.93 .004 60 / .55));
+  --rule:    light-dark(oklch(.18 .005 60 / .15),   oklch(.93 .004 60 / .18));
+  --hair:    light-dark(oklch(.18 .005 60 / .08),   oklch(.93 .004 60 / .1));
+  --wash:    light-dark(oklch(.18 .005 60 / .06),   oklch(.93 .004 60 / .08));
+  --accent:  light-dark(oklch(.45 .18 25),          oklch(.72 .16 25));
+  --good:    light-dark(oklch(.5 .12 145),          oklch(.75 .14 145));
+  --term-bg: oklch(.14 .005 60);
+  --term-fg: oklch(.9 .01 145);
+  --term-edge: oklch(.3 .01 60);
+  --serif: Georgia, "PT Serif", "Iowan Old Style", "Times New Roman", serif;
+  --sans: "Helvetica Neue", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, "IBM Plex Mono", monospace;
+}
+@supports not (color: light-dark(#000, #fff)) {
+  :root { --paper:Canvas; --surface:Canvas; --ink:CanvasText; --muted:GrayText;
+          --rule:GrayText; --hair:GrayText; --wash:transparent;
+          --accent:LinkText; --good:CanvasText; }
+}
+* { box-sizing:border-box; }
+body { max-width:68em; margin:0 auto; padding:0 1.5em 4em; font-size:.94rem;
+       line-height:1.55; font-family:var(--sans);
+       background:var(--paper); color:var(--ink); }           /* WHY.md §3 */
+h1, h2 { font-family:var(--serif); font-weight:700; letter-spacing:-.01em; margin:0 0 .4rem; }
+h1 { font-size:1.7rem; }
+h2 { font-size:1.2rem; margin-top:2.2rem; }
+h3 { font-size:.72rem; font-weight:600; text-transform:uppercase; letter-spacing:.1em;
+     color:var(--muted); margin:1.6rem 0 .5rem; }
+p { margin:.5rem 0; }
+a { color:var(--accent); text-underline-offset:2px; }
+li { overflow-wrap:anywhere; }
+code { font-family:var(--mono); font-size:.85em; }
+.mono { font-family:var(--mono); font-size:.9em; }
+.nowrap { white-space:nowrap; }      /* already-truncated ids — never wrapped mid-key */
+.muted, #status, #feed-age, #provenance-line, #truncated-line { color:var(--muted); }
+.page-head { display:flex; align-items:baseline; justify-content:space-between;
+             gap:1em; flex-wrap:wrap; }
+.badge { font-family:var(--mono); font-size:.72rem; padding:.15em .5em; white-space:nowrap;
+         background:var(--wash); border:1px solid var(--rule); border-radius:6px; }
+.pill { display:inline-flex; align-items:center; gap:.45em; font-family:var(--mono);
+        font-size:.7rem; letter-spacing:.08em; padding:.35em .75em;
+        border:1px solid currentColor; border-radius:8px; color:var(--muted); }
+.pill.live { color:var(--good); }
+.pill .dot { width:.45em; height:.45em; border-radius:50%; background:currentColor; }
+.chip { display:inline-block; font-family:var(--mono); font-size:.7rem; padding:.2em .6em;
+        border:1px solid currentColor; border-radius:6px; color:var(--muted); }
+.chip.good { color:var(--good); }
+.chip.bad { color:var(--accent); }
+.chips { display:flex; flex-wrap:wrap; gap:.4em; margin:.6rem 0; }
+button.chip.cmd { font-weight:400; background:transparent; color:var(--ink);
+                  border-color:var(--rule); }
+button.chip.cmd:hover { background:var(--ink); color:var(--paper); }
+/* Identity dot, never an avatar: the hue comes from the pubkey itself, so no
+   row on any page ever fetches an image from a stranger's host. */
+.idot { width:.75em; height:.75em; border-radius:50%; flex:none;
+        background:oklch(.65 .11 var(--h, 0)); }
+.idot.unknown { background:var(--rule); }
+.idot.big { width:4.5em; height:4.5em; }
+.profile-head { display:flex; gap:1.5em; align-items:flex-start; padding-bottom:1.4rem;
+                margin-bottom:1.2rem; border-bottom:1px solid var(--rule); }
+.profile-head .profile-id { flex:1; min-width:0; }
+.profile-head .profile-id > * { margin:.25rem 0; }
+.profile-head h2 { font-size:1.5rem; margin:0; }
+td.identity { display:flex; align-items:center; gap:.5em; white-space:nowrap;
+              max-width:15em; }
+td.identity > :last-child { overflow:hidden; text-overflow:ellipsis; }
+td.num { font-family:var(--mono); font-size:.9em; }
+td.num.bad { color:var(--accent); }
+td.pick { width:1.5em; }
+td.action { text-align:right; white-space:nowrap; }
+/* A clipped cell must not be allowed to size its column, or one long note
+   pushes every other column off the page. max-width:0 hands the column its
+   width from the table instead; `.grow` then gives it whatever is left. */
+td.clip { max-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+th.grow, td.grow { width:100%; }
+.struck { text-decoration:line-through; }
+/* A control that reads as a link but IS a button — it performs an action, so
+   it must be a button for the keyboard and the screen reader both. */
+button.linky { font-size:.78rem; font-weight:400; padding:.15em .3em; border:none;
+               background:none; color:var(--accent); text-decoration:underline;
+               text-underline-offset:2px; }
+button.linky:hover:not(:disabled) { background:none; color:var(--accent); opacity:.7; }
+.toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:.6em; margin:.7rem 0; }
+.toolbar > input[type="search"], .toolbar > input[type="text"] { flex:1; min-width:12em; }
+.modes { display:flex; flex-direction:column; gap:.3em; }
+.modes label { display:flex; align-items:baseline; gap:.5em; font-size:.88rem; }
+dl.tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(11em, 1fr));
+           gap:1px; margin:1.2rem 0; background:var(--rule);
+           border:1px solid var(--rule); border-radius:10px; overflow:hidden; }
+dl.tiles .tile { background:var(--surface); padding:.9em 1em; }
+dl.tiles dt { font-size:.68rem; font-weight:600; text-transform:uppercase;
+              letter-spacing:.08em; color:var(--muted); }
+dl.tiles dd { margin:.3rem 0 0; font-family:var(--serif); font-size:1.5rem;
+              font-weight:700; letter-spacing:-.02em; }
+dl.tiles .note { margin:.2rem 0 0; font-family:var(--mono); font-size:.68rem; color:var(--muted); }
+dl.tiles .note.bad { color:var(--accent); }
+.field-row { display:grid; grid-template-columns:16em 1fr; gap:1.2em;
+             align-items:baseline; padding:.45em 0; }
+.field-label { font-size:.85rem; color:var(--muted); }
+.field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
+.field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.6;
+           padding:1em; resize:vertical; background:var(--term-bg); color:var(--term-fg);
+           border:1px solid var(--term-edge); border-radius:14px; }
+.console-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.2em; align-items:start; }
+.console-grid h3 { display:flex; align-items:center; gap:.5em; }
+.dot-inline { width:.5em; height:.5em; border-radius:50%; background:var(--good); flex:none; }
+.dot-inline.warn { background:light-dark(oklch(.6 .14 80), oklch(.8 .14 80)); }
+.dot-inline.off { background:var(--rule); }
+table { width:100%; border-collapse:collapse; margin:.8rem 0 1.4rem; font-size:.92em; }
+th, td { text-align:left; padding:.6em .7em; border-bottom:1px solid var(--hair);
+         font-variant-numeric:tabular-nums; }
+tbody th { font-weight:600; }        /* row label, not a column header */
+thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
+           line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
+           border-bottom:1px solid var(--rule); }
+td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
+tbody tr:hover { background:var(--wash); }
+button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
+         color:var(--ink); background:transparent; border:1px solid var(--ink);
+         border-radius:8px; cursor:pointer; }
+button:hover:not(:disabled) { background:var(--ink); color:var(--paper); }
+button:disabled { opacity:.4; cursor:not-allowed; }
+input, select, textarea { font-family:var(--mono); font-size:.82rem; padding:.5em .7em;
+         color:var(--ink); background:var(--surface); border:1px solid var(--rule);
+         border-radius:8px; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+details { background:var(--surface); border:1px solid var(--rule); border-radius:10px;
+          padding:.6em .9em; margin:1rem 0; }
+summary { cursor:pointer; font-size:.85rem; font-weight:600; }
+hr { border:none; border-top:3px double var(--rule); margin:2.4rem 0; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere;                /* commands only — WHY.md §2 */
+      font-family:var(--mono); font-size:.8rem; line-height:1.65; padding:1em 1.1em;
+      background:var(--term-bg); color:var(--term-fg);
+      border:1px solid var(--term-edge); border-radius:14px; }
+pre#console-log, pre#decision-log { min-height:12em; max-height:26em; overflow:auto; }
+/* A log line is one line. Wrapping a key across two rows makes a tail
+   unreadable, so this panel scrolls sideways inside its own box — which the
+   no-horizontal-scroll rule is about the PAGE, not about a terminal. */
+pre#decision-log { white-space:pre; overflow-wrap:normal; }
+pre#console-log:empty::before { content:"strfry console — read-only verbs only";
+                                color:oklch(.6 .01 60); }
+pre .good { color:oklch(.78 .1 145); }
+pre .bad { color:oklch(.72 .16 25); }
+pre .dim { color:oklch(.6 .01 60); }
+.console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
+.console-row .prompt { font-family:var(--mono); color:var(--good); }
+.console-row input { flex:1; }
+#records-container p { padding-bottom:.6em; border-bottom:1px solid var(--hair); }
+header#s86 { position:sticky; top:0; z-index:5; margin-bottom:1.4rem;
+             background:var(--paper); border-bottom:3px double var(--rule); }
+header#s86 .brand { display:flex; align-items:baseline; gap:.8em; padding:.9rem 0 .6rem; }
+header#s86 a.logo { font-family:var(--serif); font-weight:bold; font-size:1.5rem;
+                    letter-spacing:-.02em; white-space:nowrap;
+                    text-decoration:none; color:inherit; }
+header#s86 .tagline { font-size:.65rem; font-weight:600; letter-spacing:.14em;
+                      text-transform:uppercase; color:var(--muted); }
+header#s86 .spacer { flex:1; }
+header#s86 .bar { display:flex; align-items:center; gap:.5em; flex-wrap:wrap;
+                  border-top:1px solid var(--rule); }
+header#s86 nav { display:flex; flex-wrap:wrap; }
+header#s86 nav a { padding:.7em .75em; font-size:.82rem; font-weight:600;
+                   color:var(--muted); text-decoration:none;
+                   border-bottom:2px solid transparent; }
+header#s86 nav a:hover { color:var(--ink); }
+header#s86 nav a[aria-current="page"] { color:var(--ink); border-bottom-color:var(--accent); }
+header#s86 input#q { flex:1; min-width:8em; max-width:24em; margin-left:auto; }
+header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
+@media (max-width:600px) {
+  body { font-size:1rem; padding:0 1em 3em; }
+  /* Nothing may push the page wider than the screen (rendering rule 5), so
+     at phone widths every cell breaks an unbreakable key — an npub, a hex id,
+     a nip-05 address — rather than let the table overflow. */
+  th, td { padding:.5em .35em; overflow-wrap:anywhere; }
+  .nowrap { white-space:normal; }
+  td.clip { max-width:none; white-space:normal; }
+  .console-grid { grid-template-columns:1fr; }
+  .field-row { grid-template-columns:1fr; gap:.2em; }
+  header#s86 .tagline { display:none; }
+  header#s86 input#q { max-width:none; margin:0 0 .5em; }
+}
+</style>
+</head>
+<body>
+<div class="page-head">
+  <h1>Users</h1>
+  <input id="filter-input" type="search" placeholder="search pubkey or NIP-05…" aria-label="search users">
+</div>
+<p id="status"></p>
+<div id="admin-section" style="display:none">
+  <div id="command-block-container"></div>
+  <div id="records-list"></div>
+
+  <h3>Author scan</h3>
+  <p id="scan-cost-line"></p>
+  <p class="modes">
+    <label><input type="radio" name="scan-mode" value="recent" checked> recent activity (newest 20,000 events, all kinds)</label>
+    <label><input type="radio" name="scan-mode" value="full"> full author list (every note, reaction, report and profile — excludes DMs)</label>
+  </p>
+  <p><button id="scan-btn" type="button">scan recent activity (newest 20,000 events)</button></p>
+  <p id="empty-state-line"></p>
+  <p id="provenance-line"></p>
+  <details id="composition-details" style="display:none">
+    <summary>scan composition</summary>
+    <div id="composition-line"></div>
+  </details>
+
+  <hr>
+
+  <div class="toolbar">
+    <label><input id="hide-singletons" type="checkbox" checked> hide single-event authors</label>
+    <div id="sort-row"></div>
+  </div>
+  <p id="hidden-singletons-line"></p>
+  <div class="toolbar">
+    <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
+    <b id="selected-count"></b>
+    <input id="ban-reason" type="text" placeholder="reason (optional)">
+    <button id="ban-btn" type="button">Ban selected</button>
+    <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
+  </div>
+  <pre id="purge-pre" style="display:none"></pre>
+  <p id="truncated-line"></p>
+  <p><button id="lookup-names-btn" type="button" style="display:none"></button></p>
+  <div id="table-container"></div>
+</div>
+<script src="/common86.js"></script>
+<script>
+// Users is the Authors page and the member table in one view, because they
+// were always one thing seen twice: the scan at the top is what FILLS the
+// table below it, and reading a member list whose filling control lived on
+// another page is how an operator concludes the relay has no users.
+//
+// Rows come from GET /api/userlist, which is the join of three caches
+// (authors, gift-wrap recipients, reports-against). Scan status, mode
+// durations and composition come from GET /api/authors, which owns the job.
+// Neither call ever starts a scan; only the button does.
+var adminPubkey = null;
+var isAdmin = false;
+var lastUserlist = null;
+var lastAuthorsStatus = null;
+var currentRenderedRows = [];
+var lastBanned = [];
+var bannedPubkeys = {};
+var pollTimer = null;
+var attemptedThisSession = new Set();
+var nameResolutionInFlight = false;
+
+var sortField = 'reports';
+var sortDir = 'desc';
+
+var statusEl = document.getElementById('status');
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
+var adminSection = document.getElementById('admin-section');
+var commandBlockContainer = document.getElementById('command-block-container');
+var recordsList = document.getElementById('records-list');
+var scanCostLine = document.getElementById('scan-cost-line');
+var scanBtn = document.getElementById('scan-btn');
+var emptyStateLine = document.getElementById('empty-state-line');
+var provenanceLine = document.getElementById('provenance-line');
+var compositionDetails = document.getElementById('composition-details');
+var compositionLine = document.getElementById('composition-line');
+var filterInput = document.getElementById('filter-input');
+var hideSingletonsBox = document.getElementById('hide-singletons');
+var hiddenSingletonsLine = document.getElementById('hidden-singletons-line');
+var sortRowEl = document.getElementById('sort-row');
+var selectAll = document.getElementById('select-all');
+var banBtn = document.getElementById('ban-btn');
+var copyPurgeBtn = document.getElementById('copy-purge-btn');
+var banReason = document.getElementById('ban-reason');
+var selectedCount = document.getElementById('selected-count');
+var purgePre = document.getElementById('purge-pre');
+var truncatedLine = document.getElementById('truncated-line');
+var lookupNamesBtn = document.getElementById('lookup-names-btn');
+var tableContainer = document.getElementById('table-container');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function scanModeSelected() {
+  return document.querySelector('input[name="scan-mode"]:checked').value;
+}
+
+function modeDuration(data, mode, fallback) {
+  var modes = (data && data.modes) || {};
+  var entry = modes[mode] || {};
+  return entry.typical_seconds ? ('about ' + s86FormatDuration(entry.typical_seconds)) : fallback;
+}
+
+function updateScanButtonLabel() {
+  var full = scanModeSelected() === 'full';
+  scanBtn.textContent = full
+    ? 'build full author list (you can close this tab)'
+    : 'scan recent activity (newest 20,000 events)';
+  scanCostLine.textContent = full
+    ? 'reads every note, reaction, report and profile — ' + modeDuration(lastAuthorsStatus, 'full', 'about two minutes')
+    : 'reads the newest 20,000 events of every kind — ' + modeDuration(lastAuthorsStatus, 'recent', 'about three seconds');
+}
+document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) {
+  r.addEventListener('change', updateScanButtonLabel);
+});
+
+// --- provenance / composition ---------------------------------------------
+
+function emptyStateText(data) {
+  return 'no scan yet. A recent scan reads the newest 20,000 events and takes '
+    + modeDuration(data, 'recent', 'about three seconds')
+    + '; the full author list takes ' + modeDuration(data, 'full', 'about two minutes')
+    + ' and you can close the tab while it runs. Gift-wrap counts fill from the '
+    + 'recipients scan on Stats & Console.';
+}
+
+function renderProvenance(data) {
+  if (!data || data.scanned_at === null || data.scanned_at === undefined) {
+    provenanceLine.textContent = '';
+    emptyStateLine.textContent = (data && data.error)
+      ? ('could not run — ' + data.error) : emptyStateText(data);
+    return;
+  }
+  emptyStateLine.textContent = '';
+  var parts = [data.events_read.toLocaleString() + ' events, '
+    + s86FormatDate(data.span_start) + ' → ' + s86FormatDate(data.span_end) + ', '
+    + data.authors.length.toLocaleString() + ' authors — scanned ' + s86FormatDate(data.scanned_at)
+    + ' (' + s86FormatRelativeAge(data.scanned_at) + ')'];
+  if (data.saturated) {
+    parts.push(data.mode === 'full'
+      ? 'SATURATED: relay has outgrown the full-list limit, this is a window, not a complete list'
+      : 'window limit reached');
+  }
+  if (data.warning) {
+    parts.push(data.warning);
+  }
+  var ul = lastUserlist || {};
+  if (ul.recipients_scanned_at) {
+    parts.push('gift wraps ' + s86FormatRelativeAge(ul.recipients_scanned_at)
+      + (ul.recipients_saturated ? ' — SATURATED, counts are floors' : ''));
+  } else {
+    parts.push('gift wraps never scanned — that column is —');
+  }
+  if (ul.reports_scanned_at) {
+    parts.push('reports ' + s86FormatRelativeAge(ul.reports_scanned_at));
+  } else {
+    parts.push('reports never scanned — that column is —');
+  }
+  provenanceLine.textContent = parts.join('. ');
+}
+
+var KNOWN_KINDS = { 0: 'profile', 1: 'note', 1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt' };
+function kindLabel(kind) {
+  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+}
+
+function renderComposition(data) {
+  compositionLine.textContent = '';
+  if (!data || !data.authors || data.authors.length === 0) {
+    compositionDetails.style.display = 'none';
+    return;
+  }
+  compositionDetails.style.display = '';
+  var totalAuthors = data.authors.length;
+  var singletonEntries = Object.keys(data.singleton_kinds || {}).map(function (k) {
+    return [parseInt(k, 10), data.singleton_kinds[k]];
+  }).sort(function (a, b) { return b[1] - a[1]; });
+  var singletonTotal = singletonEntries.reduce(function (sum, e) { return sum + e[1]; }, 0);
+  var multiAuthors = totalAuthors - singletonTotal;
+  var multiEvents = Math.max(0, data.events_read - singletonTotal);
+
+  var kindEntries = Object.keys(data.kinds || {}).map(function (k) {
+    return [parseInt(k, 10), data.kinds[k]];
+  }).sort(function (a, b) { return b[1] - a[1]; });
+
+  if (kindEntries.length) {
+    compositionLine.appendChild(s86BuildRankedFigureTable(
+      kindEntries.map(function (e) { return [kindLabel(e[0]), e[1]]; }),
+      { unit: 'kinds', grandTotal: data.events_read }
+    ));
+  }
+  if (singletonTotal > 0) {
+    compositionLine.appendChild(s86El('p', singletonTotal.toLocaleString() + ' of '
+      + totalAuthors.toLocaleString() + ' authors posted exactly 1 event; of those, '
+      + singletonEntries.slice(0, 5).map(function (e) { return e[1] + ' were kind ' + kindLabel(e[0]); }).join(', ')));
+  }
+  compositionLine.appendChild(s86El('p', multiEvents.toLocaleString() + ' events from '
+    + multiAuthors.toLocaleString() + ' authors who posted more than once'));
+  if (data.reports_saturated) {
+    compositionLine.appendChild(s86El('p', 'report tally is a FLOOR — the 5,000-event cap was reached and older reports were not counted'));
+  }
+}
+
+// --- sort -------------------------------------------------------------
+
+var SORT_COMPARATORS = {
+  reports: function (a, b) { return (a.reporters || 0) - (b.reporters || 0) || (a.event_count - b.event_count); },
+  events: function (a, b) { return (a.event_count || 0) - (b.event_count || 0); },
+  name: function (a, b) {
+    var an = a.name || '', bn = b.name || '';
+    if (!an && !bn) { return 0; }
+    if (!an) { return 1; }
+    if (!bn) { return -1; }
+    return an < bn ? -1 : (an > bn ? 1 : 0);
+  },
+  last_seen: function (a, b) { return (a.last_seen || 0) - (b.last_seen || 0); }
+};
+
+sortRowEl.appendChild(s86BuildSortRow(
+  [
+    { key: 'reports', label: 'reports', dir: 'desc' },
+    { key: 'events', label: 'events', dir: 'desc' },
+    { key: 'name', label: 'name', dir: 'asc' },
+    { key: 'last_seen', label: 'last active', dir: 'desc' }
+  ],
+  sortField, sortDir,
+  function (field, dir) {
+    sortField = field;
+    sortDir = dir;
+    renderUsers();
+  }
+));
+
+// --- rendering ----------------------------------------------------------
+
+function dash(v) {
+  return (v === null || v === undefined || v === '') ? '—' : v;
+}
+
+function giftwrapLabel(count, saturated) {
+  if (count === null || count === undefined) {
+    return '—';
+  }
+  return (saturated ? '≥ ' : '') + Number(count).toLocaleString();
+}
+
+function matchesQuery(row, q) {
+  if (!q) {
+    return true;
+  }
+  return [row.name, row.nip05, row.npub, row.pubkey].join(' ').toLowerCase().indexOf(q) !== -1;
+}
+
+function renderUsers() {
+  if (!lastUserlist) {
+    return;
+  }
+  tableContainer.textContent = '';
+  var saturated = !!lastUserlist.recipients_saturated;
+  var all = lastUserlist.rows || [];
+  var sorted = s86SortRows(all, SORT_COMPARATORS[sortField], sortDir);
+
+  var hiddenCount = 0;
+  var visible = sorted;
+  if (hideSingletonsBox.checked) {
+    visible = sorted.filter(function (a) { return a.event_count !== 1; });
+    hiddenCount = sorted.length - visible.length;
+  }
+  hiddenSingletonsLine.textContent = hiddenCount > 0
+    ? ('hiding ' + hiddenCount.toLocaleString() + ' single-event authors')
+    : '';
+
+  var q = filterInput.value.trim().toLowerCase();
+  var filtered = visible.filter(function (r) { return matchesQuery(r, q); });
+  var truncation = s86TruncateForRender(filtered, S86_RENDER_MAX);
+  currentRenderedRows = truncation.shown;
+  selectAll.checked = false;
+
+  if (currentRenderedRows.length === 0) {
+    tableContainer.appendChild(s86El('p', all.length === 0
+      ? 'no users yet — run a scan above'
+      : 'no users match this filter'));
+    truncatedLine.textContent = '';
+    s86UpdateSelectedCount(tableContainer, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+    updateLookupNamesButton();
+    return;
+  }
+
+  var table = document.createElement('table');
+  table.appendChild(s86BuildTableHead([
+    '', 'User', 'NIP-05', 'Events', 'Reports',
+    saturated ? 'Gift-wraps (floor — scan capped)' : 'Gift-wraps (p-tag)',
+    'Last active', ''
+  ], 2));
+  var tbody = document.createElement('tbody');
+  currentRenderedRows.forEach(function (r) {
+    var tr = document.createElement('tr');
+    tr.setAttribute('data-pubkey', r.pubkey);
+
+    var alreadyBanned = !!bannedPubkeys[r.pubkey];
+    var isSelf = r.pubkey === adminPubkey;
+    var boxTd = s86El('td', null, 'pick');
+    if (!alreadyBanned && !isSelf) {
+      var checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = r.pubkey;
+      checkbox.className = 'author-checkbox';
+      checkbox.setAttribute('aria-label', 'select ' + (r.name || r.npub || r.pubkey));
+      boxTd.appendChild(checkbox);
+    }
+    tr.appendChild(boxTd);
+
+    tr.appendChild(s86BuildIdentityCell(r, true));
+    tr.appendChild(s86El('td', dash(r.nip05), r.nip05 ? 'mono clip' : 'mono muted'));
+    tr.appendChild(s86El('td', r.event_count != null ? Number(r.event_count).toLocaleString() : '—', 'num'));
+
+    var reportsTd = s86El('td', r.reporters != null ? Number(r.reporters).toLocaleString() : '—', 'num');
+    if (r.reporters) {
+      reportsTd.classList.add('bad');
+    }
+    tr.appendChild(reportsTd);
+
+    tr.appendChild(s86El('td', giftwrapLabel(r.giftwrap_count, saturated), 'num'));
+
+    var lastTd = s86El('td', r.last_seen ? s86FormatRelativeAge(r.last_seen) : '—', 'nowrap muted');
+    lastTd.title = r.last_seen ? s86FormatDate(r.last_seen) : '';
+    tr.appendChild(lastTd);
+
+    var actionTd = s86El('td', null, 'action');
+    if (alreadyBanned) {
+      actionTd.appendChild(s86El('span', 'banned', 'chip bad'));
+    } else if (!isSelf) {
+      var banLink = s86El('button', 'Ban', 'linky');
+      banLink.type = 'button';
+      banLink.addEventListener('click', function () { banPubkeys([r.pubkey]); });
+      actionTd.appendChild(banLink);
+    }
+    tr.appendChild(actionTd);
+
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  tableContainer.appendChild(table);
+
+  truncatedLine.textContent = truncation.truncatedCount > 0
+    ? ('showing top ' + S86_RENDER_MAX + ' of ' + truncation.totalCount.toLocaleString() + ' — search to narrow')
+    : '';
+
+  s86UpdateSelectedCount(tableContainer, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+  updateLookupNamesButton();
+}
+
+function renderRecords() {
+  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+    onChanged: function () {
+      loadBanned().then(function () {
+        renderRecords();
+        renderUsers();
+      });
+    },
+    onError: setStatus
+  });
+}
+
+// --- look up names for the N shown (button-triggered, bounded to what's on
+// screen — never automatic: this set does not self-extinguish, so automatic
+// here would mean a bulk external query on every scan). --------------------
+
+function unresolvedVisiblePubkeys() {
+  var out = [];
+  currentRenderedRows.forEach(function (r) {
+    if (r.event_count !== 1 && !r.name && !r.nip05 && !attemptedThisSession.has(r.pubkey)) {
+      out.push(r.pubkey);
+    }
+  });
+  return out;
+}
+
+function updateLookupNamesButton() {
+  if (!isAdmin) {
+    lookupNamesBtn.style.display = 'none';
+    return;
+  }
+  var pubkeys = unresolvedVisiblePubkeys();
+  if (pubkeys.length === 0) {
+    lookupNamesBtn.style.display = 'none';
+    return;
+  }
+  lookupNamesBtn.style.display = '';
+  lookupNamesBtn.textContent = 'look up names for the ' + pubkeys.length
+    + ' shown without one (queries external relays)';
+}
+
+lookupNamesBtn.addEventListener('click', function () {
+  if (!isAdmin || nameResolutionInFlight) {
+    return;
+  }
+  var pubkeys = unresolvedVisiblePubkeys();
+  if (pubkeys.length === 0) {
+    return;
+  }
+  nameResolutionInFlight = true;
+  lookupNamesBtn.disabled = true;
+  pubkeys.forEach(function (pk) { attemptedThisSession.add(pk); });
+
+  s86ResolveNamesExternally(pubkeys, {
+    onDone: function () {
+      nameResolutionInFlight = false;
+      lookupNamesBtn.disabled = false;
+      loadUserlist();
+    },
+    onError: function (msg) {
+      nameResolutionInFlight = false;
+      lookupNamesBtn.disabled = false;
+      setStatus(msg);
+    }
+  });
+});
+
+// --- ban ----------------------------------------------------------------
+
+function banPubkeys(selected) {
+  if (!isAdmin || selected.length === 0) {
+    setStatus(selected.length === 0 ? 'nothing selected' : '');
+    return;
+  }
+  var reason = banReason.value;
+  var entries = selected.map(function (pk) { return { pubkey: pk, reason: reason }; });
+  var byPubkey = {};
+  ((lastUserlist && lastUserlist.rows) || []).forEach(function (r) { byPubkey[r.pubkey] = r; });
+
+  s86SignAndPost('/api/ban', { entries: entries })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('ban failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('banned ' + result.body.added.length + ' pubkey(s)'
+        + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
+      var added = result.body.added.map(function (pk) {
+        var r = byPubkey[pk];
+        return {
+          pubkey: pk, npub: r ? r.npub : null, name: r ? r.name : null,
+          nip05: r ? r.nip05 : null, reason: reason
+        };
+      });
+      if (added.length > 0) {
+        s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
+      }
+      return loadBanned().then(function () {
+        renderRecords();
+        renderUsers();
+      });
+    })
+    .catch(function () {
+      setStatus('ban failed');
+    });
+}
+
+banBtn.addEventListener('click', function () {
+  var checkboxes = tableContainer.querySelectorAll('.author-checkbox:checked');
+  var selected = [];
+  for (var i = 0; i < checkboxes.length; i++) {
+    selected.push(checkboxes[i].value);
+  }
+  banPubkeys(selected);
+});
+
+// --- loading / polling --------------------------------------------------
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function applyAuthorsStatus(data) {
+  lastAuthorsStatus = data;
+  var running = data.status === 'running';
+  var blocked = !!data.blocked_by;
+  document.querySelectorAll('input[name="scan-mode"]').forEach(function (r) { r.disabled = running || blocked; });
+  scanBtn.disabled = running || blocked;
+  updateScanButtonLabel();
+  if (running || blocked) {
+    provenanceLine.textContent = s86ScanStatusText(data);
+    emptyStateLine.textContent = '';
+    compositionDetails.style.display = 'none';
+  } else {
+    renderProvenance(data);
+    renderComposition(data);
+  }
+}
+
+function pollAuthorsStatus() {
+  fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var wasRunning = lastAuthorsStatus && lastAuthorsStatus.status === 'running';
+      applyAuthorsStatus(data);
+      if (data.status === 'running') {
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      } else {
+        stopPolling();
+        if (wasRunning) {
+          loadUserlist();
+        }
+      }
+    })
+    .catch(function () {
+      // The scan is server-side and unaffected by the browser; keep polling
+      // rather than declaring failure.
+      setStatus('connection lost — still scanning');
+      pollTimer = setTimeout(pollAuthorsStatus, 3000);
+    });
+}
+
+function loadAuthorsStatus() {
+  return fetch('/api/authors')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      applyAuthorsStatus(data);
+      if (data.status === 'running') {
+        stopPolling();
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load scan status');
+    });
+}
+
+function loadUserlist() {
+  return fetch('/api/userlist')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      lastUserlist = data;
+      renderUsers();
+      if (lastAuthorsStatus && lastAuthorsStatus.status !== 'running') {
+        renderProvenance(lastAuthorsStatus);
+      }
+    })
+    .catch(function () { setStatus('failed to load users'); });
+}
+
+function loadBanned() {
+  return fetch('/api/banned')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var firstLoad = adminPubkey === null;
+      adminPubkey = data.admin;
+      lastBanned = data.banned;
+      bannedPubkeys = {};
+      lastBanned.forEach(function (b) { bannedPubkeys[b.pubkey] = true; });
+      if (firstLoad) {
+        s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+      }
+    })
+    .catch(function () {
+      setStatus('failed to load ban list');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  adminSection.style.display = '';
+  renderRecords();
+  loadAuthorsStatus();
+  loadUserlist();
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+commandBlockContainer.appendChild(s86BuildCommandGenerator());
+
+filterInput.addEventListener('input', renderUsers);
+hideSingletonsBox.addEventListener('change', renderUsers);
+s86WireSelectAll(selectAll, tableContainer, 'author-checkbox', selectedCount, [copyPurgeBtn]);
+s86WireCopyPurge(copyPurgeBtn, purgePre, tableContainer, 'author-checkbox');
+
+updateScanButtonLabel();
+
+scanBtn.addEventListener('click', function () {
+  if (!isAdmin) {
+    return;
+  }
+  s86SignAndPost('/api/authors/scan', { mode: scanModeSelected() })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('scan failed: ' + s86ErrMsg(result));
+        return;
+      }
+      setStatus('');
+      applyAuthorsStatus(result.body);
+      if (result.body.status === 'running') {
+        stopPolling();
+        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+      }
+    })
+    .catch(function () {
+      setStatus('scan failed');
+    });
+});
+
+loadBanned();
+</script>
+</body>
+</html>

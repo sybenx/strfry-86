@@ -148,6 +148,115 @@ function s86BuildPill(label, isLive) {
   return pill;
 }
 
+// An outcome chip: accepted (green), blocked (accent), unknown (muted dash).
+// `null` is NOT "accepted" — it means nothing judged this event, which the
+// fallback feed cannot distinguish from an accept (rule 9).
+function s86BuildResult(result, title) {
+  if (!result) {
+    return s86El('span', '—', 'muted');
+  }
+  var chip = s86El('span', result, result === 'blocked' ? 'chip bad' : 'chip good');
+  if (title) {
+    chip.title = title;
+  }
+  return chip;
+}
+
+// Identity dot for a pubkey. Deliberately NOT an avatar: rendering a profile
+// picture means fetching an arbitrary URL from an arbitrary host for every
+// row on the page, which is exactly the external traffic this project avoids.
+// The hue is derived from the pubkey itself, so the same key is the same
+// colour on every page and in every session without anything being stored.
+function s86BuildIdentityDot(pubkeyHex) {
+  var dot = s86El('span', null, 'idot');
+  if (typeof pubkeyHex === 'string' && pubkeyHex.length >= 6) {
+    // Folded over the WHOLE key, not a prefix: keys that share a prefix are
+    // exactly the pair a colour most needs to tell apart.
+    var h = 0;
+    for (var i = 0; i < pubkeyHex.length; i++) {
+      h = (h * 31 + pubkeyHex.charCodeAt(i)) % 360;
+    }
+    dot.style.setProperty('--h', String(h));
+  } else {
+    dot.classList.add('unknown');
+  }
+  return dot;
+}
+
+// Name cell as the design draws it: identity dot, then the best label this
+// row has — display name, else nip-05, else a truncated npub — never a raw
+// 64-hex key, which is unreadable at row height.
+function s86BuildIdentityCell(row, linkIt) {
+  var td = s86El('td', null, 'identity');
+  td.appendChild(s86BuildIdentityDot(row.pubkey));
+  var label = row.name || row.nip05 || (row.npub ? s86ShortKey(row.npub) : '—');
+  if (linkIt && row.npub && row.pubkey) {
+    var a = s86NpubLink(row.npub, row.pubkey, true);
+    a.textContent = label;
+    a.title = row.npub;
+    td.appendChild(a);
+  } else {
+    var span = s86El('span', label);
+    if (row.npub) {
+      span.title = row.npub;
+    }
+    td.appendChild(span);
+  }
+  return td;
+}
+
+// One truncation rule for every key-shaped string on every page.
+function s86ShortKey(key) {
+  if (typeof key !== 'string' || key.length < 20) {
+    return key || '—';
+  }
+  return key.slice(0, 10) + '…' + key.slice(-6);
+}
+
+// Metric tiles. A <dl> rather than a grid of <div>s because the rendering
+// rules allow exactly two shapes for a numeric result, <table> or <dl>, and
+// a tile IS a term and its definition. tiles: [{label, value, note, tone}].
+function s86BuildTiles(tiles) {
+  var dl = s86El('dl', null, 'tiles');
+  tiles.forEach(function (t) {
+    var cell = s86El('div', null, 'tile');
+    cell.appendChild(s86El('dt', t.label));
+    cell.appendChild(s86El('dd', t.value == null ? '—' : String(t.value)));
+    if (t.note) {
+      cell.appendChild(s86El('p', t.note, t.tone ? ('note ' + t.tone) : 'note'));
+    }
+    dl.appendChild(cell);
+  });
+  return dl;
+}
+
+// Header row for a data table. Labels are the design's words; every caller
+// passes them in the design's order. `growIndex` names the one column that
+// should absorb the leftover width (the free-text column, always).
+function s86BuildTableHead(labels, growIndex) {
+  var thead = document.createElement('thead');
+  var tr = document.createElement('tr');
+  labels.forEach(function (label, i) {
+    tr.appendChild(s86El('th', label, i === growIndex ? 'grow' : null));
+  });
+  thead.appendChild(tr);
+  return thead;
+}
+
+function s86FormatBytes(n) {
+  if (n == null) {
+    return null;
+  }
+  var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var i = 0;
+  var v = Number(n);
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+}
+
 function s86FormatDate(unixSeconds) {
   if (!unixSeconds) {
     return 'unknown date';
@@ -344,13 +453,12 @@ function s86BuildProfileEntryField(statusEl) {
 // invalid input sets the status line only. Ctrl-K / Cmd-K focuses search.
 // Nav order is fixed; pages gate their own content when logged out.
 var S86_NAV_LINKS = [
-  ['home', '/home'],
-  ['stats', '/stats'],
-  ['userlist', '/userlist'],
-  ['report', '/report'],
-  ['authors', '/authors'],
-  ['bans', '/bans'],
-  ['audit', '/audit']
+  ['Live Feed', '/home'],
+  ['Stats & Console', '/stats'],
+  ['Users', '/users'],
+  ['Banlist', '/bans'],
+  ['Audit Log', '/audit'],
+  ['Settings', '/settings']
 ];
 
 function s86BuildPageChrome(statusEl) {
@@ -571,38 +679,42 @@ function s86SignAndPost(endpoint, extraBody) {
 }
 
 // --- filter -----------------------------------------------------------------
-// Scoped to one list's direct children only — a collapsed <details> command
-// block stays in the DOM and must never be filtered along with the list.
-
-function s86ApplyFilter(filterInput, listEl) {
-  var query = filterInput.value.trim().toLowerCase();
-  var items = listEl.children;
-  for (var i = 0; i < items.length; i++) {
-    var match = !query || items[i].textContent.toLowerCase().indexOf(query) !== -1;
-    items[i].style.display = match ? '' : 'none';
-  }
-}
-
-function s86WireFilter(filterInput, listEl) {
-  filterInput.addEventListener('input', function () {
-    s86ApplyFilter(filterInput, listEl);
-  });
-}
+// There is no shared filter helper any more. It hid non-matching rows with
+// display:none, which meant "shown" and "rendered" were different sets and
+// every other helper had to keep asking which was which. Every page now
+// filters the DATA and re-renders, so what is in the DOM is exactly what
+// matches. s86VisibleRowCount below still honours display:none, because a
+// page is allowed to hide a row for other reasons.
 
 // --- select-visible + live count ---------------------------------------
 // Labelled "Select visible" everywhere, never "Select all" — the control
 // has always been filter-scoped, so the old label was lying by omission
 // on a control that can mass-unban.
 
-function s86UpdateSelectedCount(listEl, checkboxClass, countEl, extraButtons) {
-  var n = listEl.querySelectorAll('.' + checkboxClass + ':checked').length;
+// A selectable row is an <li> on the pages that render lists and a <tr> on
+// the pages that render tables. Both shapes go through these two helpers, so
+// "select visible" means the same thing — and skips hidden rows the same way
+// — regardless of which element the page happened to use.
+var S86_ROW_SELECTOR = 'li, tbody > tr';
+
+function s86RowOf(el) {
+  return el.closest(S86_ROW_SELECTOR);
+}
+
+function s86VisibleRowCount(listEl) {
+  var rows = listEl.querySelectorAll(S86_ROW_SELECTOR);
   var shown = 0;
-  var items = listEl.children;
-  for (var i = 0; i < items.length; i++) {
-    if (items[i].style.display !== 'none') {
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].style.display !== 'none') {
       shown++;
     }
   }
+  return shown;
+}
+
+function s86UpdateSelectedCount(listEl, checkboxClass, countEl, extraButtons) {
+  var n = listEl.querySelectorAll('.' + checkboxClass + ':checked').length;
+  var shown = s86VisibleRowCount(listEl);
   countEl.textContent = n > 0 ? n + ' selected of ' + shown + ' shown' : '';
   (extraButtons || []).forEach(function (btn) {
     btn.disabled = n === 0;
@@ -613,7 +725,8 @@ function s86WireSelectAll(selectAllEl, listEl, checkboxClass, countEl, extraButt
   selectAllEl.addEventListener('change', function () {
     var boxes = listEl.querySelectorAll('.' + checkboxClass);
     for (var i = 0; i < boxes.length; i++) {
-      if (boxes[i].closest('li').style.display === 'none') {
+      var row = s86RowOf(boxes[i]);
+      if (row && row.style.display === 'none') {
         continue;
       }
       boxes[i].checked = selectAllEl.checked;

@@ -22,9 +22,85 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server86.py")
 SERVER_RESPAWN_INTERVAL = 3600.0
 
+# This process is the ONLY place a reject is ever observed: a blocked event
+# never reaches the database, so `strfry scan` — which is all server86 can
+# see — cannot report one. The decision log is that missing channel. It is
+# written from strfry's blocking write path, so every rule below is a
+# latency rule, not a style one:
+#   - one append of one short line per event, no read, no stat, no seek;
+#   - the content preview is truncated HERE, so line length is bounded by
+#     the plugin rather than by whatever an author decided to publish;
+#   - rotation is os.replace + reopen, O(1) regardless of file size, never
+#     a rewrite (server86 reads the .1 segment and the live one together);
+#   - any failure disables logging for the life of the process. A relay
+#     that cannot write its decision log must still accept events at full
+#     speed; it must never retry, and must never raise into the reply path.
+DECISION_LOG_PATH = os.path.join(SCRIPT_DIR, "decisions.jsonl")
+DECISION_LOG_PREV_PATH = DECISION_LOG_PATH + ".1"
+DECISION_LOG_MAX_LINES = 2000    # lines per segment before rotation; two segments are retained
+DECISION_CONTENT_PREVIEW = 160   # characters of content kept per record
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+
+
+_decision_fh = None
+_decision_lines = 0
+_decision_disabled = False
+
+
+def _decision_open():
+    global _decision_fh, _decision_lines, _decision_disabled
+    try:
+        _decision_fh = open(DECISION_LOG_PATH, "a", encoding="utf-8")
+        _decision_lines = 0
+    except OSError as e:
+        log(f"plugin86: decision log disabled ({e})")
+        _decision_fh = None
+        _decision_disabled = True
+
+
+def record_decision(event, result):
+    """Append one accept/reject record. Never raises, never blocks on
+    anything but the append itself."""
+    global _decision_fh, _decision_lines, _decision_disabled
+    if _decision_disabled:
+        return
+    if _decision_fh is None:
+        _decision_open()
+        if _decision_fh is None:
+            return
+    try:
+        content = event.get("content")
+        if not isinstance(content, str):
+            content = ""
+        rec = {
+            "at": int(time.time()),
+            "id": result.get("id"),
+            "pubkey": event.get("pubkey"),
+            "kind": event.get("kind"),
+            "created_at": event.get("created_at"),
+            "action": result.get("action"),
+            "msg": result.get("msg") or "",
+            "content": content[:DECISION_CONTENT_PREVIEW],
+        }
+        _decision_fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+        _decision_fh.flush()
+        _decision_lines += 1
+        if _decision_lines >= DECISION_LOG_MAX_LINES:
+            _decision_fh.close()
+            os.replace(DECISION_LOG_PATH, DECISION_LOG_PREV_PATH)
+            _decision_open()
+    except Exception as e:
+        log(f"plugin86: decision log disabled ({type(e).__name__}: {e})")
+        try:
+            if _decision_fh is not None:
+                _decision_fh.close()
+        except Exception:
+            pass
+        _decision_fh = None
+        _decision_disabled = True
 
 
 def load_admin_pubkey():
@@ -144,6 +220,8 @@ def main():
         except Exception as e:
             log(f"plugin86: error processing event {event_id}: {e}")
             result = {"id": event_id, "action": "accept"}
+
+        record_decision(event if isinstance(event, dict) else {}, result)
 
         try:
             print(json.dumps(result), flush=True)
