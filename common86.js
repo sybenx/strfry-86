@@ -455,15 +455,28 @@ function s86BuildProfileEntryField(statusEl) {
 // every page, same positions, always". Logo is clickable plain text (no
 // underline, inherits color). Search accepts npub / 64-hex / domain;
 // invalid input sets the status line only. Ctrl-K / Cmd-K focuses search.
-// Nav order is fixed; pages gate their own content when logged out.
+// Nav order is fixed. adminOnly tabs (Users, Audit, Settings) are blank
+// until login, so they stay out of the nav until the admin is signed in.
+// [label, path, adminOnly]
 var S86_NAV_LINKS = [
-  ['Live Feed', '/home'],
-  ['Stats & Console', '/stats'],
-  ['Users', '/users'],
-  ['Banlist', '/bans'],
-  ['Audit Log', '/audit'],
-  ['Settings', '/settings']
+  ['Live Feed', '/home', false],
+  ['Stats & Console', '/stats', false],
+  ['Users', '/users', true],
+  ['Banlist', '/bans', false],
+  ['Audit Log', '/audit', true],
+  ['Settings', '/settings', true]
 ];
+
+function s86SetNavAdminVisible(visible) {
+  var nav = document.querySelector('header#s86 nav');
+  if (!nav) {
+    return;
+  }
+  var links = nav.querySelectorAll('a[data-admin-only="1"]');
+  for (var i = 0; i < links.length; i++) {
+    links[i].hidden = !visible;
+  }
+}
 
 function s86BuildPageChrome(statusEl) {
   var header = document.createElement('header');
@@ -510,6 +523,10 @@ function s86BuildPageChrome(statusEl) {
     var a = document.createElement('a');
     a.href = pair[1];
     a.textContent = pair[0];
+    if (pair[2]) {
+      a.setAttribute('data-admin-only', '1');
+      a.hidden = true;
+    }
     if (here === pair[1]) {
       a.setAttribute('aria-current', 'page');
     }
@@ -634,6 +651,7 @@ function s86WireLogin(loginBtn, statusEl, getAdminPubkey, onLogin) {
         s86SetStoredAdmin(pk);
         loginBtn.textContent = 'Logout';
         statusEl.textContent = 'logged in as admin';
+        s86SetNavAdminVisible(true);
         onLogin(pk);
       })
       .catch(function () {
@@ -649,6 +667,7 @@ function s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin) {
   if (remembered && remembered === adminPubkey) {
     loginBtn.textContent = 'Logout';
     statusEl.textContent = 'logged in as admin';
+    s86SetNavAdminVisible(true);
     onLogin(remembered);
     return true;
   }
