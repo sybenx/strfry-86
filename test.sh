@@ -2439,11 +2439,84 @@ def scenario_noninteractive(tmpdir):
     check("contact_appeal" not in cfg, "update: a non-interactive run never writes a guessed/blank value")
 
 
+def scenario_conf_discovery_and_backup(tmpdir):
+    # Conf lives under a non-/config path — the old hardcoded path would miss it.
+    conf_dir = os.path.join(tmpdir, "etc")
+    os.makedirs(conf_dir)
+    conf_path = os.path.join(conf_dir, "strfry.conf")
+    with open(conf_path, "w") as f:
+        f.write('db = "./strfry-db/"\n')
+    # Clear the pin so discovery walks candidates; inject our temp conf as the
+    # only candidate that exists.
+    orig_candidates = updater.STRFRY_CONF_CANDIDATES
+    orig_pin = updater.STRFRY_CONF_PATH
+    updater.STRFRY_CONF_PATH = None
+    updater.STRFRY_CONF_CANDIDATES = (conf_path, "/no/such/strfry.conf")
+    try:
+        resolved = updater.resolve_strfry_conf()
+        check(resolved.get("exists") and resolved.get("path") == conf_path
+              and resolved.get("source") == "default location",
+              "updater resolves strfry.conf from candidates, not only /config/strfry.conf")
+
+        status, used = updater.edit_strfry_conf()
+        check(status == "set" and used == conf_path,
+              "updater edits writePolicy.plugin on the resolved conf path")
+        with open(conf_path) as f:
+            body = f.read()
+        check(updater.PLUGIN_PATH in body,
+              "updater wrote plugin86.py path into the resolved strfry.conf")
+        baks = [n for n in os.listdir(conf_dir) if n.startswith("strfry.conf.bak-")]
+        check(len(baks) == 1,
+              "updater writes exactly one .bak when it actually edits the conf")
+
+        # Second run: already configured — no new backup, no rewrite.
+        before = open(conf_path).read()
+        status2, used2 = updater.edit_strfry_conf()
+        after = open(conf_path).read()
+        baks2 = [n for n in os.listdir(conf_dir) if n.startswith("strfry.conf.bak-")]
+        check(status2 == "already configured" and used2 == conf_path,
+              "updater reports already configured when plugin is set")
+        check(before == after and len(baks2) == 1,
+              "updater does not write a backup or rewrite conf when nothing changes")
+    finally:
+        updater.STRFRY_CONF_CANDIDATES = orig_candidates
+        updater.STRFRY_CONF_PATH = orig_pin
+
+
+def scenario_conf_override_from_config_json(tmpdir):
+    conf_path = os.path.join(tmpdir, "custom-strfry.conf")
+    with open(conf_path, "w") as f:
+        f.write('writePolicy {\n    plugin = ""\n}\n')
+    cfg_path = os.path.join(tmpdir, "config.json")
+    json.dump({
+        "admin_pubkey_hex": ADMIN_HEX,
+        "strfry_conf_path": conf_path,
+        "port": 8686, "bind": "0.0.0.0", "contact_appeal": "",
+    }, open(cfg_path, "w"))
+    orig_pin = updater.STRFRY_CONF_PATH
+    orig_candidates = updater.STRFRY_CONF_CANDIDATES
+    updater.STRFRY_CONF_PATH = None
+    # Candidates deliberately empty of real files so only config.json wins.
+    updater.STRFRY_CONF_CANDIDATES = ("/nope/strfry.conf",)
+    try:
+        resolved = updater.resolve_strfry_conf()
+        check(resolved.get("path") == conf_path and resolved.get("source") == "config.json",
+              "updater honours config.json strfry_conf_path over candidate scan")
+        status, used = updater.edit_strfry_conf()
+        check(status == "set" and used == conf_path,
+              "updater edits the config.json-override conf path")
+    finally:
+        updater.STRFRY_CONF_PATH = orig_pin
+        updater.STRFRY_CONF_CANDIDATES = orig_candidates
+
+
 with_tmp_install_dir(scenario_fresh)
 with_tmp_install_dir(scenario_missing_contact_only)
 with_tmp_install_dir(scenario_missing_both)
 with_tmp_install_dir(scenario_nothing_missing)
 with_tmp_install_dir(scenario_noninteractive)
+with_tmp_install_dir(scenario_conf_discovery_and_backup)
+with_tmp_install_dir(scenario_conf_override_from_config_json)
 PYEOF
 UPDATER_OUTPUT="$(python3 "$UPDATER_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
 echo "$UPDATER_OUTPUT"

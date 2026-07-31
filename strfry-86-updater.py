@@ -33,7 +33,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLE_FILENAME = "strfry86-bundle.tar.gz"
 BUNDLE_PATH = os.path.join(SCRIPT_DIR, BUNDLE_FILENAME)
 INSTALL_DIR = "/config/strfry86"
-STRFRY_CONF_PATH = "/config/strfry.conf"
 PLUGIN_PATH = "/config/strfry86/plugin86.py"
 SERVER_SCRIPT = "/config/strfry86/server86.py"
 # How long to wait for a killed server86.py to actually exit before spawning
@@ -46,6 +45,23 @@ CONFIG_JSON_PATH = os.path.join(INSTALL_DIR, "config.json")
 LOCAL_MANIFEST_PATH = os.path.join(INSTALL_DIR, "manifest.json")
 DEFAULT_PORT = 8686
 DEFAULT_BIND = "0.0.0.0"
+
+# strfry.conf is NOT at a fixed path (same order of authority as server86):
+# config.json override → running relay's --config → first candidate that
+# exists. Hardcoding /config/strfry.conf made the updater no-op on packages
+# that keep the conf under /etc. Tests may pin STRFRY_CONF_PATH to force a
+# single path (including a missing one, so the pubkey prompt stays manual).
+STRFRY_CONF_PATH = None
+STRFRY_CONF_CANDIDATES = (
+    "/etc/strfry.conf",
+    "/etc/strfry/strfry.conf",
+    "/config/strfry.conf",
+    "/app/strfry.conf",
+    "/usr/local/etc/strfry.conf",
+)
+STRFRY_BIN_CANDIDATES = (
+    "/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry",
+)
 
 # Files never managed by the manifest / never overwritten by updates.
 OPERATOR_OWNED = {"config.json", "blacklist.json"}
@@ -382,15 +398,135 @@ def self_update(manifest, fetch_bytes, source_label):
 
 
 # --------------------------------------------------------------------------
+# strfry.conf location (mirrors server86.strfry_conf_status, standalone)
+# --------------------------------------------------------------------------
+
+def _relay_conf_from_args(args):
+    """Pull --config from a relay process argv (`--config X` or `--config=X`)."""
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--config="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _strfry_bin_names():
+    names = {"strfry"}
+    for candidate in STRFRY_BIN_CANDIDATES:
+        names.add(os.path.basename(candidate))
+    which = shutil.which("strfry")
+    if which:
+        names.add(os.path.basename(which))
+    return names
+
+
+def locate_relay_conf():
+    """Return the absolute path of the RUNNING relay's --config, or None.
+
+    Same idea as server86.locate_relay_process: the process is the authority
+    on which conf is active. Best-effort via /proc; silent None when /proc
+    is missing or the relay is not up yet."""
+    bin_names = _strfry_bin_names()
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    args = [a.decode("utf-8", "replace") for a in f.read().split(b"\x00") if a]
+            except OSError:
+                continue
+            if not args or os.path.basename(args[0]) not in bin_names:
+                continue
+            if "relay" not in args[1:]:
+                continue
+            conf = _relay_conf_from_args(args)
+            if not conf:
+                continue
+            if not os.path.isabs(conf):
+                try:
+                    cwd = os.readlink(f"/proc/{entry}/cwd")
+                except OSError:
+                    continue
+                conf = os.path.normpath(os.path.join(cwd, conf))
+            return conf
+    except OSError:
+        pass
+    return None
+
+
+def resolve_strfry_conf():
+    """Locate the active strfry.conf.
+
+    Returns {path, source, exists} where source is one of:
+      'pin'           — STRFRY_CONF_PATH set (tests / explicit pin)
+      'config.json'   — strfry_conf_path override in config.json
+      'relay process' — running relay's --config
+      'default location' — first STRFRY_CONF_CANDIDATES entry that exists
+      None            — nothing found
+    """
+    # Pin wins always so tests and a deliberate operator override of the
+    # module constant stay deterministic.
+    if STRFRY_CONF_PATH is not None:
+        path = STRFRY_CONF_PATH
+        return {
+            "path": path,
+            "source": "pin",
+            "exists": os.path.isfile(path),
+        }
+
+    override = None
+    try:
+        with open(CONFIG_JSON_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh).get("strfry_conf_path")
+        if isinstance(raw, str) and raw.strip():
+            override = raw.strip()
+    except (OSError, ValueError):
+        pass
+    if override:
+        return {
+            "path": override,
+            "source": "config.json",
+            "exists": os.path.isfile(override),
+        }
+
+    detected = locate_relay_conf()
+    if detected and os.path.isfile(detected):
+        return {"path": detected, "source": "relay process", "exists": True}
+
+    for candidate in STRFRY_CONF_CANDIDATES:
+        if os.path.isfile(candidate):
+            return {
+                "path": candidate,
+                "source": "default location",
+                "exists": True,
+            }
+
+    return {
+        "path": detected,
+        "source": None,
+        "exists": False,
+    }
+
+
+def get_strfry_conf_path():
+    """Path of an existing strfry.conf, or None."""
+    status = resolve_strfry_conf()
+    return status["path"] if status.get("exists") else None
+
+
+# --------------------------------------------------------------------------
 # first-run config
 # --------------------------------------------------------------------------
 
 def find_relay_info_pubkey():
     """Best-effort scan of strfry.conf for the relay.info.pubkey field."""
-    if not os.path.exists(STRFRY_CONF_PATH):
+    conf_path = get_strfry_conf_path()
+    if not conf_path:
         return None
     try:
-        with open(STRFRY_CONF_PATH, "r") as f:
+        with open(conf_path, "r") as f:
             lines = f.readlines()
     except OSError:
         return None
@@ -570,11 +706,25 @@ def find_plugin_line(lines, block_start, block_end):
 
 
 def edit_strfry_conf():
-    if not os.path.exists(STRFRY_CONF_PATH):
-        print(f"WARNING: {STRFRY_CONF_PATH} not found — skipping strfry.conf edit.")
-        return "not found"
+    """Point writePolicy.plugin at plugin86.py.
 
-    with open(STRFRY_CONF_PATH, "r") as f:
+    Returns (status, conf_path). conf_path is the file we resolved (even when
+    missing or left untouched) so the caller can prune backups next to it;
+    None only when resolution found nothing at all. A backup is written only
+    when this call is about to change the file's bytes — already-configured
+    and refused-overwrite paths never touch disk."""
+    status = resolve_strfry_conf()
+    conf_path = status.get("path")
+    if not status.get("exists") or not conf_path:
+        tried = ", ".join(STRFRY_CONF_CANDIDATES)
+        where = conf_path or f"candidates: {tried}"
+        print(f"WARNING: strfry.conf not found ({where}) — skipping strfry.conf edit.")
+        return "not found", conf_path
+
+    source = status.get("source") or "unknown"
+    print(f"strfry.conf: using {conf_path} ({source})")
+
+    with open(conf_path, "r") as f:
         original = f.read()
 
     newline = "\r\n" if "\r\n" in original else "\n"
@@ -585,7 +735,7 @@ def edit_strfry_conf():
 
     if plugin_value == PLUGIN_PATH:
         print("strfry.conf: writePolicy.plugin already set to strfry-86 — no changes made.")
-        return "already configured"
+        return "already configured", conf_path
 
     if plugin_value not in (None, ""):
         print(
@@ -593,7 +743,7 @@ def edit_strfry_conf():
             f"'{plugin_value}' — NOT overwriting. Configure manually if you "
             f"want strfry-86's plugin86.py to take over."
         )
-        return "existing plugin left untouched"
+        return "existing plugin left untouched", conf_path
 
     new_line = f'    plugin = "{PLUGIN_PATH}"{newline}'
 
@@ -614,21 +764,22 @@ def edit_strfry_conf():
 
     new_content = "".join(new_lines)
     if new_content == original:
-        # Nothing actually changes byte-for-byte — no backup, no write.
+        # Byte-identical — no backup, no write. The only path that may write
+        # a .bak is the one that actually changes the file below.
         print("strfry.conf: writePolicy.plugin already set to strfry-86 — no changes made.")
-        return "already configured"
+        return "already configured", conf_path
 
-    backup_path = f"{STRFRY_CONF_PATH}.bak-{int(time.time())}"
-    shutil.copy2(STRFRY_CONF_PATH, backup_path)
+    backup_path = f"{conf_path}.bak-{int(time.time())}"
+    shutil.copy2(conf_path, backup_path)
     print(f"strfry.conf backed up to {backup_path}")
 
-    with open(STRFRY_CONF_PATH, "w") as f:
+    with open(conf_path, "w") as f:
         f.write(new_content)
 
     if appended_block:
         print("strfry.conf: no writePolicy block found — appended a new one.")
     print(f"strfry.conf: writePolicy.plugin set to {PLUGIN_PATH}")
-    return "set"
+    return "set", conf_path
 
 
 # --------------------------------------------------------------------------
@@ -802,7 +953,7 @@ def main():
 
     config_status = ensure_config()
 
-    conf_status = edit_strfry_conf()
+    conf_status, conf_path = edit_strfry_conf()
 
     chmod_plugin()
 
@@ -834,13 +985,15 @@ def main():
     # Prune only at the very end of a fully successful run: a foreign
     # writePolicy plugin or a self-update hash mismatch leaves the current
     # state in question, so nothing gets pruned this run (the fallback
-    # files must survive to the next attempt).
+    # files must survive to the next attempt). Conf backups live next to
+    # whatever conf we actually resolved, not a hardcoded /config path.
     pruned_conf = 0
     pruned_bundles = 0
     safe_to_prune = conf_status != "existing plugin left untouched" and not self_update_mismatch
     if safe_to_prune:
-        conf_dir = os.path.dirname(STRFRY_CONF_PATH) or "."
-        pruned_conf = prune_old_files(conf_dir, CONF_BACKUP_RE, KEEP_CONF_BACKUPS)
+        if conf_path:
+            conf_dir = os.path.dirname(conf_path) or "."
+            pruned_conf = prune_old_files(conf_dir, CONF_BACKUP_RE, KEEP_CONF_BACKUPS)
         pruned_bundles = prune_old_files(INSTALL_DIR, APPLIED_BUNDLE_RE, KEEP_APPLIED_BUNDLES)
 
     print()

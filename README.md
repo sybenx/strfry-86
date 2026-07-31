@@ -123,9 +123,11 @@ The **Stats & Console** page's whole-database walk (the same scan that audits th
 
 strfry-86 deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead through the "terminal commands" generator on every admin page: pick an intent from the dropdown, fill in whatever it asks for (a pubkey, a domain, a day count), and copy the rendered `strfry` command. Nothing in that block is ever run by the page itself — destructive intents (like deleting a pubkey's events) always render the equivalent `scan --count` line first, so you see how much a command destroys before you copy the command that destroys it.
 
-## strfry.conf backups
+## strfry.conf location and backups
 
-An updater run backs `/config/strfry.conf` up next to the original as `strfry.conf.bak-<unix-timestamp>` — but only when the run actually changes the file; the steady-state run that finds everything already configured writes no backup. The updater keeps the 3 newest backups and the 1 newest applied bundle, pruning older ones after each successful run. Files you've renamed by hand are never touched.
+The updater finds `strfry.conf` the same way the admin UI does: an explicit `strfry_conf_path` in `config.json` if set, otherwise the running relay's `--config`, otherwise the first path that exists among `/etc/strfry.conf`, `/etc/strfry/strfry.conf`, `/config/strfry.conf`, `/app/strfry.conf`, and `/usr/local/etc/strfry.conf`.
+
+A backup is written next to that file as `strfry.conf.bak-<unix-timestamp>` **only when the run actually changes the file** (sets `writePolicy.plugin`). Already-configured and refused-overwrite runs write nothing. The updater keeps the 3 newest backups and the 1 newest applied bundle, pruning older ones after each successful run. Files you've renamed by hand are never touched.
 
 ## Trust model
 
