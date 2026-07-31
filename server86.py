@@ -17,6 +17,7 @@ Routes:
   GET  /profile           -> profile.html (admin-only single-pubkey detail page)
   GET  /domain            -> domain.html (admin-only nip-05 domain roster page)
   GET  /common86.js       -> shared client JS for all pages
+  GET  /favicon.ico       -> browser-tab icon for all pages
   GET  /api/live          -> text/event-stream: one shared strfry poll loop fanned
                              out as deltas (new events, kind-5 deletes) to /home & /stats
   GET  /api/banned        -> public read of the ban list
@@ -91,6 +92,7 @@ STATIC_ROUTES = {
     "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/domain": ("domain.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
 }
 
 NIP98_KIND = 27235

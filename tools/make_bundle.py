@@ -39,6 +39,7 @@ DEPLOYABLE_FILES = [
     "profile.html",
     "domain.html",
     "common86.js",
+    "favicon.ico",
     "lib86/__init__.py",
     "lib86/bip340.py",
     "lib86/bech32.py",
