@@ -449,22 +449,33 @@ function renderTiles(m, live) {
            + (m.giftwrap_retention_days != null ? m.giftwrap_retention_days : 30) + 'd')
     }
   ];
-  // Author-scan kind coverage gap — NOT "events from banned users". The
-  // Users page's author scan only watches AUTHOR_SCAN_KINDS; anything else
-  // (except gift wraps) is the gap. Surface it only when it is large enough
-  // to act on; the full breakdown lives under Database → refresh totals.
+  // Author-scan kind coverage gap: events that are neither gift wraps nor
+  // AUTHOR_SCAN_KINDS. Surface it only when large enough to act on; the full
+  // breakdown lives under Database → refresh totals.
   if (m.gap_level === 'stale' && m.gap_events != null) {
     tiles.push({
-      label: 'Unlisted kinds',
+      label: 'Untracked kinds',
       value: m.gap_events.toLocaleString(),
       note: 'one kind is large enough to add to the author scan — see Database walk',
       tone: 'bad'
     });
   } else if (m.gap_level === 'notice' && m.gap_events != null) {
+    // Name the denominator: of the whole DB when we have a total, else of
+    // non-gift-wrap (the allowlist audit's own base). Never "banned users".
+    var gapNote;
+    if (eventsTotal != null && eventsTotal > 0) {
+      gapNote = ((m.gap_events / eventsTotal) * 100).toFixed(1)
+        + '% of the database · untracked kinds';
+    } else if (m.gap_share != null) {
+      gapNote = ((m.gap_share * 100).toFixed(1)
+        + '% of non-gift-wrap · untracked kinds');
+    } else {
+      gapNote = 'untracked kinds (not in the author-scan list)';
+    }
     tiles.push({
-      label: 'Other kinds',
+      label: 'Untracked kinds',
       value: m.gap_events.toLocaleString(),
-      note: ((m.gap_share * 100).toFixed(1) + '% of non-gift-wrap · not banned users'),
+      note: gapNote,
       tone: null
     });
   }
