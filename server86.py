@@ -221,6 +221,23 @@ def get_tag(tags, name):
     return None
 
 
+def event_expiration(tags):
+    """The NIP-40 `expiration` timestamp of an event, or None when it
+    carries no well-formed one. The tag holds a unix timestamp (as a
+    string) past which the event is expired; a relay may stop serving it
+    and delete it, but strfry keeps it on disk until a delete actually
+    runs, so an expired event is live storage a full walk still sees. A
+    non-integer value is treated as absent rather than as an error: a
+    malformed tag is not a promise about lifetime."""
+    raw = get_tag(tags, "expiration")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_strfry_bin():
     """Discover the strfry binary path once per process lifetime and cache
     it for every subsequent scan: prefer PATH via shutil.which, else the
@@ -1243,6 +1260,7 @@ def _empty_report_walk():
         "distinct_authors": None, "distinct_authors_nongiftwrap": None,
         "distinct_authors_giftwrap": None, "kinds": {}, "unlisted_kinds": {},
         "unlisted_total": None, "unlisted_kind_count": None,
+        "expired_events": None,
         "warning": None, "error": None,
     }
 
@@ -1352,14 +1370,21 @@ def compute_report_walk(progress_cb=None):
     kind_counts = {}
     distinct_prefixes = set()
     giftwrap_count = 0
+    expired_count = 0
+    walk_now = int(time.time())
 
     def on_event(ev):
-        nonlocal giftwrap_count
+        nonlocal giftwrap_count, expired_count
         if not isinstance(ev, dict):
             return
         kind = ev.get("kind")
         if isinstance(kind, int):
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        tags = ev.get("tags")
+        if isinstance(tags, list):
+            exp = event_expiration(tags)
+            if exp is not None and exp < walk_now:
+                expired_count += 1
         if kind == 1059:
             giftwrap_count += 1
             return
@@ -1411,6 +1436,7 @@ def compute_report_walk(progress_cb=None):
         "unlisted_kinds": unlisted_kinds,
         "unlisted_total": sum(unlisted_kinds.values()),
         "unlisted_kind_count": len(unlisted_kinds),
+        "expired_events": expired_count,
         "warning": None,
         "error": None,
     }

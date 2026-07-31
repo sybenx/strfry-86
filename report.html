@@ -166,14 +166,25 @@ var walkPanel = s86BuildScanPanel({
     var kindsSeen = Object.keys(record.kinds || {}).length;
     var unlistedCount = record.unlisted_kind_count != null ? record.unlisted_kind_count : Object.keys(record.unlisted_kinds || {}).length;
     var unlistedTotal = record.unlisted_total != null ? record.unlisted_total : 0;
-    container.appendChild(s86BuildKeyValueTable([
+    var rows = [
       ['events walked', record.events_read, ''],
       ['distinct authors', record.distinct_authors, ''],
       ['— measured', record.distinct_authors_nongiftwrap, ''],
       ['— gift wraps', giftwraps, 'one key per message'],
       ['kinds seen', kindsSeen, ''],
       ['unlisted kinds', unlistedCount, unlistedTotal.toLocaleString() + ' events']
-    ]));
+    ];
+    // NIP-40 expired events, like gift wraps, are purgeable storage the
+    // operator can weigh — surfaced here rather than in totals because a
+    // --count can't see a non-single-letter tag, only a full walk can.
+    // Guarded so a walk cached before this figure existed renders cleanly.
+    if (record.expired_events != null) {
+      var expiredShare = record.events_read > 0
+        ? (record.expired_events / record.events_read * 100).toFixed(2) + '% of all'
+        : '';
+      rows.push(['expired events', record.expired_events, expiredShare]);
+    }
+    container.appendChild(s86BuildKeyValueTable(rows));
 
     var nonGiftwrap = record.events_read - giftwraps;
     var unlisted = Object.keys(record.unlisted_kinds || {})

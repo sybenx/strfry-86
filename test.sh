@@ -1260,11 +1260,15 @@ pk_b = shared_prefix + "22" * (32 - server86.REPORT_AUTHOR_KEY_BYTES)
 
 def _streaming_walk(filter_obj, on_event, timeout, on_progress=None):
     check(filter_obj == {}, "compute_report_walk streams the genuinely unbounded filter '{}' — the one sanctioned exception to the bounding rule")
-    on_event({"kind": 1, "pubkey": pk_a})
-    on_event({"kind": 1, "pubkey": pk_b})
-    on_event({"kind": 1059, "pubkey": "c" * 64})
+    # NIP-40 expiration tags exercise the walk's expired-event tally: a
+    # past timestamp on a plain event counts; a past timestamp on a GIFT
+    # WRAP also counts (the check runs before the kind-1059 early return);
+    # a future timestamp and a malformed value do not.
+    on_event({"kind": 1, "pubkey": pk_a, "tags": [["expiration", "1"]]})
+    on_event({"kind": 1, "pubkey": pk_b, "tags": [["expiration", "9999999999"]]})
+    on_event({"kind": 1059, "pubkey": "c" * 64, "tags": [["expiration", "1"]]})
     on_event({"kind": 1059, "pubkey": "d" * 64})
-    on_event({"kind": 99999, "pubkey": pk_a})
+    on_event({"kind": 99999, "pubkey": pk_a, "tags": [["expiration", "soon"]]})
     return 5
 
 
@@ -1286,6 +1290,18 @@ check(1059 not in walk_result["walk"]["unlisted_kinds"] and 1 not in walk_result
       "compute_report_walk: unlisted_kinds excludes gift wraps and allowlisted kinds")
 check(walk_result["walk"]["unlisted_total"] == 1 and walk_result["walk"]["unlisted_kind_count"] == 1,
       "compute_report_walk: unlisted_total/unlisted_kind_count summarise unlisted_kinds so the page needs no client-side arithmetic")
+check(walk_result["walk"]["expired_events"] == 2,
+      "compute_report_walk: expired_events counts NIP-40 past-expiration events (incl. an expired gift wrap), skipping future and malformed expirations")
+
+# --- event_expiration (NIP-40) pure-function edges --------------------------
+check(server86.event_expiration([["expiration", "1700000000"]]) == 1700000000,
+      "event_expiration: reads the unix timestamp from a well-formed expiration tag")
+check(server86.event_expiration([["p", "abc"], ["expiration", "42"]]) == 42,
+      "event_expiration: finds the expiration tag among others")
+check(server86.event_expiration([["expiration", "not-a-number"]]) is None,
+      "event_expiration: a non-integer value is treated as absent, not an error")
+check(server86.event_expiration([["e", "abc"]]) is None,
+      "event_expiration: no expiration tag returns None")
 
 # --- the gap ladder: this is the assertion that would have caught the
 # permanent false alarm before it shipped (CLAUDE.md Part 0 #1 / Part 3).

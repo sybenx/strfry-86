@@ -374,13 +374,22 @@ visible"** with the following.
     <tr><th>— gift wraps</th>      <td>1,709,910</td><td>one key per message</td></tr>
     <tr><th>kinds seen</th>        <td>486</td>      <td></td></tr>
     <tr><th>unlisted kinds</th>    <td>444</td>      <td>18,734 events</td></tr>
+    <tr><th>expired events</th>    <td>41,230</td>   <td>1.56% of all</td></tr>
   </table>
   ```
 
   `distinct authors` is split into its two components because one is measured and the other
   is a consequence of NIP-17 — gift wraps are signed by a fresh key per message by
   specification, so their author count IS their event count — and presenting them as one
-  number hides that. Then a `<table>` of the `FIGURE_HEAD_MAX` largest unlisted kinds,
+  number hides that. `expired events` is the count of events past their NIP-40 `expiration`
+  tag, surfaced here beside the gift-wrap figure because both are purgeable bulk storage and
+  because ONLY the walk can find them — `expiration` is not a single-letter tag, so no
+  `scan --count` (and therefore nothing on the totals panel) can see it. The check runs
+  before the kind-1059 branch, so an expired gift wrap counts as both. It is a size figure,
+  never an alarm: like `unlisted kinds` it describes the database, and there is no
+  filter-expressible purge for it (Nostr filters cannot compare a non-indexed tag to now),
+  so the panel states the number and recommends nothing. Rendered only when present, so a
+  walk cached before this figure existed still renders cleanly. Then a `<table>` of the `FIGURE_HEAD_MAX` largest unlisted kinds,
   ranked, well-known kinds named as the composition line names them, each with its share of
   non-gift-wrap so the reader sees for themselves that no row is worth acting on:
 
@@ -476,6 +485,19 @@ not a verdict and the page must not turn it into one.
 census, not a task list; the head confirms the shape and `KIND_ALARM_SHARE` is what makes any
 row a task. Return `unlisted_total` (the summed event count) and `unlisted_kind_count`
 alongside it so the page's tail summary needs no client-side arithmetic over 444 keys.
+
+Also return `expired_events`: the count of events whose NIP-40 `expiration` tag names a
+timestamp already past at the moment the walk started (one `int(time.time())` snapshot, not
+re-read per event). This is a byproduct of the walk the same way `unlisted_kinds` is — every
+event body is already in hand — so it costs no extra scan, and the walk is the only place it
+CAN be computed, since `expiration` is not a single-letter tag and no index `--count` can
+filter on it. `strfry scan` returns expired events that are still on disk (it does not apply
+the serve-time NIP-40 filtering the relay's query path does), which is exactly why the figure
+is meaningful: it measures purgeable storage strfry has not deleted. Counted across all
+kinds, before the kind-1059 branch, so an expired gift wrap counts once here and once in the
+gift-wrap tally. `_empty_report_walk` carries `expired_events: null`, and the panel renders
+the row only when it is non-null, so a walk cached before this field existed is not
+misrendered as "0 expired".
 
 ### `GET /api/authors` — add
 

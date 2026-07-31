@@ -357,7 +357,8 @@ function runProfilePage() {
     var entries = Object.keys(p.kinds || {}).map(function (k) { return [parseInt(k, 10), p.kinds[k]]; });
     entries.sort(function (a, b) { return b[1] - a[1]; });
     var parts = entries.map(function (e) { return (KNOWN_KINDS[e[0]] || ('kind ' + e[0])) + ':' + e[1] + (p._countsUncertain ? '?' : ''); });
-    var prefix = 'kind breakdown (most recent ' + p.kinds_window + ' events'
+    var windowLabel = p.kinds_window + (p._kindsWindowGrew ? '+' : '');
+    var prefix = 'kind breakdown (most recent ' + windowLabel + ' events'
       + (p.kinds_saturated ? ', not all ' + p.total_events : '') + '): ';
     kindsLine.textContent = prefix + (parts.length ? parts.join('  ') : 'none');
   }
@@ -658,6 +659,14 @@ function runProfilePage() {
             var kind = parseInt(k, 10);
             profileData.kinds[kind] = (profileData.kinds[kind] || 0) + body.kinds_delta[k];
           });
+          // The kinds tally is a window over the newest kinds_window events.
+          // Folding new events in without evicting the oldest grows it past
+          // that bound on an already-saturated profile — so the label reads
+          // '500+' rather than claiming an exact 500. A non-saturated window
+          // still equals the lifetime, so it stays exact.
+          if (profileData.kinds_saturated && body.previews.length > 0) {
+            profileData._kindsWindowGrew = true;
+          }
         }
         if (body.previews.length > 0) {
           profileData.previews = body.previews.concat(profileData.previews).slice(0, PROFILE_PREVIEW_MAX_CLIENT);
