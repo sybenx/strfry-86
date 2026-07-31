@@ -4,23 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>strfry-86 — bans</title>
+<title>strfry-86</title>
 <style>
 :root { color-scheme: light dark; }
 #theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
-body { background: Canvas; color: CanvasText; max-width: 40em; margin: 0 auto; padding: 0 1em; }
-li, pre { overflow-wrap: anywhere; }
-pre { white-space: pre-wrap; }
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
+li { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 600px) { body { font-size: 1.15em; } }
-header.s86-hdr { position: sticky; top: 0; background: Canvas; padding: 0.5em 0; z-index: 1; }
-header.s86-hdr a.s86-logo { text-decoration: none; color: inherit; }
-header.s86-hdr nav a { margin-right: 0.75em; }
 </style>
 </head>
 <body>
-<h1>Bans</h1>
+<h1>strfry-86</h1>
+<p id="authors-nav-link" style="display:none"><a href="/authors">active authors</a> · <a href="/report">relay report</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<button id="theme-btn" type="button"></button>
 <p id="status"></p>
 <p id="name-status-line" style="display:none"></p>
+<div id="profile-entry-container" style="display:none"></div>
 <div id="command-block-container" style="display:none"></div>
 <div id="admin-controls" style="display:none">
   <h2>Ban a pubkey</h2>
@@ -54,9 +55,11 @@ var nameResolutionInFlight = false;
 var attemptedThisSession = new Set();
 
 var statusEl = document.getElementById('status');
-var chrome = s86BuildPageChrome(statusEl);
-var loginBtn = chrome.loginBtn;
+var loginBtn = document.getElementById('login-btn');
+s86WireThemeToggle(document.getElementById('theme-btn'));
+var authorsNavLink = document.getElementById('authors-nav-link');
 var nameStatusEl = document.getElementById('name-status-line');
+var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var adminControls = document.getElementById('admin-controls');
 var appealEl = document.getElementById('appeal-line');
@@ -81,6 +84,9 @@ function setStatus(text) {
   statusEl.textContent = text;
 }
 
+// Disabled with nothing checked OR an empty reason — both conditions
+// matter independently, so this can't reuse s86UpdateSelectedCount's
+// checked-count-only disable rule.
 function updateBulkReasonButtons() {
   var n = listEl.querySelectorAll('.ban-checkbox:checked').length;
   var hasReason = bulkReasonInput.value.trim().length > 0;
@@ -180,6 +186,18 @@ function loadBans() {
     });
 }
 
+// --- automatic external name resolution -------------------------------
+//
+// The ONLY path by which strfry-86 ever contacts a machine the operator
+// does not run — and it runs in the admin's browser, never in server86.
+// It fires automatically after /api/banned renders for a logged-in admin,
+// because the set it acts on is self-extinguishing: every pubkey is
+// queried externally at most once, ever (hits AND misses persist in
+// blacklist.json via POST /api/names), so in steady state there is
+// nothing to do here. A pubkey already attempted this page load is never
+// retried even if a connection failure left it unresolved — the next
+// admin page load tries again.
+
 function unresolvedPubkeys(banned) {
   var out = [];
   for (var i = 0; i < banned.length; i++) {
@@ -205,6 +223,8 @@ function maybeResolveNamesExternally() {
   s86ResolveNamesExternally(pubkeys, {
     onDone: function (posted) {
       if (!posted) {
+        // Neither relay could be reached, or the POST itself failed —
+        // stamp nothing. The next admin page load simply tries again.
         nameResolutionInFlight = false;
         return;
       }
@@ -235,8 +255,12 @@ function renderNameStatusLine() {
   nameStatusEl.style.display = '';
 }
 
+// --- login ---------------------------------------------------------------
+
 function onLogin() {
   isAdmin = true;
+  authorsNavLink.style.display = '';
+  profileEntryContainer.style.display = '';
   commandBlockContainer.style.display = '';
   adminControls.style.display = '';
   selectAllLabel.style.display = '';
@@ -248,6 +272,7 @@ function onLogin() {
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
 
+profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 s86WireFilter(filterInput, listEl);

@@ -739,54 +739,6 @@ server86.run_strfry_count = _orig_run_strfry_count
 server86.resolve_profiles = _orig_resolve_profiles
 
 
-# --- Activity feed: kind/ts/id only (public landing) ---------------------
-_orig_scan = server86.run_strfry_scan
-server86.run_strfry_scan = lambda filter_obj, timeout=10: [
-    {"id": "a" * 64, "kind": 1, "created_at": 100, "pubkey": "b" * 64, "content": "secret", "tags": [["p", "z"]]},
-    {"id": "c" * 64, "kind": 7, "created_at": 101, "content": "x"},
-]
-_activity = server86.get_activity_feed()
-check(_activity.get("error") is None and len(_activity["events"]) == 2,
-      "get_activity_feed returns events on a successful bounded scan")
-check(all(set(e.keys()) == {"id", "kind", "created_at"} for e in _activity["events"]),
-      "get_activity_feed strips every field except id/kind/created_at (no pubkey/content/tags)")
-check("secret" not in json.dumps(_activity) and ("b" * 64) not in json.dumps(_activity),
-      "get_activity_feed payload never leaks content or pubkey")
-server86.run_strfry_scan = lambda filter_obj, timeout=10: (_ for _ in ()).throw(RuntimeError("no strfry"))
-_activity_fail = server86.get_activity_feed()
-check(_activity_fail.get("scanned_at") is None and _activity_fail.get("error"),
-      "get_activity_feed failure does not stamp scanned_at (failed ≠ empty result)")
-server86.run_strfry_scan = _orig_scan
-
-# --- Terminal allowlist: non-destructive only ----------------------------
-_argv, _err = server86.validate_terminal_command("delete --filter '{}'")
-check(_argv is None and _err and "refused" in _err,
-      "terminal allowlist refuses delete")
-_argv, _err = server86.validate_terminal_command("scan '{}'")
-check(_argv is None and _err and "--count" in _err,
-      "terminal allowlist refuses bare scan without --count")
-_argv, _err = server86.validate_terminal_command("scan --count '{}'")
-check(_argv is not None and _err is None and "--count" in _argv,
-      "terminal allowlist accepts scan --count")
-_argv, _err = server86.validate_terminal_command("info")
-check(_argv is not None and _err is None, "terminal allowlist accepts info")
-
-# --- Static routes: Activity landing + Bans moved ------------------------
-check(server86.STATIC_ROUTES["/"][0] == "activity.html",
-      "STATIC_ROUTES maps / to activity.html (public landing)")
-check(server86.STATIC_ROUTES["/bans"][0] == "bans.html",
-      "STATIC_ROUTES maps /bans to bans.html")
-for _path, _file in (("/stats", "stats.html"), ("/userlist", "userlist.html"), ("/audit", "audit.html")):
-    check(server86.STATIC_ROUTES.get(_path, (None,))[0] == _file,
-          f"STATIC_ROUTES maps {_path} to {_file}")
-
-# --- Authors empty state: recent is the default radio --------------------
-import re as _re
-_authors_html = open(os.path.join(REPO_ROOT, "authors.html")).read()
-check(bool(_re.search(r'value="recent"\s+checked', _authors_html)),
-      "authors.html offers recent as the default (checked) scan mode")
-
-
 # --- Phase 3: POST /api/reason (server86.py + lib86/blacklist.py) --------
 # blacklist.py's BASE_DIR is derived from the FILE's own path, not cwd, so
 # it always resolves to the real repo's blacklist.json unless redirected —

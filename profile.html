@@ -8,17 +8,17 @@
 <style>
 :root { color-scheme: light dark; }
 #theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
-body { background: Canvas; color: CanvasText; max-width: 40em; margin: 0 auto; padding: 0 1em; }
-li, pre { overflow-wrap: anywhere; }
-pre { white-space: pre-wrap; }
+body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
+li { overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 600px) { body { font-size: 1.15em; } }
-header.s86-hdr { position: sticky; top: 0; background: Canvas; padding: 0.5em 0; z-index: 1; }
-header.s86-hdr a.s86-logo { text-decoration: none; color: inherit; }
-header.s86-hdr nav a { margin-right: 0.75em; }
 </style>
 </head>
 <body>
-<h1 id="page-title">Profile</h1>
+<h1 id="page-title">strfry-86 — profile</h1>
+<p><a href="/">← ban list</a> · <a href="/authors">active authors</a> · <a href="/report">relay report</a> · <a href="/domain">domain roster</a></p>
+<button id="login-btn" type="button">Login with extension</button>
+<button id="theme-btn" type="button"></button>
 <p id="status"></p>
 <div id="profile-entry-container"></div>
 
@@ -70,8 +70,8 @@ var rawParam = params.get('npub') || params.get('hex') || '';
 var pubkeyHex = s86PubkeyInputToHex(rawParam);
 
 var statusEl = document.getElementById('status');
-var chrome = s86BuildPageChrome(statusEl);
-var loginBtn = chrome.loginBtn;
+var loginBtn = document.getElementById('login-btn');
+s86WireThemeToggle(document.getElementById('theme-btn'));
 var pageTitle = document.getElementById('page-title');
 var paramErrorBlock = document.getElementById('param-error-block');
 var paramErrorEl = document.getElementById('param-error');

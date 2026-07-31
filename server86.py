@@ -6,17 +6,12 @@ configured port is already taken, this process exits 0 silently, so repeated
 spawns from the plugin are harmless.
 
 Routes:
-  GET  /                  -> activity.html (public live activity feed)
-  GET  /stats             -> stats.html (totals, live delta, terminal)
-  GET  /report            -> report.html (admin-only cached-scan results page)
+  GET  /                  -> bans.html (public ban list)
   GET  /authors           -> authors.html (admin-only active-author page)
-  GET  /userlist          -> userlist.html (admin member table)
-  GET  /audit             -> audit.html (server-side admin action log)
-  GET  /bans              -> bans.html (public ban list + admin ban UI)
   GET  /profile           -> profile.html (admin-only single-pubkey detail page)
   GET  /domain            -> domain.html (admin-only nip-05 domain roster page)
+  GET  /report            -> report.html (admin-only cached-scan results page)
   GET  /common86.js       -> shared client JS for all pages
-  GET  /api/activity      -> public recent events (kind, timestamp, id only)
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
   POST /api/authors/scan  -> NIP-98 authenticated: run exactly one bounded scan
@@ -72,15 +67,11 @@ STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfr
 # path traversal is not mitigated here, it is impossible. config.json and
 # blacklist.json sit next to these files and must never be reachable.
 STATIC_ROUTES = {
-    "/": ("activity.html", "text/html; charset=utf-8"),
-    "/stats": ("stats.html", "text/html; charset=utf-8"),
-    "/report": ("report.html", "text/html; charset=utf-8"),
+    "/": ("bans.html", "text/html; charset=utf-8"),
     "/authors": ("authors.html", "text/html; charset=utf-8"),
-    "/userlist": ("userlist.html", "text/html; charset=utf-8"),
-    "/audit": ("audit.html", "text/html; charset=utf-8"),
-    "/bans": ("bans.html", "text/html; charset=utf-8"),
     "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/domain": ("domain.html", "text/html; charset=utf-8"),
+    "/report": ("report.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
 }
 
@@ -128,7 +119,6 @@ PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
 PROFILE_REPORT_LIMIT = 100      # kind-1984 events read for reports against one pubkey
 PROFILE_DAY_EVENTS_MAX = 50     # events read for one pubkey's single-day view
 DOMAIN_LOOKUP_MAX = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
-ACTIVITY_FEED_LIMIT = 50        # newest events on the public Activity landing (kind/ts/id only)
 # --- rendering caps: no result reaches a page uncapped --------------------
 RENDER_MAX = 500                # list rows rendered client-side before truncation
 FIGURE_HEAD_MAX = 10             # ranked rows shown before the tail is summarised
@@ -379,191 +369,6 @@ def run_strfry_scan(filter_obj, timeout=SCAN_TIMEOUT):
     return events
 
 
-def get_activity_feed():
-    """Public Activity landing payload: newest ACTIVITY_FEED_LIMIT events,
-    stripped to kind + created_at + id only. Never includes pubkey, content,
-    or tags — the page is logged-out-safe by construction, not by client
-    filtering. On scan failure returns error without a stamped scanned_at
-    (four-state rule: failed ≠ empty result)."""
-    try:
-        raw = run_strfry_scan({"limit": ACTIVITY_FEED_LIMIT}, timeout=SCAN_TIMEOUT)
-    except Exception as e:
-        return {
-            "events": [],
-            "error": f"activity feed failed: {type(e).__name__}: {e}"[:600],
-            "scanned_at": None,
-            "limit": ACTIVITY_FEED_LIMIT,
-        }
-    events = []
-    for ev in raw:
-        if not isinstance(ev, dict):
-            continue
-        eid = ev.get("id")
-        kind = ev.get("kind")
-        created_at = ev.get("created_at")
-        if not isinstance(eid, str) or not isinstance(kind, int) or not isinstance(created_at, int):
-            continue
-        events.append({"id": eid, "kind": kind, "created_at": created_at})
-    return {
-        "events": events,
-        "error": None,
-        "scanned_at": int(time.time()),
-        "limit": ACTIVITY_FEED_LIMIT,
-    }
-
-
-def get_stats_snapshot():
-    """Stats page payload: cached walk/totals as the baseline, plus a live
-    all-events --count so the page can state both (baseline age + delta).
-    Never starts a walk. Live count failure is reported without inventing a
-    baseline."""
-    report = get_report_status()
-    totals = report.get("totals")
-    walk = report.get("walk")
-    live_total = None
-    live_error = None
-    try:
-        live_total = run_strfry_count({})
-    except Exception as e:
-        live_error = f"live count failed: {type(e).__name__}: {e}"[:600]
-    baseline_total = None
-    baseline_at = None
-    if totals and totals.get("scanned_at") is not None and totals.get("total_events") is not None:
-        baseline_total = totals["total_events"]
-        baseline_at = totals["scanned_at"]
-    elif walk and walk.get("scanned_at") is not None and walk.get("events_read") is not None:
-        baseline_total = walk["events_read"]
-        baseline_at = walk["scanned_at"]
-    delta = None
-    if live_total is not None and baseline_total is not None:
-        delta = live_total - baseline_total
-    return {
-        "totals": totals,
-        "walk": walk,
-        "baseline_total": baseline_total,
-        "baseline_at": baseline_at,
-        "live_total": live_total,
-        "live_error": live_error,
-        "delta": delta,
-        "live_at": int(time.time()) if live_total is not None else None,
-    }
-
-
-def get_userlist_snapshot():
-    """Join authors cache + recipients cache for the Userlist page. Never
-    starts a scan. Missing fields stay null so the client can render —
-    rather than inventing zeros."""
-    authors_status = get_authors_status()
-    recipients_status = get_recipients_status()
-    authors = authors_status.get("authors") or []
-    recipients = recipients_status.get("recipients") or []
-    recipient_counts = {r["pubkey"]: r.get("count") for r in recipients if isinstance(r, dict) and r.get("pubkey")}
-    recipients_saturated = bool(recipients_status.get("saturated"))
-    recipients_scanned_at = recipients_status.get("scanned_at")
-    rows = []
-    for a in authors:
-        if not isinstance(a, dict) or not a.get("pubkey"):
-            continue
-        pk = a["pubkey"]
-        gw = recipient_counts.get(pk)
-        rows.append({
-            "pubkey": pk,
-            "npub": a.get("npub"),
-            "name": a.get("name"),
-            "nip05": a.get("nip05"),
-            "event_count": a.get("count"),
-            "giftwrap_count": gw,
-            "reporters": a.get("reporters"),
-        })
-    return {
-        "rows": rows,
-        "authors_scanned_at": authors_status.get("scanned_at"),
-        "authors_error": authors_status.get("error"),
-        "authors_modes": authors_status.get("modes"),
-        "recipients_scanned_at": recipients_scanned_at,
-        "recipients_saturated": recipients_saturated,
-        "recipients_error": recipients_status.get("error"),
-    }
-
-
-# --- terminal allowlist (Stats page) ---------------------------------------
-# Non-destructive verbs only. Never shell=True; argv is reconstructed from
-# a validated command string. Anything not on this list is refused with a
-# reason so the saturation/absence guards stay meaningful.
-
-TERMINAL_TIMEOUT = 30
-_TERMINAL_ALLOWED = (
-    # (verb, required_flag_substrings_any_of or None means verb alone is ok)
-    ("info", None),
-    ("scan", ("--count",)),
-    ("sync", ("--dry-run",)),
-)
-
-
-def validate_terminal_command(raw):
-    """Return (argv, error). argv is a list suitable for subprocess without
-    a shell; error is a human reason when refused."""
-    if not isinstance(raw, str):
-        return None, "command must be a string"
-    text = raw.strip()
-    if not text:
-        return None, "empty command"
-    if len(text) > 2000:
-        return None, "command too long"
-    # naive split on whitespace — filters are JSON and must not contain
-    # unescaped spaces the operator didn't type; this is deliberate
-    # vs shlex so we never expand quotes into a shell.
-    parts = text.split()
-    if not parts:
-        return None, "empty command"
-    verb = parts[0]
-    if verb == "strfry":
-        parts = parts[1:]
-        if not parts:
-            return None, "missing strfry subcommand"
-        verb = parts[0]
-    for allowed_verb, required_flags in _TERMINAL_ALLOWED:
-        if verb != allowed_verb:
-            continue
-        if required_flags is None:
-            return ["strfry", "--config", STRFRY_CONF_PATH] + parts, None
-        joined = " ".join(parts[1:])
-        if any(flag in parts or flag in joined for flag in required_flags):
-            return ["strfry", "--config", STRFRY_CONF_PATH] + parts, None
-        return None, f"refused: {verb} requires one of {', '.join(required_flags)}"
-    return None, (
-        f"refused: '{verb}' is not on the non-destructive allowlist "
-        f"(allowed: info, scan --count, sync --dry-run)"
-    )
-
-
-def run_terminal_command(raw):
-    """Run one allowlisted strfry command; return a JSON-serialisable result."""
-    argv, err = validate_terminal_command(raw)
-    if err:
-        return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "", "exit_code": None}
-    try:
-        strfry_bin = require_strfry_bin()
-        argv = [strfry_bin] + argv[1:]  # replace literal 'strfry' with discovered path
-        result = subprocess.run(
-            argv, cwd=get_relay_cwd(), capture_output=True, timeout=TERMINAL_TIMEOUT
-        )
-        return {
-            "ok": result.returncode == 0,
-            "error": None if result.returncode == 0 else f"exit {result.returncode}",
-            "argv": argv,
-            "stdout": result.stdout.decode("utf-8", errors="replace")[-8000:],
-            "stderr": result.stderr.decode("utf-8", errors="replace")[-4000:],
-            "exit_code": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timed out after {TERMINAL_TIMEOUT}s", "argv": argv,
-                "stdout": "", "stderr": "", "exit_code": None}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:600], "argv": argv,
-                "stdout": "", "stderr": "", "exit_code": None}
-
-
 def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
     """Run `strfry scan --count <filter>` and return the integer count.
     `--count` walks the index without streaming bodies, so it is cheap
@@ -776,69 +581,6 @@ def _load_cache_or(path, empty_result):
     except (OSError, ValueError):
         pass
     return dict(empty_result)
-
-
-# --- server-side audit log -------------------------------------------------
-AUDIT_LOG_PATH = os.path.join(SCRIPT_DIR, "audit-log.json")
-AUDIT_LOG_MAX = 500
-
-
-def _empty_audit_log():
-    return {"records": []}
-
-
-_audit_lock = threading.Lock()
-_audit_log = _load_cache_or(AUDIT_LOG_PATH, _empty_audit_log())
-if not isinstance(_audit_log.get("records"), list):
-    _audit_log = _empty_audit_log()
-
-
-def audit_append(record):
-    """Append one admin-action record and persist. Caps at AUDIT_LOG_MAX."""
-    if not isinstance(record, dict):
-        return
-    rec = dict(record)
-    rec.setdefault("id", f"{int(time.time() * 1000)}-{os.urandom(3).hex()}")
-    rec.setdefault("at", int(time.time()))
-    rec.setdefault("undone", False)
-    with _audit_lock:
-        records = list(_audit_log.get("records") or [])
-        records.append(rec)
-        if len(records) > AUDIT_LOG_MAX:
-            records = records[-AUDIT_LOG_MAX:]
-        _audit_log["records"] = records
-        try:
-            _save_cache_atomic(AUDIT_LOG_PATH, _audit_log)
-        except OSError as e:
-            log(f"server86: failed to persist audit-log.json: {e}")
-
-
-def get_audit_records(query=None):
-    q = (query or "").strip().lower()
-    with _audit_lock:
-        records = list(_audit_log.get("records") or [])
-    records.reverse()  # newest first
-    if not q:
-        return records
-    out = []
-    for r in records:
-        blob = json.dumps(r, separators=(",", ":"), ensure_ascii=False).lower()
-        if q in blob:
-            out.append(r)
-    return out
-
-
-def audit_mark_undone(record_id):
-    with _audit_lock:
-        for r in _audit_log.get("records") or []:
-            if r.get("id") == record_id:
-                r["undone"] = True
-                try:
-                    _save_cache_atomic(AUDIT_LOG_PATH, _audit_log)
-                except OSError as e:
-                    log(f"server86: failed to persist audit-log.json: {e}")
-                return dict(r)
-    return None
 
 
 def _make_progress_cb(job):
@@ -2364,18 +2106,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if path == "/api/activity":
-            self._send_json(200, get_activity_feed())
-            return
-
-        if path == "/api/stats":
-            self._send_json(200, get_stats_snapshot())
-            return
-
-        if path == "/api/userlist":
-            self._send_json(200, get_userlist_snapshot())
-            return
-
         if path == "/api/banned":
             cfg = self.server.strfry86_config
             data = blacklist.load()
@@ -2442,7 +2172,6 @@ class Handler(BaseHTTPRequestHandler):
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
             "/api/profile/day", "/api/profile/new", "/api/pubkeys/lookup", "/api/report/totals",
             "/api/report/walk", "/api/relay-url",
-            "/api/terminal", "/api/audit", "/api/audit/undo",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2508,107 +2237,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(202, status)
             return
 
-        if path == "/api/terminal":
-            raw_cmd = body.get("command")
-            result = run_terminal_command(raw_cmd if isinstance(raw_cmd, str) else "")
-            self._send_json(200 if result.get("ok") else 400, result)
-            return
-
-        if path == "/api/audit":
-            query = body.get("q") if isinstance(body.get("q"), str) else ""
-            self._send_json(200, {"records": get_audit_records(query)})
-            return
-
-        if path == "/api/audit/undo":
-            record_id = body.get("id")
-            if not isinstance(record_id, str) or not record_id:
-                self._send_json(400, {"error": "missing audit record id"})
-                return
-            with _audit_lock:
-                found = None
-                for r in _audit_log.get("records") or []:
-                    if r.get("id") == record_id:
-                        found = dict(r)
-                        break
-            if found is None:
-                self._send_json(404, {"error": "audit record not found"})
-                return
-            if found.get("undone"):
-                self._send_json(400, {"error": "already undone"})
-                return
-            rtype = found.get("type")
-            pubkeys = found.get("pubkeys") or []
-            if rtype == "ban":
-                removed = blacklist.remove(pubkeys)
-                audit_mark_undone(record_id)
-                audit_append({
-                    "type": "unban", "actor": auth.get("pubkey"),
-                    "pubkeys": removed, "via": "audit-undo", "undo_of": record_id,
-                })
-                self._send_json(200, {"ok": True, "removed": removed})
-                return
-            if rtype == "unban":
-                now = int(time.time())
-                added = []
-                for pk in pubkeys:
-                    if not is_hex64(pk):
-                        continue
-                    reason = ""
-                    for e in (found.get("entries") or []):
-                        if e.get("pubkey") == pk:
-                            reason = e.get("reason") or ""
-                            break
-                    if blacklist.add(
-                        pk, banned_at=now, report_event_id=None, reason=reason,
-                        report_type="manual", admin_pubkey_hex=cfg["admin_pubkey_hex"],
-                    ):
-                        added.append(pk)
-                audit_mark_undone(record_id)
-                audit_append({
-                    "type": "ban", "actor": auth.get("pubkey"),
-                    "pubkeys": added, "via": "audit-undo", "undo_of": record_id,
-                })
-                self._send_json(200, {"ok": True, "added": added})
-                return
-            if rtype == "reason":
-                # Restore prior reasons from the snapshot when present.
-                entries = found.get("entries") or []
-                if not entries:
-                    self._send_json(400, {"error": "undo unavailable for this reason record"})
-                    return
-                restored = 0
-                for e in entries:
-                    pk = e.get("pubkey")
-                    old = e.get("old_reason")
-                    if not is_hex64(pk):
-                        continue
-                    blacklist.set_reasons([pk], old or "", "replace", now=int(time.time()))
-                    restored += 1
-                audit_mark_undone(record_id)
-                self._send_json(200, {"ok": True, "restored": restored})
-                return
-            self._send_json(400, {"error": f"cannot undo type {rtype!r}"})
-            return
-
         if path == "/api/reason":
             pubkeys, reason, mode, err = validate_reason_request(body)
             if err:
                 self._send_json(400, {"error": err})
                 return
             updated, skipped = blacklist.set_reasons(pubkeys, reason, mode, now=int(time.time()))
-            if updated:
-                audit_append({
-                    "type": "reason",
-                    "actor": auth.get("pubkey"),
-                    "pubkeys": [u["pubkey"] for u in updated],
-                    "reason": reason,
-                    "mode": mode,
-                    "entries": [
-                        {"pubkey": u["pubkey"], "old_reason": u.get("old_reason")}
-                        for u in updated[:REASON_UNDO_MAX]
-                    ] if len(updated) <= REASON_UNDO_MAX else None,
-                    "count": len(updated),
-                })
             self._send_json(200, {"ok": True, "updated": updated, "skipped": skipped})
             return
 
@@ -2710,23 +2344,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "malformed pubkeys list"})
                 return
 
-            # Snapshot ban rows before removal so audit undo can re-ban.
-            data = blacklist.load()
-            entries_snap = []
-            for pk in pubkeys:
-                info = data.get(pk) or {}
-                entries_snap.append({
-                    "pubkey": pk,
-                    "reason": info.get("reason") or "",
-                })
             removed = blacklist.remove(pubkeys)
-            if removed:
-                audit_append({
-                    "type": "unban",
-                    "actor": auth.get("pubkey"),
-                    "pubkeys": removed,
-                    "entries": [e for e in entries_snap if e["pubkey"] in set(removed)],
-                })
             self._send_json(200, {"ok": True, "removed": removed})
             return
 
@@ -2739,7 +2357,6 @@ class Handler(BaseHTTPRequestHandler):
         added = []
         skipped = []
         now = int(time.time())
-        reasons_by_pk = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 skipped.append(entry)
@@ -2767,17 +2384,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             if ok_added:
                 added.append(pubkey)
-                reasons_by_pk[pubkey] = reason
             else:
                 skipped.append(raw_pk)
 
-        if added:
-            audit_append({
-                "type": "ban",
-                "actor": auth.get("pubkey"),
-                "pubkeys": added,
-                "entries": [{"pubkey": pk, "reason": reasons_by_pk.get(pk, "")} for pk in added],
-            })
         self._send_json(200, {"ok": True, "added": added, "skipped": skipped})
 
 

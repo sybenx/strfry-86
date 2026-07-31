@@ -266,23 +266,6 @@ function s86PubkeyInputToHex(raw) {
 // s86ValidateDomainInput used by the command generator's "fetch domain"
 // intent, so "asdf.com" typed here lands on that domain's own roster page
 // instead of erroring.
-function s86NavigateSearchInput(raw, statusEl) {
-  var hex = s86PubkeyInputToHex(raw);
-  if (hex) {
-    window.location.href = '/profile?hex=' + hex;
-    return true;
-  }
-  var domain = s86ValidateDomainInput(raw);
-  if (domain) {
-    window.location.href = '/domain?d=' + encodeURIComponent(domain);
-    return true;
-  }
-  if (statusEl) {
-    statusEl.textContent = 'enter a valid npub, hex pubkey, or domain';
-  }
-  return false;
-}
-
 function s86BuildProfileEntryField(statusEl) {
   var p = document.createElement('p');
 
@@ -299,7 +282,17 @@ function s86BuildProfileEntryField(statusEl) {
   btn.textContent = 'Go';
 
   function go() {
-    s86NavigateSearchInput(input.value, statusEl);
+    var hex = s86PubkeyInputToHex(input.value);
+    if (hex) {
+      window.location.href = '/profile?hex=' + hex;
+      return;
+    }
+    var domain = s86ValidateDomainInput(input.value);
+    if (domain) {
+      window.location.href = '/domain?d=' + encodeURIComponent(domain);
+      return;
+    }
+    statusEl.textContent = 'enter a valid npub, hex pubkey, or domain';
   }
 
   btn.addEventListener('click', go);
@@ -314,90 +307,6 @@ function s86BuildProfileEntryField(statusEl) {
   p.appendChild(document.createTextNode(' '));
   p.appendChild(btn);
   return p;
-}
-
-// --- page chrome (header + nav + search + theme) -------------------------
-// Fixed ingredients on every page per CLAUDE.md "Header & navigation".
-// Logo is clickable plain text (no underline, inherits color). Search
-// accepts npub / 64-hex / domain; invalid input sets the status line only.
-// Modifier-K focuses search. Nav order is fixed; pages gate their own
-// content when logged out.
-var S86_NAV_LINKS = [
-  ['Activity', '/'],
-  ['Stats', '/stats'],
-  ['Report', '/report'],
-  ['Authors', '/authors'],
-  ['Userlist', '/userlist'],
-  ['Audit', '/audit'],
-  ['Bans', '/bans']
-];
-
-function s86BuildPageChrome(statusEl) {
-  var header = document.createElement('header');
-  header.className = 's86-hdr';
-
-  var logo = document.createElement('a');
-  logo.className = 's86-logo';
-  logo.href = '/';
-  logo.textContent = 'strfry-86';
-  header.appendChild(logo);
-  header.appendChild(document.createTextNode(' '));
-
-  var searchInput = document.createElement('input');
-  searchInput.type = 'search';
-  searchInput.id = 's86-search';
-  searchInput.placeholder = 'npub, hex, or domain';
-  searchInput.size = 32;
-  searchInput.setAttribute('aria-label', 'search npub, hex, or domain');
-  searchInput.addEventListener('keydown', function (evt) {
-    if (evt.key === 'Enter') {
-      evt.preventDefault();
-      s86NavigateSearchInput(searchInput.value, statusEl);
-    }
-  });
-  header.appendChild(searchInput);
-
-  var nav = document.createElement('nav');
-  S86_NAV_LINKS.forEach(function (pair) {
-    var a = document.createElement('a');
-    a.href = pair[1];
-    a.textContent = pair[0];
-    nav.appendChild(a);
-  });
-  header.appendChild(nav);
-
-  var loginBtn = document.createElement('button');
-  loginBtn.type = 'button';
-  loginBtn.id = 'login-btn';
-  loginBtn.textContent = 'Login with extension';
-  header.appendChild(loginBtn);
-  header.appendChild(document.createTextNode(' '));
-
-  var themeBtn = document.createElement('button');
-  themeBtn.type = 'button';
-  themeBtn.id = 'theme-btn';
-  header.appendChild(themeBtn);
-  s86WireThemeToggle(themeBtn);
-
-  document.addEventListener('keydown', function (evt) {
-    if (!(evt.metaKey || evt.ctrlKey)) {
-      return;
-    }
-    if (evt.key !== 'k' && evt.key !== 'K') {
-      return;
-    }
-    evt.preventDefault();
-    searchInput.focus();
-    searchInput.select();
-  });
-
-  if (document.body.firstChild) {
-    document.body.insertBefore(header, document.body.firstChild);
-  } else {
-    document.body.appendChild(header);
-  }
-
-  return { loginBtn: loginBtn, themeBtn: themeBtn, searchInput: searchInput, header: header };
 }
 
 // --- login (NIP-07, remembered in localStorage) -----------------------------
