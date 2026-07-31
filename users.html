@@ -600,16 +600,13 @@ function renderUsers() {
   updateLookupNamesButton();
 }
 
-function renderRecords() {
-  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+function flashUndoCallbacks() {
+  return {
     onChanged: function () {
-      loadBanned().then(function () {
-        renderRecords();
-        renderUsers();
-      });
+      loadBanned().then(function () { renderUsers(); });
     },
     onError: setStatus
-  });
+  };
 }
 
 // --- look up names for the N shown (button-triggered, bounded to what's on
@@ -695,10 +692,9 @@ function banPubkeys(selected) {
         };
       });
       if (added.length > 0) {
-        s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
+        s86ShowFlashUndo(recordsList, { type: 'ban', at: Date.now(), entries: added }, flashUndoCallbacks());
       }
       return loadBanned().then(function () {
-        renderRecords();
         renderUsers();
       });
     })
@@ -814,7 +810,7 @@ function loadBanned() {
 function onLogin() {
   isAdmin = true;
   adminSection.style.display = '';
-  renderRecords();
+  s86ClearFlashUndo(recordsList);
   loadAuthorsStatus();
   loadUserlist();
 }

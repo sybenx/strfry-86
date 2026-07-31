@@ -674,18 +674,17 @@ function renderDomainTiles(rows) {
   ]));
 }
 
-function renderRecords() {
-  s86RenderRecords(recordsList, isAdmin, lastBanned, {
+function flashUndoCallbacks() {
+  return {
     onChanged: function () {
       loadBanned().then(function () {
-        renderRecords();
         if (lastLookup && lastLookup.results && lastLookup.results.length > 0) {
           runLookup(lastLookup.results.map(function (r) { return r.pubkey; }), lastLookup._singleEntry);
         }
       });
     },
     onError: setStatus
-  });
+  };
 }
 
 function loadBanned() {
@@ -711,7 +710,7 @@ var autoFetchedDomain = false;
 function onLogin() {
   isAdmin = true;
   adminSection.style.display = '';
-  renderRecords();
+  s86ClearFlashUndo(recordsList);
   // Autofetch only fires here, not on page load — the fetch's own
   // result is thrown away by runLookup() until isAdmin is true (the
   // authenticated POST /api/pubkeys/lookup requires it), so firing any
@@ -774,10 +773,9 @@ banBtn.addEventListener('click', function () {
         return { pubkey: pk, npub: r ? r.npub : null, name: r ? r.name : null, nip05: r ? r.nip05 : null, reason: reason };
       });
       if (added.length > 0) {
-        s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
+        s86ShowFlashUndo(recordsList, { type: 'ban', at: Date.now(), entries: added }, flashUndoCallbacks());
       }
       return loadBanned().then(function () {
-        renderRecords();
         if (lastLookup && lastLookup.results && lastLookup.results.length > 0) {
           runLookup(lastLookup.results.map(function (r) { return r.pubkey; }), lastLookup._singleEntry);
         }

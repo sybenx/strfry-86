@@ -254,14 +254,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 <div id="tiles-container"></div>
 
 <div id="admin-section" style="display:none">
-  <div id="command-block-container"></div>
-  <div id="records-list"></div>
-
-  <hr>
   <h2>Database</h2>
   <div id="totals-panel-container"></div>
   <div id="walk-panel-container"></div>
-  <p id="author-pointer-line"></p>
 
   <hr>
   <h2>Gift wrap storage</h2>
@@ -311,7 +306,6 @@ var DECISION_LOG_LINES = 40;
 
 var adminPubkey = null;
 var isAdmin = false;
-var lastBanned = [];
 var lastTotals = null;
 var lastWalk = null;
 var lastBaselineAt = null;
@@ -323,9 +317,6 @@ var livePill = document.getElementById('live-pill');
 var chrome = s86BuildPageChrome(statusEl);
 var loginBtn = chrome.loginBtn;
 var adminSection = document.getElementById('admin-section');
-var commandBlockContainer = document.getElementById('command-block-container');
-var recordsList = document.getElementById('records-list');
-var authorPointerLine = document.getElementById('author-pointer-line');
 var tilesContainer = document.getElementById('tiles-container');
 var giftwrapRetentionLine = document.getElementById('giftwrap-retention-line');
 var decisionLog = document.getElementById('decision-log');
@@ -677,30 +668,6 @@ function startReportJob(endpoint) {
   });
 }
 
-function loadAuthorPointer() {
-  fetch('/api/authors')
-    .then(function (res) { return res.json(); })
-    .then(function (data) {
-      authorPointerLine.textContent = '';
-      var prefix;
-      if (data.scanned_at) {
-        prefix = 'full author list — ' + (data.authors || []).length.toLocaleString() + ' authors, ' + s86FormatRelativeAge(data.scanned_at) + ' → ';
-      } else {
-        var recentMode = (data.modes && data.modes.recent) || {};
-        var costPart = recentMode.typical_seconds
-          ? ('a recent scan takes about ' + s86FormatDuration(recentMode.typical_seconds))
-          : 'a recent scan takes about 3 seconds';
-        prefix = 'full author list — never run; ' + costPart + ' → ';
-      }
-      authorPointerLine.appendChild(document.createTextNode(prefix));
-      var link = document.createElement('a');
-      link.href = '/users';
-      link.textContent = 'Users';
-      authorPointerLine.appendChild(link);
-    })
-    .catch(function () {});
-}
-
 // --- § This relay's URL: config.json-backed, not strfry.conf ---------------
 // Exists solely so /api/subscribers can host-match a kind-10050/10002 relay
 // tag against THIS relay; strfry itself never reads this value. Spliced under
@@ -975,14 +942,7 @@ consoleInput.addEventListener('keydown', function (evt) {
   }
 });
 
-// --- records / login --------------------------------------------------------
-
-function renderRecords() {
-  s86RenderRecords(recordsList, isAdmin, lastBanned, {
-    onChanged: function () { loadBanned(); },
-    onError: setStatus
-  });
-}
+// --- login ------------------------------------------------------------------
 
 function loadBanned() {
   return fetch('/api/banned')
@@ -990,11 +950,8 @@ function loadBanned() {
     .then(function (data) {
       var firstLoad = adminPubkey === null;
       adminPubkey = data.admin;
-      lastBanned = data.banned;
       if (firstLoad) {
         s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
-      } else {
-        renderRecords();
       }
     })
     .catch(function () {
@@ -1005,16 +962,13 @@ function loadBanned() {
 function onLogin() {
   isAdmin = true;
   adminSection.style.display = '';
-  renderRecords();
   fetchReport().then(applyReportStatus);
   fetchRecipients().then(applyRecipientsStatus);
   fetchSubscribers().then(applySubscribersStatus);
-  loadAuthorPointer();
   loadRelayUrl();
 }
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
-commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 loadBanned();
 loadStats();

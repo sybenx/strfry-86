@@ -269,6 +269,7 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
       <button id="ban-toggle-btn" type="button"></button>
     </p>
   </div>
+  <div id="flash-undo"></div>
   <div id="reason-edit-container"></div>
 
   <div id="profile-tiles"></div>
@@ -317,6 +318,7 @@ var banStatusLine = document.getElementById('ban-status-line');
 var banControls = document.getElementById('ban-controls');
 var reasonInput = document.getElementById('reason-input');
 var banToggleBtn = document.getElementById('ban-toggle-btn');
+var flashUndo = document.getElementById('flash-undo');
 var reasonEditContainer = document.getElementById('reason-edit-container');
 var profileFieldsEl = document.getElementById('profile-fields');
 var profileName = document.getElementById('profile-name');
@@ -536,11 +538,11 @@ function runProfilePage() {
             setStatus('unban failed: ' + s86ErrMsg(result));
             return;
           }
-          s86AddRecord({
+          s86ShowFlashUndo(flashUndo, {
             type: 'unban',
             at: Date.now(),
             entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, nip05: profileData.nip05, reason: profileData.ban ? profileData.ban.reason : '' }]
-          });
+          }, { onChanged: fetchProfile, onError: setStatus });
           setStatus('unbanned');
           fetchProfile();
         })
@@ -556,11 +558,11 @@ function runProfilePage() {
           setStatus('banned ' + (result.body.added.length ? '1 pubkey' : '0 pubkeys (already banned?)'));
           reasonInput.value = '';
           if (result.body.added.length > 0) {
-            s86AddRecord({
+            s86ShowFlashUndo(flashUndo, {
               type: 'ban',
               at: Date.now(),
               entries: [{ pubkey: pubkeyHex, npub: profileData.npub, name: profileData.name, nip05: profileData.nip05, reason: reason }]
-            });
+            }, { onChanged: fetchProfile, onError: setStatus });
           }
           fetchProfile();
         })

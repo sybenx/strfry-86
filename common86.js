@@ -16,6 +16,10 @@ var S86_REASON_UNDO_MAX = 50;
 var S86_FIGURE_HEAD_MAX = 10;   // ranked figure rows shown before the tail is summarised — mirrors FIGURE_HEAD_MAX in server86.py
 var S86_RENDER_MAX = 500;       // list rows rendered before truncation — mirrors RENDER_MAX in server86.py
 var S86_THEME_KEY = 'strfry86_theme';
+// Flash undo: one temporary ban/unban line after the action, then it
+// disappears. Permanent undo lives on /audit only.
+var S86_FLASH_UNDO_MS = 45000;
+var _s86FlashUndoTimer = null;
 
 // --- localStorage helpers ---------------------------------------------------
 
@@ -2238,117 +2242,62 @@ function s86UndoReportBan(pubkey, btn, callbacks) {
     });
 }
 
-// container: element to render into. bannedList: the current /api/banned
-// `banned` array (report records are derived from it, never stored).
+// Clear any flash-undo line and cancel its auto-dismiss timer.
+function s86ClearFlashUndo(container) {
+  if (_s86FlashUndoTimer != null) {
+    clearTimeout(_s86FlashUndoTimer);
+    _s86FlashUndoTimer = null;
+  }
+  if (container) {
+    container.textContent = '';
+  }
+}
+
+// One temporary Undo line right after a ban or unban. Disappears after
+// S86_FLASH_UNDO_MS, on dismiss (↩), or after a successful Undo. Permanent
+// history and undo live on /audit only — never a standing list here.
 // callbacks: {onChanged, onError}.
-function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
-  container.textContent = '';
-  if (!isAdmin) {
+function s86ShowFlashUndo(container, record, callbacks) {
+  if (!container || !record) {
     return;
   }
-
-  var stored = s86LoadStored(S86_RECORDS_KEY);
-  var dismissed = s86LoadStored(S86_DISMISSED_REPORTS_KEY);
-
-  var lines = [];
-  stored.forEach(function (r) {
-    // A reason record whose snapshot exceeded S86_REASON_UNDO_MAX stores
-    // entries: null deliberately (see s86UndoReasonRecord) — it still
-    // renders, just without an Undo button, so it needs its own bare
-    // "has a record at all" check rather than the entries-array check
-    // every other stored kind uses.
-    if (!r) {
-      return;
-    }
-    if (r.type === 'reason') {
-      if (typeof r.count !== 'number' || r.count <= 0) {
-        return;
+  if (record.type !== 'ban' && record.type !== 'unban') {
+    return;
+  }
+  if (!Array.isArray(record.entries) || record.entries.length === 0) {
+    return;
+  }
+  s86ClearFlashUndo(container);
+  if (!record.id) {
+    record.id = Date.now() + '-' + Math.random().toString(36).slice(2);
+  }
+  callbacks = callbacks || {};
+  var wrapped = {
+    onChanged: function () {
+      s86ClearFlashUndo(container);
+      if (callbacks.onChanged) {
+        callbacks.onChanged();
       }
-    } else if (!Array.isArray(r.entries) || r.entries.length === 0) {
-      return;
+    },
+    onError: callbacks.onError
+  };
+  // No dismiss-to-history: ↩ just clears the flash. Full undo later is Audit.
+  var line = s86BuildRecordLine(
+    s86RecordLabelParts(record),
+    function (btn) { s86UndoStoredRecord(record, btn, wrapped); },
+    function () { s86ClearFlashUndo(container); }
+  );
+  container.appendChild(line);
+  _s86FlashUndoTimer = setTimeout(function () {
+    _s86FlashUndoTimer = null;
+    if (container) {
+      container.textContent = '';
     }
-    lines.push({ sortAt: r.at || 0, kind: 'stored', ref: r });
-  });
-  (bannedList || []).forEach(function (ban) {
-    if (!ban.report_event_id) {
-      return;
-    }
-    var rid = ban.report_event_id + ':' + ban.pubkey;
-    if (dismissed.indexOf(rid) !== -1) {
-      return;
-    }
-    lines.push({ sortAt: (ban.banned_at || 0) * 1000, kind: 'report', ref: ban, id: rid });
-  });
+  }, S86_FLASH_UNDO_MS);
+}
 
-  lines.sort(function (a, b) { return b.sortAt - a.sortAt; });
-
-  var rendered = lines.slice(0, S86_MAX_RECORDS_RENDERED);
-  var overflow = lines.slice(S86_MAX_RECORDS_RENDERED);
-
-  var overflowStoredIds = {};
-  overflow.forEach(function (l) {
-    if (l.kind === 'stored') {
-      overflowStoredIds[l.ref.id] = true;
-    }
-  });
-  if (Object.keys(overflowStoredIds).length > 0) {
-    stored = stored.filter(function (r) { return !overflowStoredIds[r.id]; });
-    s86SaveStored(S86_RECORDS_KEY, stored, S86_MAX_RECORDS_STORED);
-  }
-
-  var lineEls = rendered.map(function (l) {
-    if (l.kind === 'stored') {
-      var record = l.ref;
-      var canUndo = !(record.type === 'reason' && !record.entries);
-      return s86BuildRecordLine(
-        s86RecordLabelParts(record),
-        canUndo ? function (btn) { s86UndoStoredRecord(record, btn, callbacks); } : null,
-        function () {
-          s86RemoveStoredRecord(record.id);
-          s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        }
-      );
-    } else {
-      var ban = l.ref;
-      var parts = {
-        verb: 'reported',
-        name: ban.name || null,
-        nip05: ban.nip05 || null,
-        suffix: ban.report_type ? ' — ' + ban.report_type : null,
-        npub: ban.npub,
-        hex: ban.pubkey,
-        entries: null
-      };
-      return s86BuildRecordLine(
-        parts,
-        function (btn) { s86UndoReportBan(ban.pubkey, btn, callbacks); },
-        function () {
-          s86DismissReport(l.id);
-          s86RenderRecords(container, isAdmin, bannedList, callbacks);
-        }
-      );
-    }
-  });
-
-  // Newest S86_RECORDS_INLINE lines sit outside any disclosure, always
-  // visible — the rest go behind a <details> so a busy admin isn't
-  // greeted by twenty lines of history above the controls they came for.
-  // Nothing here changes what's stored or the S86_MAX_RECORDS_RENDERED
-  // cap above; this only changes how the already-capped set is drawn.
-  lineEls.slice(0, S86_RECORDS_INLINE).forEach(function (el) {
-    container.appendChild(el);
-  });
-
-  var older = lineEls.slice(S86_RECORDS_INLINE);
-  if (older.length > 0) {
-    var details = document.createElement('details');
-    var summary = document.createElement('summary');
-    summary.textContent = 'recent activity (' + older.length + ' older) ▸';
-    details.appendChild(summary);
-    older.forEach(function (el) { details.appendChild(el); });
-    details.addEventListener('toggle', function () {
-      summary.textContent = 'recent activity (' + older.length + ' older) ' + (details.open ? '▾' : '▸');
-    });
-    container.appendChild(details);
-  }
+// Legacy name kept so pages that "refresh records" on load stay valid: that
+// refresh must clear any flash, never rebuild a history list.
+function s86RenderRecords(container, isAdmin, bannedList, callbacks) {
+  s86ClearFlashUndo(container);
 }

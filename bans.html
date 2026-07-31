@@ -452,7 +452,8 @@ function renderBans(banned) {
 
   s86UpdateSelectedCount(tableContainer, 'ban-checkbox', selectedCount, [copyPurgeBtn]);
   updateBulkReasonButtons();
-  renderRecords();
+  // Do not touch recordsList here — a flash undo may be showing after a
+  // ban/unban; table re-renders must not clear it.
   maybeResolveNamesExternally();
 }
 
@@ -522,11 +523,11 @@ function renderDomains(domains) {
   domainTableContainer.appendChild(table);
 }
 
-function renderRecords() {
-  s86RenderRecords(recordsList, isAdmin, lastBanned, {
-    onChanged: function () { loadBans(); },
+function flashUndoCallbacks() {
+  return {
+    onChanged: function () { loadBans().then(loadDomains); },
     onError: setStatus
-  });
+  };
 }
 
 function renderAppeal(contactAppeal) {
@@ -691,13 +692,13 @@ unbanBtn.addEventListener('click', function () {
       var removed = result.body.removed;
       setStatus('unbanned ' + removed.length + ' pubkey(s)');
       if (removed.length > 0) {
-        s86AddRecord({
+        s86ShowFlashUndo(recordsList, {
           type: 'unban',
           at: Date.now(),
           entries: removed.map(function (pk) {
             return entriesByPk[pk] || { pubkey: pk, npub: null, name: null, nip05: null, reason: '' };
           })
-        });
+        }, flashUndoCallbacks());
       }
       return loadBans().then(loadDomains);
     })
@@ -735,9 +736,8 @@ banForm.addEventListener('submit', function (evt) {
           return { pubkey: pk, npub: ban ? ban.npub : null, name: ban ? ban.name : null, nip05: ban ? ban.nip05 : null, reason: reason };
         });
         if (added.length > 0) {
-          s86AddRecord({ type: 'ban', at: Date.now(), entries: added });
+          s86ShowFlashUndo(recordsList, { type: 'ban', at: Date.now(), entries: added }, flashUndoCallbacks());
         }
-        renderRecords();
       });
     })
     .catch(function () {
@@ -773,16 +773,7 @@ function submitBulkReason(mode) {
       var updated = result.body.updated;
       setStatus('set reason on ' + updated.length + ' ban(s)'
         + (result.body.skipped.length ? ', skipped ' + result.body.skipped.length : ''));
-      if (updated.length > 0) {
-        s86AddRecord({
-          type: 'reason',
-          at: Date.now(),
-          count: updated.length,
-          entries: updated.length <= S86_REASON_UNDO_MAX
-            ? updated.map(function (u) { return { pubkey: u.pubkey, old_reason: u.old_reason }; })
-            : null
-        });
-      }
+      // Reason edits undo on Audit only — no flash line (ban/unban only).
       bulkReasonInput.value = '';
       return loadBans();
     })
