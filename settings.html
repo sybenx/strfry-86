@@ -122,6 +122,10 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Compact progress: the "N of ~M" size figure is the one number that matters
+   mid-run, so it steps out of the muted note colour into full ink + bold. */
+.field-control .note .figure { color:var(--ink); font-weight:700;
+                               font-family:var(--mono); }
 /* Range shares the same chrome as settings buttons: ink border, 8px radius,
    sans label weight. The native track is replaced so it does not look like a
    browser default next to Save / Edit raw. */
@@ -502,21 +506,40 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
     }
   }
 
-  function formatCompactProgress(st) {
+  // Append " · " separators between status parts. The size figure is a
+  // DOM node (bold ink); everything else is plain muted text from the
+  // parent .note.
+  function appendCompactParts(el, parts) {
+    parts.forEach(function (part, i) {
+      if (i > 0) {
+        el.appendChild(document.createTextNode(' · '));
+      }
+      if (part && part.nodeType) {
+        el.appendChild(part);
+      } else {
+        el.appendChild(document.createTextNode(part == null ? '' : String(part)));
+      }
+    });
+  }
+
+  function renderCompactProgress(st, el) {
+    el.textContent = '';
     if (!st) {
-      return '';
+      return;
     }
     if (st.blocked_by) {
       var label = (typeof S86_JOB_LABELS !== 'undefined' && S86_JOB_LABELS[st.blocked_by])
         ? S86_JOB_LABELS[st.blocked_by]
         : st.blocked_by;
-      return 'not started — ' + label
+      el.textContent = 'not started — ' + label
         + ' is running. This button re-enables when it finishes.';
+      return;
     }
     if (st.status === 'running') {
       // strfry compact has no built-in progress. We measure the growing
       // output file; total is the live data.mdb size (a ceiling — the copy
-      // is usually smaller). Client only formats server numbers.
+      // is usually smaller). The size figure is the one mid-run number that
+      // matters, so it steps out of the muted note into full ink + bold.
       var elapsed = st.started_at
         ? Math.max(0, Math.floor(Date.now() / 1000) - st.started_at)
         : 0;
@@ -527,12 +550,15 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
       var parts = ['compacting…'];
       if (st.total != null && st.total > 0) {
         var pct = Math.min(99, Math.floor(written / st.total * 100));
-        parts.push(s86FormatBytes(written) + ' of ~' + s86FormatBytes(st.total)
-          + ' live (' + pct + '%)');
+        var fig = s86El('span',
+          s86FormatBytes(written) + ' of ~' + s86FormatBytes(st.total)
+            + ' live (' + pct + '%)',
+          'figure');
+        parts.push(fig);
       } else if (written > 0) {
-        parts.push(s86FormatBytes(written) + ' written');
+        parts.push(s86El('span', s86FormatBytes(written) + ' written', 'figure'));
       } else if (st.live_bytes != null) {
-        parts.push('source ' + s86FormatBytes(st.live_bytes));
+        parts.push(s86El('span', 'source ' + s86FormatBytes(st.live_bytes), 'figure'));
       }
       parts.push(elapsedTxt + ' elapsed');
       if (st.rate) {
@@ -550,43 +576,46 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
       } else {
         parts.push('estimating…');
       }
-      return parts.join(' · ');
+      appendCompactParts(el, parts);
+      return;
     }
     if (st.failed || st.phase === 'failed' || st.error) {
       var detail = (payload && payload.compact) || null;
       var text = st.error
         || (detail && detail.finished_at === st.finished_at ? detail.error : null);
-      return 'failed — ' + (text || 'compact failed; reload to load the reason');
+      el.textContent = 'failed — ' + (text || 'compact failed; reload to load the reason');
+      return;
     }
     if (st.phase === 'done') {
       var took = (st.started_at && st.finished_at)
         ? (st.finished_at - st.started_at)
         : null;
-      var line = 'compacted copy written'
+      var doneParts = ['compacted copy written'
         + (took != null
           ? (' in ' + (typeof s86FormatDuration === 'function'
             ? s86FormatDuration(took) : (took + 's')))
-          : '');
+          : '')];
       if (st.live_bytes != null && st.compacted_bytes != null) {
-        line += ' — live ' + s86FormatBytes(st.live_bytes)
-          + ' → copy ' + s86FormatBytes(st.compacted_bytes);
+        doneParts.push(s86El('span',
+          'live ' + s86FormatBytes(st.live_bytes)
+            + ' → copy ' + s86FormatBytes(st.compacted_bytes),
+          'figure'));
       }
       if (st.reclaimable_bytes != null && st.reclaimable_bytes > 0) {
-        line += ' · ~' + s86FormatBytes(st.reclaimable_bytes)
-          + ' reclaimable after stop + swap of data.mdb';
+        doneParts.push('~' + s86FormatBytes(st.reclaimable_bytes)
+          + ' reclaimable after stop + swap of data.mdb');
       } else {
-        line += ' · stop the relay and replace data.mdb with the compacted copy to free space';
+        doneParts.push('stop the relay and replace data.mdb with the compacted copy to free space');
       }
-      return line;
+      appendCompactParts(el, doneParts);
     }
-    return '';
   }
 
   function applyCompactStatus(st) {
     if (!compactStatus) {
       return;
     }
-    compactStatus.textContent = formatCompactProgress(st);
+    renderCompactProgress(st, compactStatus);
     var busy = st && (st.status === 'running' || st.blocked_by);
     setRetentionBusy(busy);
   }

@@ -122,6 +122,10 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Compact progress: the "N of ~M" size figure is the one number that matters
+   mid-run, so it steps out of the muted note colour into full ink + bold. */
+.field-control .note .figure { color:var(--ink); font-weight:700;
+                               font-family:var(--mono); }
 /* Range shares the same chrome as settings buttons: ink border, 8px radius,
    sans label weight. The native track is replaced so it does not look like a
    browser default next to Save / Edit raw. */
