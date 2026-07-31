@@ -480,6 +480,18 @@ function runProfilePage() {
       }
       banStatusLine.appendChild(document.createTextNode(' — '));
       banStatusLine.appendChild(s86El('i', s86FormatDate(p.ban.banned_at)));
+      // What the ban has done since. The most recent rejection is the part
+      // that says whether this account is still trying, which a total alone
+      // cannot: 400 blocks that all stopped in March reads very differently
+      // from 4 that happened this morning.
+      if (p.last_blocked_at) {
+        var last = s86El('span', ' — last blocked ' + s86FormatRelativeAge(p.last_blocked_at), 'muted');
+        last.title = s86FormatDate(p.last_blocked_at);
+        banStatusLine.appendChild(last);
+      } else if (p.blocked === 0) {
+        banStatusLine.appendChild(s86El('span',
+          ' — nothing blocked inside the decision log window', 'muted'));
+      }
     } else {
       banStatusLine.textContent = 'not banned';
     }
@@ -572,6 +584,24 @@ function runProfilePage() {
     });
   }
 
+  function blockedCapped(p) {
+    return !!(p.blocked_window && p.blocked_window.truncated);
+  }
+
+  // The blocked figure's denominator, stated in its own note per rendering
+  // rule 3: a count of rejections is meaningless without the window it was
+  // counted over, and that window is a rotating log, not the relay's lifetime.
+  function blockedNote(p) {
+    var w = p.blocked_window;
+    if (!w || !w.present) {
+      return 'no decision log yet';
+    }
+    // The `≥` on the value already says the count is a floor; spelling out
+    // why in the note as well made the tile the longest thing on the page.
+    return 'of ' + w.records.toLocaleString() + ' decisions'
+      + (w.window_start ? (' since ' + s86FormatRelativeAge(w.window_start)) : '');
+  }
+
   // The design's four figures, from data this page already has. Every one of
   // them can legitimately be unknown — the profile endpoint is bounded — and
   // an unknown renders `—`, never 0 (rule 9).
@@ -595,6 +625,19 @@ function runProfilePage() {
         value: reporterCount,
         note: p.reports_saturated ? 'floor — report scan capped' : 'distinct reporters (kind 1984)',
         tone: reporterCount ? 'bad' : null
+      },
+      {
+        label: 'Blocked',
+        // The only figure here counting events that never reached the
+        // database — a scan cannot see a rejection, only plugin86's decision
+        // log can. A floor over that log's window, so `≥` whenever the log
+        // was read from its tail, and `—` when nothing has judged anything
+        // yet, never 0.
+        value: p.blocked == null
+          ? null
+          : ((blockedCapped(p) && p.blocked > 0 ? '≥ ' : '') + p.blocked.toLocaleString()),
+        note: blockedNote(p),
+        tone: p.blocked ? 'bad' : null
       },
       {
         label: 'Kinds seen',

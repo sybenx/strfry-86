@@ -619,6 +619,96 @@ def read_decisions(limit=DECISION_TAIL_MAX):
     return records[-limit:]
 
 
+_blocked_tally_lock = threading.Lock()
+_blocked_tally_cache = {"key": None, "value": None}
+
+
+def _decision_log_key():
+    """Cheap fingerprint of the log's on-disk state, so the tally is recomputed
+    when plugin86 has written since the last one and not otherwise."""
+    key = []
+    for path in (DECISION_LOG_PREV_PATH, DECISION_LOG_PATH):
+        try:
+            st = os.stat(path)
+            key.append((int(st.st_mtime_ns), st.st_size))
+        except OSError:
+            key.append(None)
+    return tuple(key)
+
+
+def get_blocked_tally():
+    """Per-pubkey count of events plugin86 REJECTED, over whatever of the
+    decision log is still on disk.
+
+    This is a FLOOR over a WINDOW, never a lifetime total, and there is no
+    version of it that isn't: the log keeps two rotating segments and each is
+    read from its tail up to DECISION_READ_BYTES, so a pubkey blocked ten
+    thousand times last month and twice today counts as two. Callers render it
+    with `≥` and name the window — the same rule the saturated gift-wrap
+    column already follows. Recomputed only when the log has changed.
+
+    Returns {"counts", "last_at", "window_start", "records", "truncated"}."""
+    key = _decision_log_key()
+    with _blocked_tally_lock:
+        if _blocked_tally_cache["key"] == key and _blocked_tally_cache["value"] is not None:
+            return _blocked_tally_cache["value"]
+
+    counts, last_at = {}, {}
+    window_start, records, truncated = None, 0, False
+    for path in (DECISION_LOG_PREV_PATH, DECISION_LOG_PATH):
+        text, was_truncated = _read_log_segment_tail(path)
+        truncated = truncated or was_truncated
+        if not text:
+            continue
+        lines = text.split("\n")
+        if was_truncated and lines:
+            lines = lines[1:]        # first line is a fragment of a record
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            records += 1
+            at = rec.get("at")
+            if isinstance(at, int) and (window_start is None or at < window_start):
+                window_start = at
+            if rec.get("action") != "reject":
+                continue
+            pubkey = rec.get("pubkey")
+            if not is_hex64(pubkey):
+                continue
+            counts[pubkey] = counts.get(pubkey, 0) + 1
+            if isinstance(at, int) and at > last_at.get(pubkey, 0):
+                last_at[pubkey] = at
+
+    value = {
+        "counts": counts, "last_at": last_at, "window_start": window_start,
+        "records": records, "truncated": truncated,
+        # `present` separates "nothing was blocked" from "nothing judged
+        # anything" — rule 9: an unmeasured cell renders `—`, never 0.
+        "present": records > 0,
+    }
+    with _blocked_tally_lock:
+        _blocked_tally_cache["key"] = key
+        _blocked_tally_cache["value"] = value
+    return value
+
+
+def blocked_window_meta(tally):
+    """The provenance block every page renders beside a blocked count."""
+    return {
+        "present": tally["present"],
+        "window_start": tally["window_start"],
+        "records": tally["records"],
+        "truncated": tally["truncated"],
+    }
+
+
 def _feed_row_from_decision(rec):
     pubkey = rec.get("pubkey")
     npub = None
@@ -802,14 +892,15 @@ def run_giftwrap_retention_purge(days=None):
     overrides the saved setting (Purge now on Settings); the hourly loop
     leaves it None and uses config. Blanket form — no subscriber exemption.
     Failures are returned (and logged) so a stuck delete never kills the
-    server process."""
+    server process. Synchronous; the Settings button uses the async job
+    wrapper below so the UI can poll progress."""
     days = clamp_giftwrap_retention_days(days if days is not None else get_giftwrap_retention_days())
     try:
         strfry_bin = require_strfry_bin()
         conf = require_strfry_conf()
     except RuntimeError as e:
         log(f"server86: giftwrap retention skipped: {e}")
-        return False, str(e)
+        return False, str(e), None
     filt = giftwrap_retention_filter(days=days)
     filter_json = json.dumps(filt, separators=(",", ":"))
     argv = [strfry_bin, "--config", conf, "delete", "--filter", filter_json]
@@ -820,25 +911,144 @@ def run_giftwrap_retention_purge(days=None):
         )
     except subprocess.TimeoutExpired:
         log(f"server86: giftwrap retention timed out after {GIFTWRAP_RETENTION_TIMEOUT}s")
-        return False, "timeout"
+        return False, "timeout", None
     except Exception as e:
         log(f"server86: giftwrap retention failed: {type(e).__name__}: {e}")
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e}", None
     if result.returncode != 0:
         err = (result.stderr or b"").decode("utf-8", "replace")[-300:]
         log(f"server86: giftwrap retention exit {result.returncode}: {err}")
-        return False, err or f"exit {result.returncode}"
+        return False, err or f"exit {result.returncode}", None
     log(f"server86: giftwrap retention ok (until={filt['until']}, days={days})")
-    return True, None
+    return True, None, filt
+
+
+# --- gift-wrap purge job (Settings "Purge now") -----------------------------
+# Async so the request is not held open for the whole delete. strfry's
+# `delete` collects every matching levId then deletes in one write txn —
+# there is no mid-delete event counter to stream — so progress is:
+#   counting → total known → deleting (elapsed only) → idle with result.
+# Shares the global scan lock: concurrent LMDB writers fight each other.
+# `counted` is deliberately NOT called `deleted`: strfry's delete reports no
+# count of its own, so the only number available is the one counted moments
+# BEFORE the delete ran, against an age cutoff a few seconds earlier than the
+# one the delete used. It is a good estimate and a bad fact, and the field
+# name is where that distinction survives being passed around.
+_giftwrap_purge_job = {
+    "status": "idle", "started_at": None, "progress": None, "total": None,
+    "rate": None, "eta": None, "days": None, "phase": None, "error": None,
+    "finished_at": None, "counted": None, "counted_until": None, "until": None,
+}
+_JOB_REGISTRY["giftwrap-purge"] = _giftwrap_purge_job
+
+
+def get_giftwrap_purge_status(include_detail=False):
+    """Purge job status. `include_detail` adds the raw failure text, and is
+    only ever true for an authenticated caller.
+
+    That text is strfry's own stderr, which names the config file and the
+    database directory — the same disclosure /api/metrics was deliberately
+    scrubbed of. The public form keeps everything an operator needs to watch
+    progress (phase, elapsed, whether it failed) and drops the one field that
+    describes this machine's filesystem."""
+    with _scan_lock:
+        status = dict(_giftwrap_purge_job)
+        running = _active_scan["name"]
+    status["blocked_by"] = running if running not in (None, "giftwrap-purge") else None
+    error = status.get("error")
+    status["failed"] = bool(error) or status.get("phase") == "failed"
+    if not include_detail:
+        status.pop("error", None)
+    return status
+
+
+def _run_giftwrap_purge_job(days):
+    """Background body for Settings Purge now. Counts first so the UI can say
+    roughly how much the delete is about to remove, then runs the delete.
+    Releases the global lock on every exit path.
+
+    The count and the delete each work out their own age cutoff, seconds
+    apart, so they do NOT describe the same set of events — anything that
+    aged past the line in between is deleted but uncounted. Both cutoffs are
+    reported (`counted_until` and `until`) and the count is never renamed
+    into a deletion total."""
+    error = None
+    counted = None
+    counted_until = None
+    until = None
+    try:
+        with _scan_lock:
+            _giftwrap_purge_job["phase"] = "counting"
+            _giftwrap_purge_job["progress"] = 0
+            _giftwrap_purge_job["total"] = None
+        filt = giftwrap_retention_filter(days=days)
+        counted_until = filt["until"]
+        total = run_strfry_count(filt)
+        with _scan_lock:
+            _giftwrap_purge_job["total"] = total
+            _giftwrap_purge_job["progress"] = 0
+            _giftwrap_purge_job["phase"] = "deleting"
+            _giftwrap_purge_job["counted_until"] = counted_until
+        ok, err, used_filter = run_giftwrap_retention_purge(days=days)
+        if not ok:
+            error = err or "purge failed"
+        else:
+            counted = total
+            # The cutoff the DELETE actually used, straight from the filter it
+            # ran with — not the one the count used a moment earlier.
+            until = used_filter["until"] if used_filter else None
+            with _scan_lock:
+                _giftwrap_purge_job["progress"] = total
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"[:600]
+        log(f"server86: giftwrap purge job failed: {error}")
+    with _scan_lock:
+        _giftwrap_purge_job["status"] = "idle"
+        _giftwrap_purge_job["phase"] = "failed" if error else "done"
+        _giftwrap_purge_job["error"] = error
+        _giftwrap_purge_job["counted"] = counted
+        _giftwrap_purge_job["counted_until"] = counted_until
+        _giftwrap_purge_job["until"] = until
+        _giftwrap_purge_job["finished_at"] = int(time.time())
+        _giftwrap_purge_job["rate"] = None
+        _giftwrap_purge_job["eta"] = None
+        _active_scan["name"] = None
+
+
+def start_giftwrap_purge(days=None, on_started=None):
+    """Start one purge under the global job lock. Returns the job status
+    dict (status=running on start, or blocked_by if another job holds the
+    lock). `on_started` fires only if this call launched the purge — the
+    audit record hangs off it, so a refused press is never recorded as a
+    deletion and an accepted one is never recorded as nothing."""
+    days = clamp_giftwrap_retention_days(days if days is not None else get_giftwrap_retention_days())
+
+    def run():
+        _run_giftwrap_purge_job(days)
+
+    status = _start_scan_job(
+        "giftwrap-purge", _giftwrap_purge_job, run,
+        on_started=on_started,
+        extra_job_fields={
+            "days": days, "phase": "starting", "error": None,
+            "finished_at": None, "counted": None, "counted_until": None, "until": None,
+        },
+    )
+    return status
 
 
 def _giftwrap_retention_loop():
     # First pass waits a full interval so a restart storm cannot pile up
-    # concurrent deletes against a just-starting LMDB.
+    # concurrent deletes against a just-starting LMDB. Goes through the
+    # same job lock as Settings "Purge now", so a manual purge and the
+    # hourly pass never run together.
     while True:
         time.sleep(GIFTWRAP_RETENTION_INTERVAL)
         try:
-            run_giftwrap_retention_purge()
+            status = start_giftwrap_purge()
+            if status.get("blocked_by"):
+                log(f"server86: giftwrap retention skipped — "
+                    f"{status['blocked_by']} is running")
         except Exception as e:
             log(f"server86: giftwrap retention loop: {type(e).__name__}: {e}")
 
@@ -1626,6 +1836,10 @@ def get_settings_payload():
             "error": None, "balanced": True,
             "writable": _path_writable(CONFIG_PATH),
         },
+        # The admin-only copy of the purge status, carrying the failure text
+        # the public poll endpoint withholds. The Settings page is the only
+        # thing that needs it, and it already authenticates to load this.
+        "purge": get_giftwrap_purge_status(include_detail=True),
     }
 
 
@@ -1872,7 +2086,7 @@ def _run_scan_job(name, job, cache, cache_path, compute_fn):
         _active_scan["name"] = None
 
 
-def _start_scan_job(name, job, run_target, extra_job_fields=None):
+def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=None):
     """Single-flight per endpoint, AND global across every scan endpoint:
 
     - A POST naming the job that is already running returns the SAME 202
@@ -1881,7 +2095,15 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None):
     - A POST naming a DIFFERENT job while one is running does not start a
       second subprocess and does not 409 — it returns the RUNNING job's own
       status, with `blocked_by` naming it, so the caller can tell the two
-      apart from the response shape alone."""
+      apart from the response shape alone.
+
+    `on_started` runs exactly once, and only for the call that actually
+    launched the thread. It exists because a caller CANNOT determine that for
+    itself: checking the lock before calling races with the call, so a
+    destructive job that guesses either records a run that never happened or
+    runs with no record at all. It is deliberately not a field on the
+    returned status — the two POSTs above must stay byte-identical."""
+    launched = False
     with _scan_lock:
         running = _active_scan["name"]
         if running == name:
@@ -1902,7 +2124,13 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None):
             job.update(extra_job_fields)
         status = dict(job)
         status["blocked_by"] = None
+        launched = True
 
+    # Outside the lock: on_started writes to disk (the audit log), and every
+    # status read in the project waits on this lock. Before the thread, so
+    # the record exists by the time the job can do anything.
+    if launched and on_started is not None:
+        on_started()
     threading.Thread(target=run_target, daemon=True).start()
     return status
 
@@ -3058,6 +3286,11 @@ def build_profile_response(pubkey_hex):
             scan_count = a.get("count")
             break
 
+    # What the ban has actually stopped. Costs no scan — plugin86's decision
+    # log is already read for the feed — and it is the only figure on this
+    # page that describes events which never reached the database at all.
+    tally = get_blocked_tally()
+
     result = compute_profile(pubkey_hex)
     result.update({
         "pubkey": pubkey_hex,
@@ -3068,6 +3301,9 @@ def build_profile_response(pubkey_hex):
         "ban": dict(ban_entry) if ban_entry else None,
         "scan_rank": scan_rank,
         "scan_count": scan_count,
+        "blocked": tally["counts"].get(pubkey_hex, 0) if tally["present"] else None,
+        "last_blocked_at": tally["last_at"].get(pubkey_hex),
+        "blocked_window": blocked_window_meta(tally),
     })
     return result
 
@@ -3428,6 +3664,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_relay_metrics())
             return
 
+        if path == "/api/giftwrap-retention/purge":
+            # Public so the Settings page can poll progress without asking the
+            # signing extension to re-sign every three seconds. Redacted for
+            # exactly that reason — the failure text goes out only through the
+            # authenticated POST /api/settings read.
+            self._send_json(200, get_giftwrap_purge_status())
+            return
+
         if path == "/api/domain-bans":
             self._send_json(200, {"domains": get_domain_bans()})
             return
@@ -3455,6 +3699,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log(f"server86: name resolution failed: {e}")
                 profiles = {}
+            # A ban is a rule; the blocked count is that rule being enforced.
+            # It is the only figure on the page that says the ban is doing
+            # anything, so it travels with the row rather than living behind
+            # another scan.
+            tally = get_blocked_tally()
             banned = []
             for pubkey, info in data.items():
                 try:
@@ -3473,6 +3722,8 @@ class Handler(BaseHTTPRequestHandler):
                         "name": profile.get("name"),
                         "nip05": profile.get("nip05"),
                         "name_checked_at": info.get("name_checked_at"),
+                        "blocked": tally["counts"].get(pubkey, 0) if tally["present"] else None,
+                        "last_blocked_at": tally["last_at"].get(pubkey),
                     }
                 )
             banned.sort(key=lambda b: (b["banned_at"] is None, b["banned_at"]), reverse=True)
@@ -3480,6 +3731,7 @@ class Handler(BaseHTTPRequestHandler):
                 "admin": cfg["admin_pubkey_hex"],
                 "contact_appeal": get_contact_appeal(),
                 "banned": banned,
+                "blocked_window": blocked_window_meta(tally),
             })
             return
 
@@ -3677,15 +3929,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/giftwrap-retention/purge":
             days = clamp_giftwrap_retention_days(body.get("days"))
-            ok_purge, perr = run_giftwrap_retention_purge(days=days)
-            if not ok_purge:
-                self._send_json(500, {"error": perr or "purge failed", "days": days})
-                return
-            audit_append({
-                "type": "giftwrap_purge", "actor": auth.get("pubkey"),
-                "days": days, "via": "settings purge now",
-            })
-            self._send_json(200, {"ok": True, "days": days})
+            # The audit record is written by start_giftwrap_purge itself, and
+            # only if THIS call launched the purge — the handler never has to
+            # infer that from the lock, which is what let a refused press be
+            # audited and an accepted one go unrecorded.
+            status = start_giftwrap_purge(
+                days=days,
+                on_started=lambda: audit_append({
+                    "type": "giftwrap_purge", "actor": auth.get("pubkey"),
+                    "days": days, "via": "settings purge now",
+                }),
+            )
+            # 202 while this job (or a blocker) is running so the client
+            # knows to poll; 200 when nothing is in flight.
+            code = 202 if status.get("status") == "running" or status.get("blocked_by") else 200
+            self._send_json(code, status)
             return
 
         if path == "/api/settings/save":

@@ -413,6 +413,96 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
     estimateTimer = setTimeout(refreshEstimate, 250);
   }
 
+  function formatPurgeProgress(st) {
+    if (!st) {
+      return '';
+    }
+    // Blocked means NOT started — jobs are not queued, so this is a refusal,
+    // not a place in a line. Say so, and keep polling (s86PollStatus keeps
+    // going while blocked_by is set) so the moment the blocker clears the
+    // button comes back and the operator can press it for real.
+    if (st.blocked_by) {
+      return 'not started — ' + st.blocked_by
+        + ' is running. This button re-enables when it finishes.';
+    }
+    if (st.status === 'running') {
+      var elapsed = st.started_at
+        ? Math.max(0, Math.floor(Date.now() / 1000) - st.started_at)
+        : 0;
+      var elapsedTxt = elapsed < 60
+        ? (elapsed + 's')
+        : (Math.floor(elapsed / 60) + 'm ' + (elapsed % 60) + 's');
+      if (st.phase === 'counting' || st.phase === 'starting') {
+        return 'counting gift wraps to delete… ' + elapsedTxt;
+      }
+      if (st.phase === 'deleting') {
+        var n = st.total != null ? st.total.toLocaleString() : '…';
+        return 'deleting about ' + n + ' gift wraps… ' + elapsedTxt;
+      }
+      return 'purging… ' + elapsedTxt;
+    }
+    if (st.failed || st.phase === 'failed' || st.error) {
+      // The poll endpoint is public and withholds the failure text, since it
+      // is strfry's stderr and names paths on this machine. An admin still
+      // gets it: POST /api/settings carries the detailed copy, and this page
+      // has already authenticated to load it. Matched on finished_at so a
+      // fresh failure never renders a previous run's reason.
+      var detail = (payload && payload.purge) || null;
+      var text = st.error
+        || (detail && detail.finished_at === st.finished_at ? detail.error : null);
+      return 'failed — ' + (text || 'purge failed; reload to load the reason');
+    }
+    if (st.phase === 'done') {
+      // strfry's delete returns no count, so the only number here is the one
+      // counted just BEFORE it ran, against a cutoff seconds earlier than the
+      // one the delete used. Reported as the estimate it is — never as
+      // "deleted N", which would be a measured figure this project does not
+      // have.
+      var took = (st.started_at && st.finished_at)
+        ? (st.finished_at - st.started_at)
+        : null;
+      var line = 'purged gift wraps older than ' + (st.days || '?') + ' days'
+        + (took != null ? (' in ' + took + 's') : '');
+      if (st.counted != null) {
+        line += ' — about ' + st.counted.toLocaleString()
+          + ' events, counted just before the delete ran';
+      }
+      return line;
+    }
+    return '';
+  }
+
+  function applyPurgeStatus(st) {
+    purgeStatus.textContent = formatPurgeProgress(st);
+    var busy = st && (st.status === 'running' || st.blocked_by);
+    purgeBtn.disabled = !!busy || !isAdmin;
+    if (st && st.status !== 'running' && !st.blocked_by && st.phase === 'done') {
+      refreshEstimate();
+    }
+  }
+
+  function pollPurge() {
+    s86PollStatus(
+      function () {
+        return fetch('/api/giftwrap-retention/purge').then(function (res) {
+          return res.json();
+        });
+      },
+      applyPurgeStatus
+    );
+  }
+
+  // Resume a purge still running from a previous visit to this page.
+  fetch('/api/giftwrap-retention/purge')
+    .then(function (res) { return res.json(); })
+    .then(function (st) {
+      applyPurgeStatus(st);
+      if (st.status === 'running' || st.blocked_by) {
+        pollPurge();
+      }
+    })
+    .catch(function () {});
+
   slider.addEventListener('input', scheduleEstimate);
   setDaysLabel();
   refreshEstimate();
@@ -429,16 +519,21 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
       return;
     }
     purgeBtn.disabled = true;
-    purgeStatus.textContent = 'purging…';
+    purgeStatus.textContent = 'starting…';
     s86SignAndPost('/api/giftwrap-retention/purge', { days: days })
       .then(function (result) {
-        purgeBtn.disabled = false;
+        // 202 running and 200 idle both carry the job status body; res.ok
+        // is true for both (2xx).
+        var st = result.body || {};
         if (!result.ok) {
+          purgeBtn.disabled = false;
           purgeStatus.textContent = 'failed — ' + s86ErrMsg(result);
           return;
         }
-        purgeStatus.textContent = 'purged gift wraps older than ' + days + ' days';
-        refreshEstimate();
+        applyPurgeStatus(st);
+        if (st.status === 'running' || st.blocked_by) {
+          pollPurge();
+        }
       })
       .catch(function () {
         purgeBtn.disabled = false;

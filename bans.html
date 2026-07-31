@@ -263,6 +263,7 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 </div>
 
 <h3>Banned Pubkeys</h3>
+<p class="muted" id="blocked-window-note"></p>
 <div class="toolbar">
   <input id="filter-input" type="search" placeholder="filter banned pubkeys…" aria-label="filter banned pubkeys">
   <label id="select-all-label" style="display:none"><input id="select-all" type="checkbox"> Select visible</label>
@@ -295,6 +296,7 @@ var adminPubkey = null;
 var isAdmin = false;
 var lastBanned = [];
 var lastDomains = [];
+var blockedWindow = null;
 var nameResolutionInFlight = false;
 var attemptedThisSession = new Set();
 
@@ -316,6 +318,7 @@ var banReason = document.getElementById('ban-reason');
 var tableContainer = document.getElementById('ban-table-container');
 var domainTableContainer = document.getElementById('domain-table-container');
 var domainNote = document.getElementById('domain-note');
+var blockedWindowNote = document.getElementById('blocked-window-note');
 var filterInput = document.getElementById('filter-input');
 var selectAllLabel = document.getElementById('select-all-label');
 var selectAll = document.getElementById('select-all');
@@ -344,10 +347,50 @@ function matchesQuery(ban, q) {
     .join(' ').toLowerCase().indexOf(q) !== -1;
 }
 
+// How many events this pubkey has had REJECTED since the decision log's
+// window opened. Always a floor over a window, never a lifetime total: the
+// log keeps two rotating segments and is read from the tail, so a pubkey
+// blocked ten thousand times last month and twice today reads as two. `≥`
+// whenever the read was capped, `—` when nothing has judged anything yet
+// (rule 9 — an unmeasured cell is never 0), and 0 only when the log exists
+// and genuinely holds no rejection for this key.
+function blockedCell(row) {
+  if (row.blocked == null) {
+    var unknown = s86El('td', '—', 'num muted');
+    unknown.title = 'no decision log yet — plugin86 has not judged an event since it last started';
+    return unknown;
+  }
+  var capped = !!(blockedWindow && blockedWindow.truncated);
+  var text = (capped && row.blocked > 0 ? '≥ ' : '') + Number(row.blocked).toLocaleString();
+  var td = s86El('td', text, row.blocked > 0 ? 'num bad' : 'num muted');
+  td.title = row.last_blocked_at
+    ? ('last blocked ' + s86FormatDate(row.last_blocked_at))
+    : 'nothing blocked inside the log window';
+  return td;
+}
+
+function renderBlockedWindowNote() {
+  if (!blockedWindow || !blockedWindow.present) {
+    blockedWindowNote.textContent = 'Blocked counts need plugin86\'s decision log — '
+      + 'nothing has been judged since it last started, so that column is —.';
+    return;
+  }
+  blockedWindowNote.textContent = 'Blocked counts cover the '
+    + blockedWindow.records.toLocaleString() + ' decisions still in the log'
+    + (blockedWindow.window_start
+        ? (', back to ' + s86FormatDate(blockedWindow.window_start)
+           + ' (' + s86FormatRelativeAge(blockedWindow.window_start) + ')')
+        : '')
+    + (blockedWindow.truncated
+        ? ' — the log was read from its tail, so every count is a floor, shown as ≥.'
+        : '.');
+}
+
 function renderBans(banned) {
   lastBanned = banned;
   selectAll.checked = false;
   tableContainer.textContent = '';
+  renderBlockedWindowNote();
 
   var q = filterInput.value.trim().toLowerCase();
   var filtered = banned.filter(function (b) { return matchesQuery(b, q); });
@@ -359,8 +402,8 @@ function renderBans(banned) {
       : 'no bans match this filter'));
   } else {
     var table = document.createElement('table');
-    var head = ['Pubkey', 'Banned on', 'Source', 'Reason'];
-    table.appendChild(s86BuildTableHead(isAdmin ? [''].concat(head) : head, isAdmin ? 4 : 3));
+    var head = ['Pubkey', 'Banned on', 'Source', 'Blocked', 'Reason'];
+    table.appendChild(s86BuildTableHead(isAdmin ? [''].concat(head) : head, isAdmin ? 5 : 4));
     var tbody = document.createElement('tbody');
     truncation.shown.forEach(function (ban) {
       var tr = document.createElement('tr');
@@ -387,6 +430,7 @@ function renderBans(banned) {
         sourceTd.textContent = '—';
       }
       tr.appendChild(sourceTd);
+      tr.appendChild(blockedCell(ban));
 
       tr.appendChild(s86El('td', ban.reason || '—', ban.reason ? 'clip' : 'muted'));
       tbody.appendChild(tr);
@@ -496,6 +540,7 @@ function loadBans() {
       var firstLoad = adminPubkey === null;
       adminPubkey = data.admin;
       renderAppeal(data.contact_appeal);
+      blockedWindow = data.blocked_window || null;
       renderBans(data.banned);
       if (firstLoad) {
         s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);

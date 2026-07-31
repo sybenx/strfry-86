@@ -1239,7 +1239,11 @@ function s86PollStatus(fetchFn, applyFn, onError) {
     fetchFn()
       .then(function (data) {
         applyFn(data);
-        if (data.status === 'running') {
+        // Keep polling while THIS job runs, and also while it is blocked by
+        // another one. A blocked job's own status reads `idle`, so stopping
+        // on status alone leaves the panel frozen on "waiting on X…" forever:
+        // nothing ever fetches again to notice that X has finished.
+        if (data.status === 'running' || data.blocked_by) {
           setTimeout(poll, 3000);
         }
       })

@@ -1784,6 +1784,146 @@ check(server86._active_scan["name"] is None,
 server86.compute_authors = _orig_compute_authors
 
 
+# --- gift-wrap purge: `started` is the only thing the audit trail trusts ---
+# The purge is the one DESTRUCTIVE async job, so two silent failures matter
+# more here than anywhere else: a press that is refused (another job holds
+# the lock) must not be audited as a deletion, and a press that IS accepted
+# must never run unaudited. A caller cannot answer that by reading the lock
+# before starting — the lock can change in between — so _start_scan_job
+# reports `started` from inside the lock that launched the thread.
+
+_audit_fires = {"n": 0}
+
+
+def _count_audit():
+    _audit_fires["n"] += 1
+
+
+server86._active_scan["name"] = None
+server86.compute_authors = _slow_compute_authors
+_purge_blocker = server86.start_authors_scan("recent")
+purge_blocked = server86.start_giftwrap_purge(days=30, on_started=_count_audit)
+check(purge_blocked.get("blocked_by") == "authors" and _audit_fires["n"] == 0,
+      "gift-wrap purge refused while another job holds the lock never fires on_started — a refused press writes no audit record for a deletion that did not happen")
+check(server86._giftwrap_purge_job.get("phase") != "deleting",
+      "gift-wrap purge refused while blocked never entered its delete phase")
+check("started" not in purge_blocked,
+      "gift-wrap purge status carries no `started` field — the two POST bodies stay byte-identical, per the single-flight shape rule above")
+_time.sleep(0.6)
+server86.compute_authors = _orig_compute_authors
+server86._active_scan["name"] = None
+
+# A purge that really runs: the count and the delete each compute their own
+# age cutoff, seconds apart, so they describe DIFFERENT sets of events. Both
+# cutoffs are reported and the count is never renamed into a deletion total.
+_orig_count = server86.run_strfry_count
+_orig_retention_purge = server86.run_giftwrap_retention_purge
+_delete_until = 1234567
+
+
+def _fake_count(filter_obj, timeout=None):
+    return 4242
+
+
+def _fake_retention_purge(days=None):
+    _time.sleep(0.05)
+    return True, None, {"kinds": [1059], "until": _delete_until}
+
+
+server86.run_strfry_count = _fake_count
+server86.run_giftwrap_retention_purge = _fake_retention_purge
+
+purge_started = server86.start_giftwrap_purge(days=30, on_started=_count_audit)
+check(purge_started.get("status") == "running" and _audit_fires["n"] == 1,
+      "gift-wrap purge that actually launches fires on_started exactly once — the audit record is written for this press and no other")
+_purge_again = server86.start_giftwrap_purge(days=30, on_started=_count_audit)
+# Same KEYS as the first response (the single-flight shape rule) but not the
+# same values — unlike the other scans, this job publishes phase and totals
+# as it runs, so a body frozen at launch would be the bug, not the fix.
+check(_audit_fires["n"] == 1 and set(_purge_again) == set(purge_started)
+      and _purge_again.get("blocked_by") is None,
+      "a second press while the purge runs is recognised as the same job and does NOT audit again — one deletion, one record")
+_time.sleep(0.5)
+purge_done = server86.get_giftwrap_purge_status()
+check("deleted" not in purge_done,
+      "gift-wrap purge reports no `deleted` field — strfry's delete returns no count, so none is invented")
+check(purge_done.get("counted") == 4242,
+      "gift-wrap purge reports `counted`, the pre-delete count, under a name that says it is one")
+check(purge_done.get("until") == _delete_until,
+      "gift-wrap purge `until` comes from the filter the DELETE ran with, not the one the count used")
+check(purge_done.get("counted_until") not in (None, _delete_until),
+      "gift-wrap purge reports the count's own cutoff separately — the two are never reconciled into one figure")
+
+check("error" not in server86.get_giftwrap_purge_status(),
+      "public purge status withholds the failure text — it is strfry's stderr, which names this machine's config and database paths")
+check("error" in server86.get_giftwrap_purge_status(include_detail=True),
+      "authenticated purge status still carries the failure text, so an admin can see why a purge failed")
+check(server86.get_giftwrap_purge_status().get("failed") is False,
+      "public purge status still says WHETHER it failed — redaction removes the paths, not the outcome")
+
+server86.run_strfry_count = _orig_count
+server86.run_giftwrap_retention_purge = _orig_retention_purge
+server86._active_scan["name"] = None
+
+
+# --- blocked tally: the ban list's only proof a ban is doing anything -------
+# Counted from plugin86's decision log, which is a rotating window read from
+# its tail — so the figure is a FLOOR over a window, and every rule here is
+# about never letting it be read as a lifetime total, or as a zero when
+# nothing has been measured at all.
+
+import json as _json, shutil as _shutil, tempfile as _tempfile
+
+_tally_dir = _tempfile.mkdtemp()
+_orig_dec_path = server86.DECISION_LOG_PATH
+_orig_dec_prev = server86.DECISION_LOG_PREV_PATH
+server86.DECISION_LOG_PATH = os.path.join(_tally_dir, "decisions.jsonl")
+server86.DECISION_LOG_PREV_PATH = server86.DECISION_LOG_PATH + ".1"
+
+_pk_spam = "aa" * 32
+_pk_ok = "bb" * 32
+
+# No log at all: not zero blocks — nothing judged anything.
+server86._blocked_tally_cache["key"] = None
+_empty_tally = server86.get_blocked_tally()
+check(_empty_tally["present"] is False and _empty_tally["counts"] == {},
+      "blocked tally with no decision log reports present=False — the column renders — , never 0 (rendering rule 9)")
+
+with open(server86.DECISION_LOG_PATH, "w", encoding="utf-8") as _fh:
+    for _i in range(3):
+        _fh.write(_json.dumps({"at": 1000 + _i, "id": f"{_i:064x}", "pubkey": _pk_spam,
+                               "kind": 1, "action": "reject", "msg": "blocked: banned pubkey"}) + "\n")
+    _fh.write(_json.dumps({"at": 1010, "id": "f" * 64, "pubkey": _pk_ok,
+                           "kind": 1, "action": "accept", "msg": ""}) + "\n")
+
+server86._blocked_tally_cache["key"] = None
+_tally = server86.get_blocked_tally()
+check(_tally["counts"].get(_pk_spam) == 3,
+      "blocked tally counts one rejection per decision record for the pubkey that was rejected")
+check(_pk_ok not in _tally["counts"],
+      "blocked tally counts ONLY rejections — an accepted event never adds to a pubkey's blocked count")
+check(_tally["last_at"].get(_pk_spam) == 1002 and _tally["window_start"] == 1000,
+      "blocked tally reports the newest rejection per pubkey and the window's own start, so the count can state its denominator")
+check(_tally["present"] is True and _tally["records"] == 4,
+      "blocked tally counts every decision read as the window, not just the rejections — the count names what it is out of")
+
+# The cache must not outlive a write, or a freshly blocked pubkey reads stale.
+with open(server86.DECISION_LOG_PATH, "a", encoding="utf-8") as _fh:
+    _fh.write(_json.dumps({"at": 1100, "id": "e" * 64, "pubkey": _pk_spam,
+                           "kind": 1, "action": "reject", "msg": "blocked: banned pubkey"}) + "\n")
+check(server86.get_blocked_tally()["counts"].get(_pk_spam) == 4,
+      "blocked tally is recomputed after plugin86 appends — the cache keys on the log's size and mtime, never on time alone")
+
+_meta = server86.blocked_window_meta(server86.get_blocked_tally())
+check(set(_meta) == {"present", "window_start", "records", "truncated"},
+      "every page that renders a blocked count is handed the window it covers, so the figure is never shown bare")
+
+server86.DECISION_LOG_PATH = _orig_dec_path
+server86.DECISION_LOG_PREV_PATH = _orig_dec_prev
+server86._blocked_tally_cache["key"] = None
+_shutil.rmtree(_tally_dir, ignore_errors=True)
+
+
 # --- static route table: query strings never affect routing --------------
 # CLAUDE.md requires this exact check: /profile and /profile?npub=<anything>
 # (including a value containing '../') must serve identical bytes, since
@@ -2021,6 +2161,37 @@ check(flatten(reportLine, []).indexOf('INPUT') === -1,
 
 check(sandbox.s86BuildRecordLine.length === 3,
   's86BuildRecordLine takes exactly 3 parameters — no reasonEdit 4th argument for a record line to act on');
+
+// s86PollStatus must keep polling while a job is BLOCKED, not only while it
+// is running. A blocked job's own status reads `idle`, so stopping on status
+// alone freezes the panel on "waiting on X…" forever — nothing ever fetches
+// again to notice X finished, and the button never comes back.
+{
+  let fetches = 0;
+  const seen = [];
+  sandbox.setTimeout = (fn) => { if (fetches < 4) { fn(); } };
+  sandbox.s86PollStatus(
+    () => {
+      fetches++;
+      // idle-but-blocked twice, then idle and clear.
+      return Promise.resolve(fetches <= 2
+        ? { status: 'idle', blocked_by: 'authors' }
+        : { status: 'idle', blocked_by: null });
+    },
+    (data) => { seen.push(data.blocked_by); }
+  );
+  // The shim resolves promises asynchronously; drain the microtask queue.
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+  drain().then(drain).then(drain).then(drain).then(drain).then(() => {
+    check(fetches >= 3,
+      's86PollStatus keeps polling while blocked_by is set — a blocked panel un-freezes when the blocker finishes');
+    check(seen[seen.length - 1] === null,
+      's86PollStatus stops only once the job is both idle AND unblocked');
+    for (const [ok, name] of results.slice(-2)) {
+      console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
+    }
+  });
+}
 
 for (const [ok, name] of results) {
   console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
