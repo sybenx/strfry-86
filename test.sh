@@ -33,6 +33,17 @@ else
 fi
 rm -f "$MANIFEST_BACKUP" "$BUNDLE_BACKUP"
 
+# --- style block identical on every page ------------------------------------
+# Silent failure this covers: one page's <style> edited in place. Nothing
+# errors, no test notices, and that page quietly renders differently from the
+# other eight — which CLAUDE.md calls a bug.
+
+if python3 tools/stamp_style.py --check > /dev/null 2>&1; then
+    pass "style block is byte-identical across every page"
+else
+    fail "style block drifted — edit tools/style86.css, then run tools/stamp_style.py"
+fi
+
 # --- committed bundle contents hash-match the manifest ----------------------
 
 CHECK_BUNDLE_SCRIPT="$(mktemp)"

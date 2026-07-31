@@ -37,36 +37,56 @@ under 444 rows of long tail. Overview first, details on demand.
 8. Empty states name the cheapest press that fills them and its measured cost.
 9. Progressive fill renders `—` for not-yet-known; `0` only when measured. Blank = never.
 
-## Style block — locked, enumerated, reopened once for the header (do not grow it again)
+## Style block — one canonical file, stamped into every page (never hand-edited in a page)
 
-```css
-body { max-width:40em; margin:0 auto; padding:0 1em; }
-li { overflow-wrap:anywhere; }
-pre { white-space:pre-wrap; overflow-wrap:anywhere; }   /* commands only — WHY.md §2 */
-@media (max-width:600px){ body{ font-size:1.15em; } }
-:root { color-scheme: light dark; }
-body { background:Canvas; color:CanvasText; }           /* required — WHY.md §3 */
-header#s86 { position:sticky; top:0; background:Canvas; display:flex;
-             gap:1em; align-items:center; padding:.5em 0; }
-header#s86 a.logo { text-decoration:none; color:inherit; font-weight:bold; }
-header#s86 input#q { flex:1; min-width:8em; }
-```
+`tools/style86.css` IS the style block. `tools/stamp_style.py` copies it verbatim into
+every page's `<style>`; `tools/stamp_style.py --check` exits non-zero if any page has
+drifted. Still duplicated character-for-character in every page's `<style>` — a page
+differing is still a bug — but the duplication is now produced by a command, so editing
+CSS inside an HTML file is the bug, not the drift it causes. Rules that hold in it:
 
-Duplicated character-for-character in every page's `<style>`. A page differing is a bug.
+- **Tokens, not literals.** Every colour is a `--var` on `:root`. No page, and no
+  element style in JS, names a colour directly.
+- **Light/dark via `light-dark()`.** Tokens resolve against the same `color-scheme` the
+  theme button and the anti-flash `<script>` already set (WHY.md §3 — the mechanism is
+  unchanged; only the palette is ours now). An `@supports not (color: light-dark(…))`
+  block hands every token back to a system colour (`Canvas`/`CanvasText`/`GrayText`/
+  `LinkText`), so an old browser gets exactly the browser-default page this project
+  shipped before the paint. Any token added must be added to that block too.
+- **Fonts are stacks, never fetched.** Serif for display, sans for body, mono for keys,
+  ids, timestamps and figures. No webfont, no network request — same rule as `kinds86.json`.
+- **`<pre>` is a terminal.** Dark panel, mono, rounded — commands and console output only
+  (WHY.md §2), never figures.
+- **`thead th` is a column header** (2px rule above, uppercase, muted); `tbody th` is a
+  row label and gets none of that. Key/value tables have no `thead`.
+- **Nothing exceeds the viewport at phone width** (rendering rule 5): the `max-width:600px`
+  block drops `.nowrap` and breaks unbreakable keys in every cell.
+
+Presentational class names owned by the block, applied from `common86.js` and pages:
+`mono` · `nowrap` · `muted` · `badge` (kind/action chip) · `pill`/`pill live` (live state)
+· `page-head` (h1 + right-hand pill) · `console-row`.
 
 ## Header — identical on every page, same positions, always
 
-- `strfry-86` text logo, left: an `<a href="/home">` styled as plain text via `a.logo`.
-- Search box `#q`, center, grows: accepts npub / 64-hex / domain; routes to
+Two rows, built once in `s86BuildPageChrome`. Row one (`.brand`) is the identity and the
+account controls; row two (`.bar`) is the nav tabs and the search box. Only ONE thing
+differs between pages, and it differs by attribute rather than by markup: the current
+tab carries `aria-current="page"` and the accent underline.
+
+- `strfry-86` text logo, left of row one: an `<a href="/home">` styled as plain text via
+  `a.logo`, followed by the fixed `.tagline` (hidden under 600px, never page-specific).
+- Search box `#q`, right end of row two, grows: accepts npub / 64-hex / domain; routes to
   `/profile?npub=` or `/domain?d=` by what was typed. Invalid input sets a plain status
   line and navigates nowhere. A domain typed here navigates; it NEVER bans.
   Focused by Ctrl-K / Cmd-K (`keydown`, `preventDefault`, in `common86.js`, once).
-- Theme button, right, inside the header (not `position:fixed`). Cycle auto→light→dark→auto;
-  glyphs ☀/☾ only, auto shows the OS-resolved glyph via `matchMedia`, live `change`
-  listener; `title`+`aria-label` state current AND next. Store `strfry86_theme` =
-  `"light"|"dark"`; absence IS auto. Anti-flash inline `<script>` at top of `<head>`
-  applies a stored override before first paint — duplicated per page, deliberately.
-- Nav links after the logo, same order everywhere: home · stats · userlist · report ·
+- Theme button, right end of row one, inside the header (not `position:fixed`). Cycle
+  auto→light→dark→auto; glyphs ☀/☾ only, auto shows the OS-resolved glyph via
+  `matchMedia`, live `change` listener; `title`+`aria-label` state current AND next.
+  Store `strfry86_theme` = `"light"|"dark"`; absence IS auto. Anti-flash inline `<script>`
+  at top of `<head>` applies a stored override before first paint — duplicated per page,
+  deliberately. It sets `color-scheme`, which is also what every `light-dark()` token in
+  the style block reads, so one write themes the whole page before first paint.
+- Nav tabs, row two, same order everywhere: home · stats · userlist · report ·
   authors · bans · audit.
 
 ## Pages
@@ -176,6 +196,7 @@ line contains an `<input>`. `report.html` DOM has no checkbox and no set-bound h
 Empty authors page: both buttons, `recent` checked, duration sourced from `modes`.
 Console: a `delete` verb is refused and nothing executes. Userlist: saturated gift-wrap
 cell renders `≥`. `/home` logged-out DOM contains no npub and no profile link.
+Style block byte-identical across all nine pages (`tools/stamp_style.py --check`).
 
 ## Reference (2026-07-30, this relay; every figure states DB-wide vs window)
 

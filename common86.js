@@ -37,12 +37,15 @@ function s86SaveStored(key, arr, max) {
 }
 
 // --- theme toggle ------------------------------------------------------------
-// No custom colors anywhere in this project — every page is unstyled
-// browser-default HTML, which is exactly what makes this safe: setting
-// `color-scheme` only tells the browser which of ITS OWN tested light/dark
-// palettes to use for the default background, text, form controls, and
-// links. We never choose a color, so we never get one wrong; readability
-// is the browser's own guarantee, not something recomputed here.
+// This toggle writes exactly ONE property, `color-scheme` on <html>, and it
+// is still the only thing in this file that knows anything about appearance.
+// The pages used to be unstyled browser-default HTML, so that one property
+// picked between the browser's OWN tested light and dark palettes. They are
+// painted now, but the pivot did not move: every colour in the style block is
+// a `light-dark(light, dark)` token, and `light-dark()` resolves against the
+// same `color-scheme` value written here. So there is still one switch, still
+// two palettes, and still no colour chosen in JavaScript — a page that sets a
+// colour from script is a bug, because it will not follow this toggle.
 //
 // 'auto' (the default, nothing stored) leaves `color-scheme: light dark`
 // from the page's own <style> in effect, which follows the OS/browser dark
@@ -121,12 +124,28 @@ function s86WireThemeToggle(buttonEl) {
 
 // --- generic DOM / formatting helpers ---------------------------------------
 
-function s86El(tag, text) {
+// className is optional and purely presentational — 'mono' for hex/npub/id
+// cells, 'badge' for kind chips, 'muted' for secondary text. Callers that
+// pass two arguments behave exactly as before.
+function s86El(tag, text, className) {
   var el = document.createElement(tag);
   if (text != null) {
     el.textContent = text;
   }
+  if (className) {
+    el.className = className;
+  }
   return el;
+}
+
+// A status pill with a leading dot: live (green) or its off state (muted).
+// Used wherever a page has a continuously-updating source, so "this number is
+// moving" is visible without reading the age line under it.
+function s86BuildPill(label, isLive) {
+  var pill = s86El('span', null, isLive ? 'pill live' : 'pill');
+  pill.appendChild(s86El('span', null, 'dot'));
+  pill.appendChild(document.createTextNode(label));
+  return pill;
 }
 
 function s86FormatDate(unixSeconds) {
@@ -338,11 +357,53 @@ function s86BuildPageChrome(statusEl) {
   var header = document.createElement('header');
   header.id = 's86';
 
+  // Two rows, same ingredients in the same order on every page: the brand row
+  // carries the wordmark and the two account controls, the bar below it
+  // carries the nav tabs and the search box. The current page's tab is the
+  // only thing that differs between pages, and it differs by attribute
+  // (aria-current) rather than by markup, so the header still renders
+  // identically everywhere the CSS is identical.
+  var brand = document.createElement('div');
+  brand.className = 'brand';
+  header.appendChild(brand);
+
   var logo = document.createElement('a');
   logo.className = 'logo';
   logo.href = '/home';
   logo.textContent = 'strfry-86';
-  header.appendChild(logo);
+  brand.appendChild(logo);
+
+  brand.appendChild(s86El('span', 'Relay sidecar — admin console', 'tagline'));
+  brand.appendChild(s86El('span', null, 'spacer'));
+
+  var loginBtn = document.createElement('button');
+  loginBtn.type = 'button';
+  loginBtn.id = 'login-btn';
+  loginBtn.textContent = 'Login with extension';
+  brand.appendChild(loginBtn);
+
+  var themeBtn = document.createElement('button');
+  themeBtn.type = 'button';
+  themeBtn.id = 'theme-btn';
+  brand.appendChild(themeBtn);
+  s86WireThemeToggle(themeBtn);
+
+  var bar = document.createElement('div');
+  bar.className = 'bar';
+  header.appendChild(bar);
+
+  var here = window.location.pathname;
+  var nav = document.createElement('nav');
+  S86_NAV_LINKS.forEach(function (pair) {
+    var a = document.createElement('a');
+    a.href = pair[1];
+    a.textContent = pair[0];
+    if (here === pair[1]) {
+      a.setAttribute('aria-current', 'page');
+    }
+    nav.appendChild(a);
+  });
+  bar.appendChild(nav);
 
   var searchInput = document.createElement('input');
   searchInput.type = 'search';
@@ -355,31 +416,7 @@ function s86BuildPageChrome(statusEl) {
       s86NavigateSearchInput(searchInput.value, statusEl);
     }
   });
-  header.appendChild(searchInput);
-
-  var nav = document.createElement('nav');
-  S86_NAV_LINKS.forEach(function (pair, i) {
-    if (i > 0) {
-      nav.appendChild(document.createTextNode(' · '));
-    }
-    var a = document.createElement('a');
-    a.href = pair[1];
-    a.textContent = pair[0];
-    nav.appendChild(a);
-  });
-  header.appendChild(nav);
-
-  var loginBtn = document.createElement('button');
-  loginBtn.type = 'button';
-  loginBtn.id = 'login-btn';
-  loginBtn.textContent = 'Login with extension';
-  header.appendChild(loginBtn);
-
-  var themeBtn = document.createElement('button');
-  themeBtn.type = 'button';
-  themeBtn.id = 'theme-btn';
-  header.appendChild(themeBtn);
-  s86WireThemeToggle(themeBtn);
+  bar.appendChild(searchInput);
 
   document.addEventListener('keydown', function (evt) {
     if (!(evt.metaKey || evt.ctrlKey)) {
