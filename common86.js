@@ -248,13 +248,16 @@ function s86CopyTextFallback(text) {
 // profile page to open, and the full npub is what they need to paste elsewhere.
 function s86BuildIdentityCell(row, linkIt) {
   var td = s86El('td', null, 'identity');
-  td.appendChild(s86BuildIdentityDot(row.pubkey));
+  // Flex lives on this inner row, never on the <td> — display:flex on a
+  // table-cell breaks border alignment with the rest of the row.
+  var idrow = s86El('span', null, 'idrow');
+  idrow.appendChild(s86BuildIdentityDot(row.pubkey));
   var label = row.name || row.nip05 || (row.npub ? s86ShortKey(row.npub) : '—');
   if (linkIt && row.npub && row.pubkey) {
     var a = s86NpubLink(row.npub, row.pubkey, true);
     a.textContent = label;
     a.title = row.npub;
-    td.appendChild(a);
+    idrow.appendChild(a);
   } else {
     var span = s86El('span', label);
     if (row.npub) {
@@ -295,8 +298,9 @@ function s86BuildIdentityCell(row, linkIt) {
         }
       });
     }
-    td.appendChild(span);
+    idrow.appendChild(span);
   }
+  td.appendChild(idrow);
   return td;
 }
 

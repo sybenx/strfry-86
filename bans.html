@@ -84,9 +84,16 @@ button.chip.cmd:hover { background:var(--ink); color:var(--paper); }
 .profile-head .profile-id { flex:1; min-width:0; }
 .profile-head .profile-id > * { margin:.25rem 0; }
 .profile-head h2 { font-size:1.5rem; margin:0; }
-td.identity { display:flex; align-items:center; gap:.5em; white-space:nowrap;
-              max-width:15em; }
-td.identity > :last-child { overflow:hidden; text-overflow:ellipsis; }
+/* Identity stays a real table-cell. display:flex on the <td> itself took it
+   out of table layout, so its border-bottom sat at a different height from
+   every sibling cell after the avatar was replaced by a small colour dot.
+   Flex lives on the inner .idrow; the cell keeps vertical-align so the
+   divider line is one continuous rule across the row. */
+td.identity { max-width:15em; white-space:nowrap; vertical-align:middle; }
+td.identity .idrow { display:flex; align-items:center; gap:.4em; min-width:0;
+                     line-height:1.2; }
+td.identity .idrow > :last-child { overflow:hidden; text-overflow:ellipsis;
+                                   min-width:0; }
 td.num { font-family:var(--mono); font-size:.9em; }
 td.num.bad { color:var(--accent); }
 td.pick { width:1.5em; }
