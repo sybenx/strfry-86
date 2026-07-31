@@ -6,12 +6,19 @@ configured port is already taken, this process exits 0 silently, so repeated
 spawns from the plugin are harmless.
 
 Routes:
-  GET  /                  -> bans.html (public ban list)
+  GET  /                  -> 302 redirect to /home
+  GET  /home              -> home.html (public live activity feed)
+  GET  /stats             -> stats.html (totals, live delta, console)
+  GET  /report            -> report.html (admin-only cached-scan results page)
   GET  /authors           -> authors.html (admin-only active-author page)
+  GET  /userlist          -> userlist.html (admin member table)
+  GET  /audit             -> audit.html (server-side admin action log)
+  GET  /bans              -> bans.html (public ban list + admin ban UI)
   GET  /profile           -> profile.html (admin-only single-pubkey detail page)
   GET  /domain            -> domain.html (admin-only nip-05 domain roster page)
-  GET  /report            -> report.html (admin-only cached-scan results page)
   GET  /common86.js       -> shared client JS for all pages
+  GET  /api/live          -> text/event-stream: one shared strfry poll loop fanned
+                             out as deltas (new events, kind-5 deletes) to /home & /stats
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
   POST /api/authors/scan  -> NIP-98 authenticated: run exactly one bounded scan
@@ -30,6 +37,11 @@ Routes:
   POST /api/profile/new   -> NIP-98 authenticated: events newer than a given time, bounded
   POST /api/pubkeys/lookup -> NIP-98 authenticated: what's known about a domain's roster
   POST /api/names         -> NIP-98 authenticated: intake for externally-verified profile names
+  GET  /api/reports       -> public read of the last kind-1984-per-p-tag tally (never scans)
+  POST /api/reports       -> NIP-98 authenticated: run exactly one bounded scan
+  POST /api/console       -> NIP-98 authenticated: run one CONSOLE_VERBS-allowlisted command
+  GET  /api/audit         -> paged read of the server-side admin-action log
+  POST /api/undo          -> NIP-98 authenticated: undo one audit record by id
 """
 
 import calendar
@@ -37,6 +49,7 @@ import errno
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -44,7 +57,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -58,6 +71,7 @@ AUTHORS_CACHE_PATH = os.path.join(SCRIPT_DIR, "authors-cache.json")
 RECIPIENTS_CACHE_PATH = os.path.join(SCRIPT_DIR, "recipients-cache.json")
 SUBSCRIBERS_CACHE_PATH = os.path.join(SCRIPT_DIR, "subscribers-cache.json")
 REPORT_CACHE_PATH = os.path.join(SCRIPT_DIR, "report-cache.json")
+REPORTS_CACHE_PATH = os.path.join(SCRIPT_DIR, "reports-cache.json")
 # dockurr/strfry ships the binary at /app/strfry, which is NOT on PATH for a
 # detached process; the official image installs to /usr/local/bin.
 STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfry", "/strfry")
@@ -67,11 +81,15 @@ STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfr
 # path traversal is not mitigated here, it is impossible. config.json and
 # blacklist.json sit next to these files and must never be reachable.
 STATIC_ROUTES = {
-    "/": ("bans.html", "text/html; charset=utf-8"),
+    "/home": ("home.html", "text/html; charset=utf-8"),
+    "/stats": ("stats.html", "text/html; charset=utf-8"),
+    "/report": ("report.html", "text/html; charset=utf-8"),
     "/authors": ("authors.html", "text/html; charset=utf-8"),
+    "/userlist": ("userlist.html", "text/html; charset=utf-8"),
+    "/audit": ("audit.html", "text/html; charset=utf-8"),
+    "/bans": ("bans.html", "text/html; charset=utf-8"),
     "/profile": ("profile.html", "text/html; charset=utf-8"),
     "/domain": ("domain.html", "text/html; charset=utf-8"),
-    "/report": ("report.html", "text/html; charset=utf-8"),
     "/common86.js": ("common86.js", "application/javascript"),
 }
 
@@ -125,6 +143,12 @@ FIGURE_HEAD_MAX = 10             # ranked rows shown before the tail is summaris
 # --- allowlist audit: size and actionability are separate questions -------
 GAP_NOTICE_SHARE = 0.02         # gap worth a sentence, never an alarm on its own
 KIND_ALARM_SHARE = 0.005        # ONE unlisted kind this big is the actionable alarm
+# --- stats console (read-only) ---------------------------------------------
+CONSOLE_VERBS = ("scan", "info", "export")  # --count/read-only; all else refused
+# --- live layer: one shared strfry poll fanned out over SSE ----------------
+LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
+LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
+LIVE_RECENT_MAX = RENDER_MAX    # events kept in the shared ring buffer for new SSE clients
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
@@ -369,6 +393,276 @@ def run_strfry_scan(filter_obj, timeout=SCAN_TIMEOUT):
     return events
 
 
+# --- live layer: one shared strfry poll loop fanned out over SSE -----------
+# A single background thread polls `strfry scan {"since": ...}` on an
+# interval and keeps a small ring buffer plus running deltas that every
+# connected /home and /stats tab reads from the SAME state — N open tabs
+# cost ONE poll loop, never N (WHY.md §6). This is a delta layer only: a
+# freshly connected client renders nothing until the next tick finds
+# something new (rule 9's progressive fill, never a history replay), and a
+# poll failure just retries on the next tick from the same cursor rather
+# than trying to patch through the gap it missed. The numeric delta (+N
+# events, -M deletes) is always relative to the freshest report totals/walk
+# `scanned_at` — the moment an admin presses either report button, that
+# scan's own count becomes the new baseline and the delta resets to zero,
+# which is what "figures = last cache PLUS live deltas since" means in
+# practice. Kind-5 events increment `deletes` but are also counted once in
+# `new_events`, matching stats.html's own "+N events, -M deletes" wording.
+
+_live_lock = threading.Lock()
+_live_since = int(time.time())      # poll cursor: only events at/after this are new
+_live_seen_at_since = set()         # ids already counted AT exactly _live_since (dedup)
+_live_delta_baseline_at = None      # scanned_at this delta count is relative to
+_live_new_events = 0
+_live_deletes = 0
+_live_recent = []                   # ring buffer for /home, capped at LIVE_RECENT_MAX
+_live_error = None
+_live_subscribers = []              # list of queue.Queue, one per open SSE connection
+
+
+def _live_current_baseline_at():
+    """The freshest totals/walk scanned_at, or None before either has ever
+    run — the anchor the live delta counts forward from."""
+    with _scan_lock:
+        totals_at = _report_cache["totals"].get("scanned_at")
+        walk_at = _report_cache["walk"].get("scanned_at")
+    candidates = [t for t in (totals_at, walk_at) if t is not None]
+    return max(candidates) if candidates else None
+
+
+def _live_broadcast(msg):
+    with _live_lock:
+        subs = list(_live_subscribers)
+    for q in subs:
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            with _live_lock:
+                if q in _live_subscribers:
+                    _live_subscribers.remove(q)
+
+
+def _live_state_snapshot():
+    with _live_lock:
+        return {
+            "new_events": _live_new_events, "deletes": _live_deletes,
+            "baseline_at": _live_delta_baseline_at, "events": list(_live_recent),
+            "error": _live_error, "at": int(time.time()),
+        }
+
+
+def _live_poll_tick():
+    """One poll cycle: re-anchor the delta baseline if a report scan just
+    completed, then read events newer than the cursor and fold them into
+    the shared ring buffer and counters. Always broadcasts, even with zero
+    new events, so the SSE stream itself is the heartbeat."""
+    global _live_since, _live_seen_at_since, _live_delta_baseline_at
+    global _live_new_events, _live_deletes, _live_error
+
+    baseline_at = _live_current_baseline_at()
+    with _live_lock:
+        if baseline_at != _live_delta_baseline_at:
+            _live_delta_baseline_at = baseline_at
+            _live_new_events = 0
+            _live_deletes = 0
+            if baseline_at is not None and baseline_at > _live_since:
+                _live_since = baseline_at
+                _live_seen_at_since = set()
+
+    try:
+        events = run_strfry_scan({"since": _live_since, "limit": LIVE_POLL_LIMIT}, timeout=SCAN_TIMEOUT)
+    except Exception as e:
+        with _live_lock:
+            _live_error = f"{type(e).__name__}: {e}"[:300]
+        _live_broadcast(_live_state_snapshot())
+        return
+
+    events.sort(key=lambda ev: ev.get("created_at") or 0)
+    with _live_lock:
+        _live_error = None
+        new_high_water = _live_since
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            eid, kind, created_at = ev.get("id"), ev.get("kind"), ev.get("created_at")
+            if not isinstance(eid, str) or not isinstance(kind, int) or not isinstance(created_at, int):
+                continue
+            if created_at < _live_since:
+                continue
+            if created_at == _live_since and eid in _live_seen_at_since:
+                continue
+            row = {"id": eid, "kind": kind, "created_at": created_at}
+            _live_recent.append(row)
+            _live_new_events += 1
+            if kind == 5:
+                _live_deletes += 1
+            if created_at > new_high_water:
+                new_high_water = created_at
+                _live_seen_at_since = {eid}
+            elif created_at == new_high_water:
+                _live_seen_at_since.add(eid)
+        _live_since = new_high_water
+        del _live_recent[:-LIVE_RECENT_MAX]
+
+    _live_broadcast(_live_state_snapshot())
+
+
+def _live_poll_loop():
+    while True:
+        try:
+            _live_poll_tick()
+        except Exception as e:
+            log(f"server86: live poll tick failed: {type(e).__name__}: {e}")
+        time.sleep(LIVE_POLL_INTERVAL)
+
+
+def live_subscribe():
+    """Register one SSE connection's queue and return (queue, initial_state).
+    The initial state carries the WHOLE ring buffer so a freshly opened tab
+    renders immediately rather than waiting out LIVE_POLL_INTERVAL."""
+    q = queue.Queue(maxsize=64)
+    with _live_lock:
+        _live_subscribers.append(q)
+    return q, _live_state_snapshot()
+
+
+def live_unsubscribe(q):
+    with _live_lock:
+        if q in _live_subscribers:
+            _live_subscribers.remove(q)
+
+
+def get_stats_snapshot():
+    """Stats page's initial (pre-SSE) payload: cached walk/totals plus the
+    live layer's CURRENT in-memory delta — an O(1) dict read, never a fresh
+    scan, since the shared poll loop already keeps this up to date."""
+    report = get_report_status()
+    live = _live_state_snapshot()
+    return {
+        "totals": report.get("totals"),
+        "walk": report.get("walk"),
+        "baseline_at": live["baseline_at"],
+        "new_events": live["new_events"],
+        "deletes": live["deletes"],
+        "live_error": live["error"],
+        "live_at": live["at"],
+    }
+
+
+def get_userlist_snapshot():
+    """Join authors cache + recipients cache + reports cache for the
+    Userlist page. Never starts a scan. Missing fields stay null so the
+    client can render — rather than inventing zeros. `giftwrap_count` is a
+    FLOOR (render `≥ n`, rule per CLAUDE.md) whenever the recipients scan is
+    saturated — RECIPIENT_SCAN_LIMIT is reached routinely (WHY.md §5), so
+    this is the common case, not an edge case."""
+    authors_status = get_authors_status()
+    recipients_status = get_recipients_status()
+    reports_status = get_reports_status()
+    authors = authors_status.get("authors") or []
+    recipients = recipients_status.get("recipients") or []
+    recipient_counts = {r["pubkey"]: r.get("count") for r in recipients if isinstance(r, dict) and r.get("pubkey")}
+    recipients_saturated = bool(recipients_status.get("saturated"))
+    recipients_scanned_at = recipients_status.get("scanned_at")
+    report_counts = reports_status.get("counts") or {}
+    rows = []
+    for a in authors:
+        if not isinstance(a, dict) or not a.get("pubkey"):
+            continue
+        pk = a["pubkey"]
+        rows.append({
+            "pubkey": pk,
+            "npub": a.get("npub"),
+            "name": a.get("name"),
+            "nip05": a.get("nip05"),
+            "event_count": a.get("count"),
+            "giftwrap_count": recipient_counts.get(pk),
+            "reporters": report_counts.get(pk),
+        })
+    return {
+        "rows": rows,
+        "authors_scanned_at": authors_status.get("scanned_at"),
+        "authors_error": authors_status.get("error"),
+        "authors_modes": authors_status.get("modes"),
+        "recipients_scanned_at": recipients_scanned_at,
+        "recipients_saturated": recipients_saturated,
+        "recipients_error": recipients_status.get("error"),
+        "reports_scanned_at": reports_status.get("scanned_at"),
+        "reports_error": reports_status.get("error"),
+    }
+
+
+# --- stats console (Stats page) ---------------------------------------------
+# CONSOLE_VERBS names the whole allowlist — never shell=True, argv is
+# reconstructed from a validated command string. `scan`, `info`, and
+# `export` are the only strfry subcommands that cannot mutate the database
+# regardless of what flags follow them (unlike `sync`, `import`, `router`,
+# or `delete`), so the check IS the verb allowlist; there is no per-verb
+# required-flag table left to maintain. A free command box would make every
+# guard elsewhere in this project decorative (WHY.md §5) — read-only verbs
+# give the live-debugging value without reopening that hole.
+
+CONSOLE_TIMEOUT = 30
+
+
+def validate_console_command(raw):
+    """Return (argv, error). argv is a list suitable for subprocess without
+    a shell; error is a human reason when refused."""
+    if not isinstance(raw, str):
+        return None, "command must be a string"
+    text = raw.strip()
+    if not text:
+        return None, "empty command"
+    if len(text) > 2000:
+        return None, "command too long"
+    # naive split on whitespace — filters are JSON and must not contain
+    # unescaped spaces the operator didn't type; this is deliberate
+    # vs shlex so we never expand quotes into a shell.
+    parts = text.split()
+    if not parts:
+        return None, "empty command"
+    verb = parts[0]
+    if verb == "strfry":
+        parts = parts[1:]
+        if not parts:
+            return None, "missing strfry subcommand"
+        verb = parts[0]
+    if verb not in CONSOLE_VERBS:
+        return None, (
+            f"refused: '{verb}' is not on the read-only allowlist "
+            f"(allowed: {', '.join(CONSOLE_VERBS)})"
+        )
+    return ["strfry", "--config", STRFRY_CONF_PATH] + parts, None
+
+
+def run_console_command(raw):
+    """Run one CONSOLE_VERBS-allowlisted strfry command; return a
+    JSON-serialisable result."""
+    argv, err = validate_console_command(raw)
+    if err:
+        return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "", "exit_code": None}
+    try:
+        strfry_bin = require_strfry_bin()
+        argv = [strfry_bin] + argv[1:]  # replace literal 'strfry' with discovered path
+        result = subprocess.run(
+            argv, cwd=get_relay_cwd(), capture_output=True, timeout=CONSOLE_TIMEOUT
+        )
+        return {
+            "ok": result.returncode == 0,
+            "error": None if result.returncode == 0 else f"exit {result.returncode}",
+            "argv": argv,
+            "stdout": result.stdout.decode("utf-8", errors="replace")[-8000:],
+            "stderr": result.stderr.decode("utf-8", errors="replace")[-4000:],
+            "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timed out after {CONSOLE_TIMEOUT}s", "argv": argv,
+                "stdout": "", "stderr": "", "exit_code": None}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:600], "argv": argv,
+                "stdout": "", "stderr": "", "exit_code": None}
+
+
 def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
     """Run `strfry scan --count <filter>` and return the integer count.
     `--count` walks the index without streaming bodies, so it is cheap
@@ -581,6 +875,69 @@ def _load_cache_or(path, empty_result):
     except (OSError, ValueError):
         pass
     return dict(empty_result)
+
+
+# --- server-side audit log -------------------------------------------------
+AUDIT_LOG_PATH = os.path.join(SCRIPT_DIR, "audit-log.json")
+AUDIT_LOG_MAX = 500
+
+
+def _empty_audit_log():
+    return {"records": []}
+
+
+_audit_lock = threading.Lock()
+_audit_log = _load_cache_or(AUDIT_LOG_PATH, _empty_audit_log())
+if not isinstance(_audit_log.get("records"), list):
+    _audit_log = _empty_audit_log()
+
+
+def audit_append(record):
+    """Append one admin-action record and persist. Caps at AUDIT_LOG_MAX."""
+    if not isinstance(record, dict):
+        return
+    rec = dict(record)
+    rec.setdefault("id", f"{int(time.time() * 1000)}-{os.urandom(3).hex()}")
+    rec.setdefault("at", int(time.time()))
+    rec.setdefault("undone", False)
+    with _audit_lock:
+        records = list(_audit_log.get("records") or [])
+        records.append(rec)
+        if len(records) > AUDIT_LOG_MAX:
+            records = records[-AUDIT_LOG_MAX:]
+        _audit_log["records"] = records
+        try:
+            _save_cache_atomic(AUDIT_LOG_PATH, _audit_log)
+        except OSError as e:
+            log(f"server86: failed to persist audit-log.json: {e}")
+
+
+def get_audit_records(query=None):
+    q = (query or "").strip().lower()
+    with _audit_lock:
+        records = list(_audit_log.get("records") or [])
+    records.reverse()  # newest first
+    if not q:
+        return records
+    out = []
+    for r in records:
+        blob = json.dumps(r, separators=(",", ":"), ensure_ascii=False).lower()
+        if q in blob:
+            out.append(r)
+    return out
+
+
+def audit_mark_undone(record_id):
+    with _audit_lock:
+        for r in _audit_log.get("records") or []:
+            if r.get("id") == record_id:
+                r["undone"] = True
+                try:
+                    _save_cache_atomic(AUDIT_LOG_PATH, _audit_log)
+                except OSError as e:
+                    log(f"server86: failed to persist audit-log.json: {e}")
+                return dict(r)
+    return None
 
 
 def _make_progress_cb(job):
@@ -1017,6 +1374,59 @@ def start_recipients_scan():
 
 def get_recipients_status():
     return _scan_status("recipients", _recipients_job, _recipients_cache)
+
+
+# --- kind-1984 reports, tallied per reported pubkey -------------------------
+# Userlist's "reports by others" column: one bounded scan of recent kind-1984
+# events, tallied by DISTINCT reporter per p-tag (a pubkey reported five
+# times by the same account is one report, not five) — the same shape as the
+# reports sub-tally inside compute_authors, kept as its OWN cached scan
+# rather than shared, since userlist must render this column even before an
+# author scan has ever run.
+
+def _empty_reports_result():
+    return {
+        "scanned_at": None, "events_read": 0, "saturated": False,
+        "warning": None, "error": None, "counts": {},
+    }
+
+
+def compute_reports(progress_cb=None):
+    if progress_cb:
+        progress_cb(0, total=REPORT_SCAN_LIMIT)
+    reporters_by_pubkey = {}
+    events = run_strfry_scan({"kinds": [1984], "limit": REPORT_SCAN_LIMIT}, timeout=SCAN_TIMEOUT)
+    for ev in events:
+        reporter = ev.get("pubkey")
+        tags = ev.get("tags")
+        if not isinstance(reporter, str) or not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p" and isinstance(tag[1], str):
+                reporters_by_pubkey.setdefault(tag[1], set()).add(reporter)
+    return {
+        "scanned_at": int(time.time()),
+        "events_read": len(events),
+        "saturated": len(events) >= REPORT_SCAN_LIMIT,
+        "warning": None,
+        "error": None,
+        "counts": {pk: len(reporters) for pk, reporters in reporters_by_pubkey.items()},
+    }
+
+
+_reports_job = {"status": "idle", "started_at": None, "progress": None, "total": None, "rate": None, "eta": None}
+_reports_cache = _load_cache_or(REPORTS_CACHE_PATH, _empty_reports_result())
+_JOB_REGISTRY["reports"] = _reports_job
+
+
+def start_reports_scan():
+    def run():
+        _run_scan_job("reports", _reports_job, _reports_cache, REPORTS_CACHE_PATH, compute_reports)
+    return _start_scan_job("reports", _reports_job, run)
+
+
+def get_reports_status():
+    return _scan_status("reports", _reports_job, _reports_cache)
 
 
 # --- DM / general relay-list subscriber search -----------------------------
@@ -2087,8 +2497,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_sse(self, msg):
+        self.wfile.write(("event: live\ndata: " + json.dumps(msg) + "\n\n").encode("utf-8"))
+        self.wfile.flush()
+
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/home")
+            self.end_headers()
+            return
 
         if path in STATIC_ROUTES:
             filename, content_type = STATIC_ROUTES[path]
@@ -2104,6 +2526,59 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if path == "/api/live":
+            # One shared poll loop, fanned out: this connection just
+            # registers a queue and relays whatever _live_poll_loop
+            # broadcasts, plus a heartbeat comment when nothing has arrived
+            # in a while so an idle proxy doesn't time the connection out.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            q, initial = live_subscribe()
+            try:
+                self._send_sse(initial)
+                while True:
+                    try:
+                        msg = q.get(timeout=LIVE_POLL_INTERVAL * 3)
+                    except queue.Empty:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    self._send_sse(msg)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                live_unsubscribe(q)
+            return
+
+        if path == "/api/stats":
+            self._send_json(200, get_stats_snapshot())
+            return
+
+        if path == "/api/userlist":
+            self._send_json(200, get_userlist_snapshot())
+            return
+
+        if path == "/api/reports":
+            self._send_json(200, get_reports_status())
+            return
+
+        if path == "/api/audit":
+            q = (query.get("q") or [""])[0]
+            try:
+                offset = max(0, int((query.get("offset") or ["0"])[0]))
+            except ValueError:
+                offset = 0
+            records = get_audit_records(q)
+            page = records[offset:offset + RENDER_MAX]
+            self._send_json(200, {
+                "records": page, "total": len(records),
+                "offset": offset, "limit": RENDER_MAX,
+            })
             return
 
         if path == "/api/banned":
@@ -2171,7 +2646,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/unban", "/api/ban", "/api/authors/scan", "/api/names",
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
             "/api/profile/day", "/api/profile/new", "/api/pubkeys/lookup", "/api/report/totals",
-            "/api/report/walk", "/api/relay-url",
+            "/api/report/walk", "/api/relay-url", "/api/reports",
+            "/api/console", "/api/undo",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -2237,12 +2713,107 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(202, status)
             return
 
+        if path == "/api/reports":
+            status = start_reports_scan()
+            self._send_json(202, status)
+            return
+
+        if path == "/api/console":
+            raw_cmd = body.get("command")
+            result = run_console_command(raw_cmd if isinstance(raw_cmd, str) else "")
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/undo":
+            record_id = body.get("id")
+            if not isinstance(record_id, str) or not record_id:
+                self._send_json(400, {"error": "missing audit record id"})
+                return
+            with _audit_lock:
+                found = None
+                for r in _audit_log.get("records") or []:
+                    if r.get("id") == record_id:
+                        found = dict(r)
+                        break
+            if found is None:
+                self._send_json(404, {"error": "audit record not found"})
+                return
+            if found.get("undone"):
+                self._send_json(400, {"error": "already undone"})
+                return
+            rtype = found.get("type")
+            pubkeys = found.get("pubkeys") or []
+            if rtype == "ban":
+                removed = blacklist.remove(pubkeys)
+                audit_mark_undone(record_id)
+                audit_append({
+                    "type": "unban", "actor": auth.get("pubkey"),
+                    "pubkeys": removed, "via": "audit-undo", "undo_of": record_id,
+                })
+                self._send_json(200, {"ok": True, "removed": removed})
+                return
+            if rtype == "unban":
+                now = int(time.time())
+                added = []
+                for pk in pubkeys:
+                    if not is_hex64(pk):
+                        continue
+                    reason = ""
+                    for e in (found.get("entries") or []):
+                        if e.get("pubkey") == pk:
+                            reason = e.get("reason") or ""
+                            break
+                    if blacklist.add(
+                        pk, banned_at=now, report_event_id=None, reason=reason,
+                        report_type="manual", admin_pubkey_hex=cfg["admin_pubkey_hex"],
+                    ):
+                        added.append(pk)
+                audit_mark_undone(record_id)
+                audit_append({
+                    "type": "ban", "actor": auth.get("pubkey"),
+                    "pubkeys": added, "via": "audit-undo", "undo_of": record_id,
+                })
+                self._send_json(200, {"ok": True, "added": added})
+                return
+            if rtype == "reason":
+                # Restore prior reasons from the snapshot when present.
+                entries = found.get("entries") or []
+                if not entries:
+                    self._send_json(400, {"error": "undo unavailable for this reason record"})
+                    return
+                restored = 0
+                for e in entries:
+                    pk = e.get("pubkey")
+                    old = e.get("old_reason")
+                    if not is_hex64(pk):
+                        continue
+                    blacklist.set_reasons([pk], old or "", "replace", now=int(time.time()))
+                    restored += 1
+                audit_mark_undone(record_id)
+                self._send_json(200, {"ok": True, "restored": restored})
+                return
+            self._send_json(400, {"error": f"cannot undo type {rtype!r}"})
+            return
+
         if path == "/api/reason":
             pubkeys, reason, mode, err = validate_reason_request(body)
             if err:
                 self._send_json(400, {"error": err})
                 return
             updated, skipped = blacklist.set_reasons(pubkeys, reason, mode, now=int(time.time()))
+            if updated:
+                audit_append({
+                    "type": "reason",
+                    "actor": auth.get("pubkey"),
+                    "pubkeys": [u["pubkey"] for u in updated],
+                    "reason": reason,
+                    "mode": mode,
+                    "entries": [
+                        {"pubkey": u["pubkey"], "old_reason": u.get("old_reason")}
+                        for u in updated[:REASON_UNDO_MAX]
+                    ] if len(updated) <= REASON_UNDO_MAX else None,
+                    "count": len(updated),
+                })
             self._send_json(200, {"ok": True, "updated": updated, "skipped": skipped})
             return
 
@@ -2344,7 +2915,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "malformed pubkeys list"})
                 return
 
+            # Snapshot ban rows before removal so audit undo can re-ban.
+            data = blacklist.load()
+            entries_snap = []
+            for pk in pubkeys:
+                info = data.get(pk) or {}
+                entries_snap.append({
+                    "pubkey": pk,
+                    "reason": info.get("reason") or "",
+                })
             removed = blacklist.remove(pubkeys)
+            if removed:
+                audit_append({
+                    "type": "unban",
+                    "actor": auth.get("pubkey"),
+                    "pubkeys": removed,
+                    "entries": [e for e in entries_snap if e["pubkey"] in set(removed)],
+                })
             self._send_json(200, {"ok": True, "removed": removed})
             return
 
@@ -2357,6 +2944,7 @@ class Handler(BaseHTTPRequestHandler):
         added = []
         skipped = []
         now = int(time.time())
+        reasons_by_pk = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 skipped.append(entry)
@@ -2384,9 +2972,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             if ok_added:
                 added.append(pubkey)
+                reasons_by_pk[pubkey] = reason
             else:
                 skipped.append(raw_pk)
 
+        if added:
+            audit_append({
+                "type": "ban",
+                "actor": auth.get("pubkey"),
+                "pubkeys": added,
+                "entries": [{"pubkey": pk, "reason": reasons_by_pk.get(pk, "")} for pk in added],
+            })
         self._send_json(200, {"ok": True, "added": added, "skipped": skipped})
 
 
@@ -2406,6 +3002,7 @@ def main():
         sys.exit(0)
 
     httpd.strfry86_config = cfg
+    threading.Thread(target=_live_poll_loop, daemon=True).start()
     log(f"server86: listening on {cfg['bind']}:{cfg['port']}")
     httpd.serve_forever()
 

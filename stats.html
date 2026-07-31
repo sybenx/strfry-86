@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
+<title>strfry-86 — stats</title>
+<style>
+body { max-width:40em; margin:0 auto; padding:0 1em; }
+li { overflow-wrap:anywhere; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere; }   /* commands only — WHY.md §2 */
+@media (max-width:600px){ body{ font-size:1.15em; } }
+:root { color-scheme: light dark; }
+body { background:Canvas; color:CanvasText; }           /* required — WHY.md §3 */
+header#s86 { position:sticky; top:0; background:Canvas; display:flex;
+             gap:1em; align-items:center; padding:.5em 0; }
+header#s86 a.logo { text-decoration:none; color:inherit; font-weight:bold; }
+header#s86 input#q { flex:1; min-width:8em; }
+</style>
+</head>
+<body>
+<h1>Stats</h1>
+<p id="status"></p>
+<p id="baseline-line"></p>
+<div id="totals-container"></div>
+<div id="kinds-container"></div>
+<div id="gap-container"></div>
+<div id="console-section" style="display:none">
+  <h2>Console</h2>
+  <p>Read-only verbs only: <code>scan</code>, <code>info</code>, <code>export</code>. Everything else is refused.</p>
+  <pre id="console-log"></pre>
+  <p>
+    <input id="console-input" type="text" size="50" placeholder="scan --count {}">
+    <button id="console-run" type="button">Run</button>
+  </p>
+</div>
+<script src="/common86.js"></script>
+<script>
+var KNOWN_KINDS = {
+  0: 'profile', 1: 'note', 5: 'deletion', 6: 'repost', 7: 'reaction',
+  1059: 'gift wrap', 1984: 'report', 9735: 'zap receipt',
+  10002: 'relay list', 10050: 'DM relay list', 30023: 'long-form'
+};
+var adminPubkey = null;
+var isAdmin = false;
+var lastTotals = null;
+var lastWalk = null;
+var lastBaselineAt = null;
+
+var statusEl = document.getElementById('status');
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
+var baselineLine = document.getElementById('baseline-line');
+var totalsContainer = document.getElementById('totals-container');
+var kindsContainer = document.getElementById('kinds-container');
+var gapContainer = document.getElementById('gap-container');
+var consoleSection = document.getElementById('console-section');
+var consoleLog = document.getElementById('console-log');
+var consoleInput = document.getElementById('console-input');
+var consoleRun = document.getElementById('console-run');
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function kindLabel(kind) {
+  return KNOWN_KINDS[kind] ? (kind + ' ' + KNOWN_KINDS[kind]) : String(kind);
+}
+
+// Baseline + delta model (CLAUDE.md "/stats"): figures are the last
+// walk/totals cache PLUS the live layer's running delta since that cache's
+// own scanned_at. Kind-5 deletes are shown alongside new events, never
+// netted into one number — strfry-internal NIP-40 expiry does NOT appear
+// here at all; only the next walk corrects for it.
+function renderBaselineLine(live) {
+  var totals = lastTotals;
+  var baselineAt = (totals && totals.scanned_at != null) ? totals.scanned_at
+    : (lastWalk && lastWalk.scanned_at != null ? lastWalk.scanned_at : null);
+  if (baselineAt == null) {
+    baselineLine.textContent = 'no walk/totals baseline yet — run a full database walk or refresh totals on Report to establish one.';
+    return;
+  }
+  var line = 'baseline ' + s86FormatDate(baselineAt) + ' (' + s86FormatRelativeAge(baselineAt) + ')';
+  if (live && live.baseline_at === baselineAt) {
+    var sign = live.new_events >= 0 ? '+' : '';
+    line += ' · ' + sign + live.new_events.toLocaleString() + ' events, -'
+      + live.deletes.toLocaleString() + ' deletes since';
+  }
+  if (live && live.error) {
+    line += ' — live layer could not run: ' + live.error;
+  }
+  baselineLine.textContent = line;
+}
+
+function renderStats(data) {
+  totalsContainer.textContent = '';
+  kindsContainer.textContent = '';
+  gapContainer.textContent = '';
+  lastTotals = data.totals;
+  lastWalk = data.walk;
+
+  var totals = data.totals;
+  if (totals && totals.scanned_at != null) {
+    var nonGw = totals.total_events - totals.giftwrap_events;
+    totalsContainer.appendChild(s86BuildKeyValueTable([
+      ['all events', totals.total_events, ''],
+      ['gift wraps', totals.giftwrap_events, (totals.giftwrap_share * 100).toFixed(1) + '% of all'],
+      ['non-gift-wrap', nonGw, ''],
+      ['— in allowlist', totals.allowlist_events, ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap'],
+      ['— not in allowlist', totals.gap_events, (totals.gap_share * 100).toFixed(1) + '% of non-gift-wrap']
+    ]));
+    if (totals.gap_level === 'stale') {
+      gapContainer.appendChild(s86El('p', 'allowlist alarm: a single unlisted kind is large enough to act on — see Report.'));
+    } else if (totals.gap_level === 'notice') {
+      gapContainer.appendChild(s86El('p', 'allowlist covers '
+        + ((1 - totals.gap_share) * 100).toFixed(1)
+        + '% of non-gift-wrap; remaining share is long-tail shaped (see Report walk).'));
+    } else if (totals.gap_level === 'ok') {
+      gapContainer.appendChild(s86El('p', 'allowlist covers '
+        + ((1 - totals.gap_share) * 100).toFixed(1) + '% of non-gift-wrap events.'));
+    }
+  }
+
+  var walk = data.walk;
+  if (walk && walk.kinds) {
+    var kindRows = Object.keys(walk.kinds).map(function (k) {
+      return [kindLabel(parseInt(k, 10)), walk.kinds[k]];
+    }).sort(function (a, b) { return b[1] - a[1]; });
+    if (kindRows.length) {
+      kindsContainer.appendChild(s86El('h2', 'Kinds (walk baseline)'));
+      kindsContainer.appendChild(s86BuildRankedFigureTable(kindRows, {
+        unit: 'kinds',
+        grandTotal: walk.events_read || null
+      }));
+    }
+    if (walk.expired_events != null) {
+      kindsContainer.appendChild(s86El('p', walk.expired_events.toLocaleString()
+        + ' expired events on disk (NIP-40) — a size figure, not an alarm; purge only via the walk-driven forms.'));
+    }
+  }
+
+  renderBaselineLine(null);
+}
+
+function loadStats() {
+  return fetch('/api/stats')
+    .then(function (res) { return res.json(); })
+    .then(renderStats)
+    .catch(function () { setStatus('failed to load stats'); });
+}
+
+function appendConsole(text) {
+  consoleLog.textContent = (consoleLog.textContent ? consoleLog.textContent + '\n' : '') + text;
+  consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+function runConsole() {
+  if (!isAdmin) {
+    return;
+  }
+  var cmd = consoleInput.value.trim();
+  if (!cmd) {
+    return;
+  }
+  appendConsole('> ' + cmd);
+  s86SignAndPost('/api/console', { command: cmd })
+    .then(function (result) {
+      var body = result.body || {};
+      if (body.error && !body.ok) {
+        appendConsole('refused/error: ' + body.error);
+      }
+      if (body.stdout) {
+        appendConsole(body.stdout);
+      }
+      if (body.stderr) {
+        appendConsole(body.stderr);
+      }
+      if (body.exit_code != null && body.ok) {
+        appendConsole('(exit ' + body.exit_code + ')');
+      }
+    })
+    .catch(function () {
+      appendConsole('request failed');
+    });
+}
+
+function onLogin() {
+  isAdmin = true;
+  consoleSection.style.display = '';
+  setStatus('logged in as admin');
+}
+
+s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+consoleRun.addEventListener('click', runConsole);
+consoleInput.addEventListener('keydown', function (evt) {
+  if (evt.key === 'Enter') {
+    evt.preventDefault();
+    runConsole();
+  }
+});
+
+fetch('/api/banned')
+  .then(function (res) { return res.json(); })
+  .then(function (data) {
+    adminPubkey = data.admin;
+    s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin);
+  })
+  .catch(function () {});
+
+loadStats();
+
+// Live layer: the shared SSE connection drives the delta line continuously.
+// If its baseline_at ever differs from what we last rendered (an admin
+// pressed refresh totals / run walk, here or on another tab), that means
+// the report cache moved — pull the new totals/walk record once rather
+// than trying to reconstruct it from deltas.
+s86ConnectLive(function (live) {
+  if (live.baseline_at !== lastBaselineAt) {
+    lastBaselineAt = live.baseline_at;
+    loadStats().then(function () { renderBaselineLine(live); });
+    return;
+  }
+  renderBaselineLine(live);
+}, function () {
+  setStatus('live layer disconnected — retrying');
+});
+</script>
+</body>
+</html>

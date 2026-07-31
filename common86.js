@@ -14,6 +14,7 @@ var S86_RECORDS_INLINE = 3;
 var S86_MAX_DISMISSED = 1000;
 var S86_REASON_UNDO_MAX = 50;
 var S86_FIGURE_HEAD_MAX = 10;   // ranked figure rows shown before the tail is summarised — mirrors FIGURE_HEAD_MAX in server86.py
+var S86_RENDER_MAX = 500;       // list rows rendered before truncation — mirrors RENDER_MAX in server86.py
 var S86_THEME_KEY = 'strfry86_theme';
 
 // --- localStorage helpers ---------------------------------------------------
@@ -72,8 +73,9 @@ function s86OsPrefersDark() {
   return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
 }
 
-// buttonEl: a <button> already in the DOM, moved to the top-right corner
-// by #theme-btn's rule in the shared <style> block. Cycles auto -> light
+// buttonEl: a <button> already in the DOM, at the right end of the shared
+// header (part of the flex layout in header#s86, not position:fixed).
+// Cycles auto -> light
 // -> dark -> auto on each press and persists the choice. The glyph (☀/☾)
 // always names the CURRENT resolved appearance and the hover text (title,
 // doubling as aria-label per this project's icon-button convention) names
@@ -266,6 +268,23 @@ function s86PubkeyInputToHex(raw) {
 // s86ValidateDomainInput used by the command generator's "fetch domain"
 // intent, so "asdf.com" typed here lands on that domain's own roster page
 // instead of erroring.
+function s86NavigateSearchInput(raw, statusEl) {
+  var hex = s86PubkeyInputToHex(raw);
+  if (hex) {
+    window.location.href = '/profile?hex=' + hex;
+    return true;
+  }
+  var domain = s86ValidateDomainInput(raw);
+  if (domain) {
+    window.location.href = '/domain?d=' + encodeURIComponent(domain);
+    return true;
+  }
+  if (statusEl) {
+    statusEl.textContent = 'enter a valid npub, hex pubkey, or domain';
+  }
+  return false;
+}
+
 function s86BuildProfileEntryField(statusEl) {
   var p = document.createElement('p');
 
@@ -282,17 +301,7 @@ function s86BuildProfileEntryField(statusEl) {
   btn.textContent = 'Go';
 
   function go() {
-    var hex = s86PubkeyInputToHex(input.value);
-    if (hex) {
-      window.location.href = '/profile?hex=' + hex;
-      return;
-    }
-    var domain = s86ValidateDomainInput(input.value);
-    if (domain) {
-      window.location.href = '/domain?d=' + encodeURIComponent(domain);
-      return;
-    }
-    statusEl.textContent = 'enter a valid npub, hex pubkey, or domain';
+    s86NavigateSearchInput(input.value, statusEl);
   }
 
   btn.addEventListener('click', go);
@@ -307,6 +316,121 @@ function s86BuildProfileEntryField(statusEl) {
   p.appendChild(document.createTextNode(' '));
   p.appendChild(btn);
   return p;
+}
+
+// --- page chrome (header + nav + search + theme) -------------------------
+// Fixed ingredients on every page per CLAUDE.md "Header — identical on
+// every page, same positions, always". Logo is clickable plain text (no
+// underline, inherits color). Search accepts npub / 64-hex / domain;
+// invalid input sets the status line only. Ctrl-K / Cmd-K focuses search.
+// Nav order is fixed; pages gate their own content when logged out.
+var S86_NAV_LINKS = [
+  ['home', '/home'],
+  ['stats', '/stats'],
+  ['userlist', '/userlist'],
+  ['report', '/report'],
+  ['authors', '/authors'],
+  ['bans', '/bans'],
+  ['audit', '/audit']
+];
+
+function s86BuildPageChrome(statusEl) {
+  var header = document.createElement('header');
+  header.id = 's86';
+
+  var logo = document.createElement('a');
+  logo.className = 'logo';
+  logo.href = '/home';
+  logo.textContent = 'strfry-86';
+  header.appendChild(logo);
+
+  var searchInput = document.createElement('input');
+  searchInput.type = 'search';
+  searchInput.id = 'q';
+  searchInput.placeholder = 'npub, hex, or domain';
+  searchInput.setAttribute('aria-label', 'search npub, hex, or domain');
+  searchInput.addEventListener('keydown', function (evt) {
+    if (evt.key === 'Enter') {
+      evt.preventDefault();
+      s86NavigateSearchInput(searchInput.value, statusEl);
+    }
+  });
+  header.appendChild(searchInput);
+
+  var nav = document.createElement('nav');
+  S86_NAV_LINKS.forEach(function (pair, i) {
+    if (i > 0) {
+      nav.appendChild(document.createTextNode(' · '));
+    }
+    var a = document.createElement('a');
+    a.href = pair[1];
+    a.textContent = pair[0];
+    nav.appendChild(a);
+  });
+  header.appendChild(nav);
+
+  var loginBtn = document.createElement('button');
+  loginBtn.type = 'button';
+  loginBtn.id = 'login-btn';
+  loginBtn.textContent = 'Login with extension';
+  header.appendChild(loginBtn);
+
+  var themeBtn = document.createElement('button');
+  themeBtn.type = 'button';
+  themeBtn.id = 'theme-btn';
+  header.appendChild(themeBtn);
+  s86WireThemeToggle(themeBtn);
+
+  document.addEventListener('keydown', function (evt) {
+    if (!(evt.metaKey || evt.ctrlKey)) {
+      return;
+    }
+    if (evt.key !== 'k' && evt.key !== 'K') {
+      return;
+    }
+    evt.preventDefault();
+    searchInput.focus();
+    searchInput.select();
+  });
+
+  if (document.body.firstChild) {
+    document.body.insertBefore(header, document.body.firstChild);
+  } else {
+    document.body.appendChild(header);
+  }
+
+  return { loginBtn: loginBtn, themeBtn: themeBtn, searchInput: searchInput, header: header };
+}
+
+// --- live layer (shared SSE connection) -------------------------------------
+// GET /api/live is ONE server-side strfry poll loop fanned out to every
+// connected /home and /stats tab (CLAUDE.md "Endpoints"). onMessage(data)
+// fires for every `event: live` frame, including the very first one, which
+// carries the server's current state (ring buffer + delta counters) — never
+// this browser's own history, per the "no history fetch" rule. EventSource
+// reconnects on its own after a drop; onDisconnected fires once per drop so
+// the page can say so, and the next onMessage clears it back out.
+function s86ConnectLive(onMessage, onDisconnected) {
+  if (typeof EventSource === 'undefined') {
+    if (onDisconnected) {
+      onDisconnected();
+    }
+    return null;
+  }
+  var es = new EventSource('/api/live');
+  es.addEventListener('live', function (evt) {
+    try {
+      onMessage(JSON.parse(evt.data));
+    } catch (e) {
+      // malformed frame — wait for the next one rather than throwing
+    }
+  });
+  es.onerror = function () {
+    if (onDisconnected) {
+      onDisconnected();
+    }
+  };
+  return es;
 }
 
 // --- login (NIP-07, remembered in localStorage) -----------------------------

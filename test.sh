@@ -739,6 +739,94 @@ server86.run_strfry_count = _orig_run_strfry_count
 server86.resolve_profiles = _orig_resolve_profiles
 
 
+# --- Live layer: one shared poll tick, kind/ts/id only, deltas reset -----
+_orig_scan = server86.run_strfry_scan
+server86._live_since = 100
+server86._live_seen_at_since = set()
+server86._live_recent = []
+server86._live_new_events = 0
+server86._live_deletes = 0
+server86._live_delta_baseline_at = None
+server86.run_strfry_scan = lambda filter_obj, timeout=10: [
+    {"id": "a" * 64, "kind": 1, "created_at": 100, "pubkey": "b" * 64, "content": "secret", "tags": [["p", "z"]]},
+    {"id": "c" * 64, "kind": 5, "created_at": 101, "content": "x"},
+]
+server86._live_poll_tick()
+check(server86._live_error is None and len(server86._live_recent) == 2,
+      "_live_poll_tick folds new events into the shared ring buffer on a successful poll")
+check(all(set(e.keys()) == {"id", "kind", "created_at"} for e in server86._live_recent),
+      "_live_poll_tick strips every field except id/kind/created_at (no pubkey/content/tags)")
+check("secret" not in json.dumps(server86._live_recent) and ("b" * 64) not in json.dumps(server86._live_recent),
+      "the live ring buffer never leaks content or pubkey")
+check(server86._live_new_events == 2 and server86._live_deletes == 1,
+      "_live_poll_tick counts new_events and, separately, kind-5 deletes")
+server86.run_strfry_scan = lambda filter_obj, timeout=10: (_ for _ in ()).throw(RuntimeError("no strfry"))
+server86._live_poll_tick()
+check(server86._live_error is not None and len(server86._live_recent) == 2,
+      "_live_poll_tick on failure leaves the prior ring buffer untouched and just sets _live_error (failed poll ≠ empty result)")
+server86.run_strfry_scan = _orig_scan
+
+_orig_baseline_at = server86._live_current_baseline_at
+server86._live_current_baseline_at = lambda: 12345
+server86._live_new_events = 7
+server86._live_deletes = 3
+server86._live_since = 1
+server86._live_poll_tick()
+check(server86._live_delta_baseline_at == 12345 and server86._live_since == 12345,
+      "a moved report baseline re-anchors the live poll cursor forward")
+server86._live_current_baseline_at = _orig_baseline_at
+server86._live_since = int(__import__("time").time())
+server86._live_recent = []
+server86._live_new_events = 0
+server86._live_deletes = 0
+server86._live_delta_baseline_at = None
+
+# --- Console allowlist: CONSOLE_VERBS only, no per-verb flag table --------
+_argv, _err = server86.validate_console_command("delete --filter '{}'")
+check(_argv is None and _err and "refused" in _err,
+      "console allowlist refuses delete")
+_argv, _err = server86.validate_console_command("sync --dry-run")
+check(_argv is None and _err and "refused" in _err,
+      "console allowlist refuses sync (dropped from CONSOLE_VERBS)")
+_argv, _err = server86.validate_console_command("scan '{}'")
+check(_argv is not None and _err is None,
+      "console allowlist accepts bare scan — CONSOLE_VERBS has no per-verb required-flag table")
+_argv, _err = server86.validate_console_command("info")
+check(_argv is not None and _err is None, "console allowlist accepts info")
+_argv, _err = server86.validate_console_command("export")
+check(_argv is not None and _err is None, "console allowlist accepts export")
+
+# --- Reports cache: kind-1984 tallied by DISTINCT reporter per p-tag -----
+_orig_scan = server86.run_strfry_scan
+server86.run_strfry_scan = lambda filter_obj, timeout=10: [
+    {"pubkey": "r" * 64, "tags": [["p", "x" * 64]]},
+    {"pubkey": "r" * 64, "tags": [["p", "x" * 64]]},  # same reporter twice — counts once
+    {"pubkey": "s" * 64, "tags": [["p", "x" * 64]]},
+    {"pubkey": "r" * 64, "tags": [["p", "y" * 64]]},
+]
+_reports = server86.compute_reports()
+server86.run_strfry_scan = _orig_scan
+check(_reports["counts"].get("x" * 64) == 2 and _reports["counts"].get("y" * 64) == 1,
+      "compute_reports tallies DISTINCT reporters per p-tag, not raw report events")
+
+# --- Static routes: home landing + Bans moved -----------------------------
+check(server86.STATIC_ROUTES["/home"][0] == "home.html",
+      "STATIC_ROUTES maps /home to home.html (public landing)")
+check(server86.STATIC_ROUTES["/bans"][0] == "bans.html",
+      "STATIC_ROUTES maps /bans to bans.html")
+for _path, _file in (("/stats", "stats.html"), ("/userlist", "userlist.html"), ("/audit", "audit.html")):
+    check(server86.STATIC_ROUTES.get(_path, (None,))[0] == _file,
+          f"STATIC_ROUTES maps {_path} to {_file}")
+check("/" not in server86.STATIC_ROUTES,
+      "'/' is not a static route — do_GET redirects it to /home instead")
+
+# --- Authors empty state: recent is the default radio --------------------
+import re as _re
+_authors_html = open(os.path.join(REPO_ROOT, "authors.html")).read()
+check(bool(_re.search(r'value="recent"\s+checked', _authors_html)),
+      "authors.html offers recent as the default (checked) scan mode")
+
+
 # --- Phase 3: POST /api/reason (server86.py + lib86/blacklist.py) --------
 # blacklist.py's BASE_DIR is derived from the FILE's own path, not cwd, so
 # it always resolves to the real repo's blacklist.json unless redirected —
@@ -1472,6 +1560,20 @@ try:
         status_query, body_query = _get_bytes(route + "?d=../../../../etc/passwd&npub=../../../../etc/passwd")
         check(status_plain == 200 and status_query == 200 and body_plain == body_query,
               f"static route {route} serves IDENTICAL bytes with and without a query string containing '../' ({label})")
+
+    class _NoRedirect(_urllib_request.HTTPErrorProcessor):
+        def http_response(self, request, response):
+            return response
+        https_response = http_response
+    _opener = _urllib_request.build_opener(_NoRedirect)
+    _resp = _opener.open(_urllib_request.Request(_base_url + "/", method="GET"), timeout=5)
+    check(_resp.status == 302 and _resp.headers.get("Location") == "/home",
+          "GET / redirects (302) to /home")
+
+    _status, _body = _get_bytes("/api/audit?q=")
+    _audit_page = json.loads(_body)
+    check(_status == 200 and "records" in _audit_page and "total" in _audit_page,
+          "GET /api/audit is a public, paged read (records + total)")
 
     # /api/relay-url: GET is a public read (same stance as /api/authors,
     # /api/recipients, /api/subscribers — only the mutating POST needs

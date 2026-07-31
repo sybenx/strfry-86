@@ -4,24 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>strfry-86 — domain roster</title>
+<title>strfry-86 — domain</title>
 <style>
+body { max-width:40em; margin:0 auto; padding:0 1em; }
+li { overflow-wrap:anywhere; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere; }   /* commands only — WHY.md §2 */
+@media (max-width:600px){ body{ font-size:1.15em; } }
 :root { color-scheme: light dark; }
-#theme-btn { position: fixed; top: 0.5em; right: 0.5em; }
-body { max-width: 40em; margin: 0 auto; padding: 0 1em; background: Canvas; color: CanvasText; }
-li { overflow-wrap: anywhere; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-@media (max-width: 600px) { body { font-size: 1.15em; } }
+body { background:Canvas; color:CanvasText; }           /* required — WHY.md §3 */
+header#s86 { position:sticky; top:0; background:Canvas; display:flex;
+             gap:1em; align-items:center; padding:.5em 0; }
+header#s86 a.logo { text-decoration:none; color:inherit; font-weight:bold; }
+header#s86 input#q { flex:1; min-width:8em; }
 </style>
 </head>
 <body>
-<h1>strfry-86 — domain roster</h1>
-<p><a href="/">← ban list</a> · <a href="/authors">active authors</a> · <a href="/report">relay report</a></p>
-<button id="login-btn" type="button">Login with extension</button>
-<button id="theme-btn" type="button"></button>
+<h1>Domain roster</h1>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
-  <div id="profile-entry-container"></div>
   <div id="command-block-container"></div>
   <div id="records-list"></div>
 
@@ -67,10 +67,9 @@ var sortField = 'name';
 var sortDir = 'asc';
 
 var statusEl = document.getElementById('status');
-var loginBtn = document.getElementById('login-btn');
-s86WireThemeToggle(document.getElementById('theme-btn'));
+var chrome = s86BuildPageChrome(statusEl);
+var loginBtn = chrome.loginBtn;
 var adminSection = document.getElementById('admin-section');
-var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var domainInput = document.getElementById('domain-input');
@@ -440,7 +439,6 @@ if (prefillDomain) {
   domainInput.value = prefillDomain;
 }
 
-profileEntryContainer.appendChild(s86BuildProfileEntryField(statusEl));
 commandBlockContainer.appendChild(s86BuildCommandGenerator());
 
 s86WireFilter(filterInput, listEl);
