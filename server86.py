@@ -1105,10 +1105,17 @@ def get_db_compact_status(include_detail=False):
     return status
 
 
-def run_db_compact(output_path=None):
+def run_db_compact(output_path=None, progress_cb=None):
     """Run `strfry compact <output_path>`. Default path is the Settings fixed
     name under the db directory. Removes a previous file at that path first
-    (strfry refuses to overwrite). Returns
+    (strfry refuses to overwrite).
+
+    strfry itself prints no progress. The only mid-run signal is the growing
+    size of the output file, polled while the process runs. `progress_cb` is
+    the same shape as scan progress (`count, total=None`): count = bytes
+    written so far, total = live data.mdb size (a ceiling — the compacted
+    copy is usually smaller, so the bar may not reach 100% before done; ETA
+    is therefore an upper-bound estimate). Returns
     (ok, error, {output_path, live_bytes, compacted_bytes, reclaimable_bytes})."""
     if output_path is None:
         output_path, path_err = settings_compact_output_path()
@@ -1129,20 +1136,58 @@ def run_db_compact(output_path=None):
             os.remove(output_path)
     except OSError as e:
         return False, f"could not clear previous compact output: {e}", None
+    if progress_cb is not None:
+        # Seed total = live size so the first poll already has a denominator
+        # (rule 9: — until measured; live_bytes is measured).
+        progress_cb(0, total=live_bytes)
     argv = [strfry_bin, "--config", conf, "compact", output_path]
     try:
-        result = subprocess.run(
-            argv, cwd=get_relay_cwd(), capture_output=True,
-            timeout=COMPACT_TIMEOUT,
+        # stdout discarded: compact is silent on success. stderr kept so a
+        # failure still has a reason; it is short on normal errors, so the
+        # pipe will not fill during a multi-GB run.
+        proc = subprocess.Popen(
+            argv, cwd=get_relay_cwd(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired:
-        return False, f"timeout after {COMPACT_TIMEOUT}s", None
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None
-    if result.returncode != 0:
-        err = (result.stderr or b"").decode("utf-8", "replace")[-300:]
-        return False, err or f"exit {result.returncode}", None
+    deadline = time.monotonic() + COMPACT_TIMEOUT
+    try:
+        while proc.poll() is None:
+            written = _file_size_or_none(output_path) or 0
+            if progress_cb is not None:
+                progress_cb(written, total=live_bytes)
+            if time.monotonic() >= deadline:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                return False, f"timeout after {COMPACT_TIMEOUT}s", None
+            time.sleep(0.5)
+        # Final size sample after exit, then collect stderr.
+        written = _file_size_or_none(output_path) or 0
+        if progress_cb is not None:
+            progress_cb(written, total=live_bytes)
+        _stdout, stderr = proc.communicate(timeout=5)
+        if proc.returncode != 0:
+            err = (stderr or b"").decode("utf-8", "replace")[-300:]
+            return False, err or f"exit {proc.returncode}", None
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return False, f"{type(e).__name__}: {e}", None
     compacted_bytes = _file_size_or_none(output_path)
+    if progress_cb is not None and compacted_bytes is not None:
+        # Snap to measured final size so the UI does not freeze mid-bar when
+        # the copy finished well under the live ceiling.
+        progress_cb(compacted_bytes, total=compacted_bytes)
     reclaimable = None
     if live_bytes is not None and compacted_bytes is not None and live_bytes >= compacted_bytes:
         reclaimable = live_bytes - compacted_bytes
@@ -1158,21 +1203,26 @@ def run_db_compact(output_path=None):
 
 def _run_db_compact_job():
     """Background body for Settings Compact. Releases the global lock on every
-    exit path. Does not replace the live data.mdb — that needs a relay stop."""
+    exit path. Does not replace the live data.mdb — that needs a relay stop.
+    Progress is the growing compact output file (bytes), total is live
+    data.mdb size as a ceiling — see run_db_compact."""
     error = None
     meta = None
+    progress_cb = _make_progress_cb(_db_compact_job)
     try:
         with _scan_lock:
             _db_compact_job["phase"] = "compacting"
+            # Publish live size early so the first status poll can name the
+            # denominator before any bytes have been written.
+            db_dir = _strfry_db_dir()
+            live_path = os.path.join(db_dir, "data.mdb") if db_dir else None
+            live_bytes = _file_size_or_none(live_path) if live_path else None
+            _db_compact_job["live_bytes"] = live_bytes
             _db_compact_job["progress"] = 0
-            _db_compact_job["total"] = None
-        ok, err, meta = run_db_compact()
+            _db_compact_job["total"] = live_bytes
+        ok, err, meta = run_db_compact(progress_cb=progress_cb)
         if not ok:
             error = err or "compact failed"
-        else:
-            with _scan_lock:
-                _db_compact_job["progress"] = 1
-                _db_compact_job["total"] = 1
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         log(f"server86: db compact job failed: {error}")
@@ -1182,6 +1232,8 @@ def _run_db_compact_job():
             _db_compact_job["phase"] = "failed" if error else "done"
             _db_compact_job["error"] = error
             _db_compact_job["finished_at"] = int(time.time())
+            # Keep the last progress/rate snapshot for a moment of readability,
+            # but clear rate/eta so a finished job never still says "N min left".
             _db_compact_job["rate"] = None
             _db_compact_job["eta"] = None
             if meta:
@@ -1189,6 +1241,9 @@ def _run_db_compact_job():
                 _db_compact_job["live_bytes"] = meta.get("live_bytes")
                 _db_compact_job["compacted_bytes"] = meta.get("compacted_bytes")
                 _db_compact_job["reclaimable_bytes"] = meta.get("reclaimable_bytes")
+                if meta.get("compacted_bytes") is not None:
+                    _db_compact_job["progress"] = meta["compacted_bytes"]
+                    _db_compact_job["total"] = meta["compacted_bytes"]
             _active_scan["name"] = None
 
 
@@ -1205,6 +1260,7 @@ def start_db_compact(on_started=None):
             "phase": "starting", "error": None, "finished_at": None,
             "output_path": None, "live_bytes": None,
             "compacted_bytes": None, "reclaimable_bytes": None,
+            "progress": 0, "total": None, "rate": None, "eta": None,
         },
     )
 

@@ -1015,7 +1015,9 @@ var S86_JOB_LABELS = {
   recipients: 'the gift-wrap recipient scan',
   subscribers: 'the subscriber scan',
   'report-totals': 'the database totals refresh',
-  'report-walk': 'the database walk'
+  'report-walk': 'the database walk',
+  'giftwrap-purge': 'the gift-wrap purge',
+  'db-compact': 'database compact'
 };
 
 function s86FormatRelativeAge(unixSeconds) {

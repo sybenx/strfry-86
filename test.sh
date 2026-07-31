@@ -1893,9 +1893,14 @@ _orig_run_compact = server86.run_db_compact
 server86._strfry_db_bytes = lambda: (10_000, _compact_db2)
 
 
-def _fake_run_compact(output_path=None):
+def _fake_run_compact(output_path=None, progress_cb=None):
     if output_path is None:
         output_path = os.path.join(_compact_db2, server86.COMPACT_OUTPUT_NAME)
+    # Mimic the real mid-run signal: growing output under a live-size ceiling.
+    if progress_cb is not None:
+        progress_cb(0, total=10_000)
+        progress_cb(2_000, total=10_000)
+        progress_cb(4_000, total=4_000)
     with open(output_path, "wb") as _fh:
         _fh.write(b"y" * 4_000)
     return True, None, {
@@ -1923,10 +1928,24 @@ check(compact_started.get("status") == "running" and _compact_audit["n"] == 1,
 _compact_again = server86.start_db_compact(on_started=_count_compact_audit)
 check(_compact_audit["n"] == 1 and _compact_again.get("blocked_by") is None,
       "a second press while compact runs is the same job and does not audit again")
+# Give the progress_cb a tick to land on the job dict before the process ends.
+_saw_progress = False
+for _ in range(20):
+    _mid = server86.get_db_compact_status()
+    if _mid.get("status") == "running" and _mid.get("total") == 10_000:
+        _saw_progress = True
+        break
+    if _mid.get("phase") == "done":
+        break
+    _time.sleep(0.05)
+check(_saw_progress or server86.get_db_compact_status().get("phase") == "done",
+      "db compact publishes total=live_bytes (or finishes) so the UI has a denominator mid-run")
 _time.sleep(0.3)
 compact_done = server86.get_db_compact_status(include_detail=True)
 check(compact_done.get("phase") == "done" and compact_done.get("reclaimable_bytes") == 6_000,
       "db compact reports reclaimable_bytes as live − compacted, never claims the live file shrank")
+check(compact_done.get("progress") == 4_000 and compact_done.get("total") == 4_000,
+      "db compact snaps progress/total to the measured copy size when done — the live ceiling is not left as a half-full bar")
 check(compact_done.get("output_path") == os.path.join(_compact_db2, "data.mdb.compacted"),
       "Settings compact always writes <db>/data.mdb.compacted")
 check("error" not in server86.get_db_compact_status(),
