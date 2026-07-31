@@ -137,8 +137,9 @@ why; it must NEVER render "accepted" for an event nothing judged (rule 9).
   - *console* — input runs `strfry <verb> …` only when the first token is in
     `CONSOLE_VERBS` and no write flag is present; anything else renders the refusal and
     the reason, executes nothing. Quick-command chips may only contain `CONSOLE_VERBS`
-    commands. The console NEVER runs `delete` — purges go through the guarded forms only
-    (WHY.md §5). Global job lock applies to console commands too.
+    commands. The console NEVER runs `delete` or `compact` — purges and database compact
+    go through the guarded Settings forms only (WHY.md §5). Global job lock applies to
+    console commands too.
 
 ### `/users` — Users (the member table and the scan that fills it, one page)
 Columns: User (identity dot + best label) · NIP-05 · Events · Reports · Gift-wraps

@@ -1053,6 +1053,162 @@ def _giftwrap_retention_loop():
             log(f"server86: giftwrap retention loop: {type(e).__name__}: {e}")
 
 
+# --- DB compact (Settings "Compact" only — never the console) ---------------
+# strfry compact writes a NEW compacted LMDB dump; it does NOT shrink the live
+# data.mdb in place. Reclaiming free pages on disk means stopping the relay,
+# replacing data.mdb with the compacted file, and starting again (strfry's own
+# README). This job only performs the safe half: dump to
+# <db>/data.mdb.compacted, report live vs compacted sizes, leave the swap to
+# the operator. Shares the global scan lock — compact copies the whole LMDB.
+# Not on CONSOLE_VERBS: a free command box must not host a multi-GB write that
+# needs the same confirm + audit path Settings already has (WHY.md §5).
+_db_compact_job = {
+    "status": "idle", "started_at": None, "progress": None, "total": None,
+    "rate": None, "eta": None, "phase": None, "error": None,
+    "finished_at": None, "output_path": None,
+    "live_bytes": None, "compacted_bytes": None, "reclaimable_bytes": None,
+}
+_JOB_REGISTRY["db-compact"] = _db_compact_job
+
+
+def settings_compact_output_path():
+    """Fixed output path for the Settings Compact button: always
+    <db>/data.mdb.compacted. Returns (path, error)."""
+    db_dir = _strfry_db_dir()
+    if not db_dir:
+        return None, "strfry db path is not configured or not found"
+    return os.path.join(db_dir, COMPACT_OUTPUT_NAME), None
+
+
+def _file_size_or_none(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def get_db_compact_status(include_detail=False):
+    """Compact job status. `include_detail` adds the raw failure text (strfry
+    stderr names paths) and is only ever true for an authenticated caller.
+    Public poll keeps phase/sizes/outcome and drops the path-bearing error."""
+    with _scan_lock:
+        status = dict(_db_compact_job)
+        running = _active_scan["name"]
+    status["blocked_by"] = running if running not in (None, "db-compact") else None
+    error = status.get("error")
+    status["failed"] = bool(error) or status.get("phase") == "failed"
+    # output_path also names the host filesystem — same disclosure class as
+    # the error text. Public poll keeps sizes; the path stays admin-only.
+    if not include_detail:
+        status.pop("error", None)
+        status.pop("output_path", None)
+    return status
+
+
+def run_db_compact(output_path=None):
+    """Run `strfry compact <output_path>`. Default path is the Settings fixed
+    name under the db directory. Removes a previous file at that path first
+    (strfry refuses to overwrite). Returns
+    (ok, error, {output_path, live_bytes, compacted_bytes, reclaimable_bytes})."""
+    if output_path is None:
+        output_path, path_err = settings_compact_output_path()
+        if path_err:
+            return False, path_err, None
+    try:
+        strfry_bin = require_strfry_bin()
+        conf = require_strfry_conf()
+    except RuntimeError as e:
+        return False, str(e), None
+    db_dir = _strfry_db_dir()
+    live_path = os.path.join(db_dir, "data.mdb") if db_dir else None
+    live_bytes = _file_size_or_none(live_path) if live_path else None
+    # Own the fixed name: a prior compact's leftover would make strfry exit
+    # with "output file exists, not overwriting" and look like a hard failure.
+    try:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    except OSError as e:
+        return False, f"could not clear previous compact output: {e}", None
+    argv = [strfry_bin, "--config", conf, "compact", output_path]
+    try:
+        result = subprocess.run(
+            argv, cwd=get_relay_cwd(), capture_output=True,
+            timeout=COMPACT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timeout after {COMPACT_TIMEOUT}s", None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", None
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", "replace")[-300:]
+        return False, err or f"exit {result.returncode}", None
+    compacted_bytes = _file_size_or_none(output_path)
+    reclaimable = None
+    if live_bytes is not None and compacted_bytes is not None and live_bytes >= compacted_bytes:
+        reclaimable = live_bytes - compacted_bytes
+    meta = {
+        "output_path": output_path,
+        "live_bytes": live_bytes,
+        "compacted_bytes": compacted_bytes,
+        "reclaimable_bytes": reclaimable,
+    }
+    log(f"server86: db compact ok (live={live_bytes}, compacted={compacted_bytes})")
+    return True, None, meta
+
+
+def _run_db_compact_job():
+    """Background body for Settings Compact. Releases the global lock on every
+    exit path. Does not replace the live data.mdb — that needs a relay stop."""
+    error = None
+    meta = None
+    try:
+        with _scan_lock:
+            _db_compact_job["phase"] = "compacting"
+            _db_compact_job["progress"] = 0
+            _db_compact_job["total"] = None
+        ok, err, meta = run_db_compact()
+        if not ok:
+            error = err or "compact failed"
+        else:
+            with _scan_lock:
+                _db_compact_job["progress"] = 1
+                _db_compact_job["total"] = 1
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        log(f"server86: db compact job failed: {error}")
+    finally:
+        with _scan_lock:
+            _db_compact_job["status"] = "idle"
+            _db_compact_job["phase"] = "failed" if error else "done"
+            _db_compact_job["error"] = error
+            _db_compact_job["finished_at"] = int(time.time())
+            _db_compact_job["rate"] = None
+            _db_compact_job["eta"] = None
+            if meta:
+                _db_compact_job["output_path"] = meta.get("output_path")
+                _db_compact_job["live_bytes"] = meta.get("live_bytes")
+                _db_compact_job["compacted_bytes"] = meta.get("compacted_bytes")
+                _db_compact_job["reclaimable_bytes"] = meta.get("reclaimable_bytes")
+            _active_scan["name"] = None
+
+
+def start_db_compact(on_started=None):
+    """Start one compact under the global job lock. Same single-flight shape
+    as the gift-wrap purge: on_started fires only for the call that launched."""
+    def run():
+        _run_db_compact_job()
+
+    return _start_scan_job(
+        "db-compact", _db_compact_job, run,
+        on_started=on_started,
+        extra_job_fields={
+            "phase": "starting", "error": None, "finished_at": None,
+            "output_path": None, "live_bytes": None,
+            "compacted_bytes": None, "reclaimable_bytes": None,
+        },
+    )
+
+
 def live_subscribe():
     """Register one SSE connection's queue and return (queue, initial_state).
     The initial state carries the WHOLE ring buffer so a freshly opened tab
@@ -1135,12 +1291,20 @@ def get_userlist_snapshot():
 # reconstructed from a validated command string. `scan`, `info`, and
 # `export` are the only strfry subcommands that cannot mutate the database
 # regardless of what flags follow them (unlike `sync`, `import`, `router`,
-# or `delete`), so the check IS the verb allowlist; there is no per-verb
-# required-flag table left to maintain. A free command box would make every
-# guard elsewhere in this project decorative (WHY.md §5) — read-only verbs
-# give the live-debugging value without reopening that hole.
+# `compact`, or `delete`), so the check IS the verb allowlist; there is no
+# per-verb required-flag table left to maintain. Compact lives on Settings
+# only (confirm + audit + fixed path). A free command box would make every
+# guard elsewhere decorative (WHY.md §5).
 
 CONSOLE_TIMEOUT = 30
+COMPACT_TIMEOUT = 3600          # hard cap on one strfry compact run (Settings)
+COMPACT_OUTPUT_NAME = "data.mdb.compacted"  # fixed name for Settings compact
+
+
+def _strfry_db_dir():
+    """Absolute path of the LMDB directory named by strfry.conf `db`, or None."""
+    _, db_path = _strfry_db_bytes()
+    return db_path
 
 
 def validate_console_command(raw):
@@ -1836,10 +2000,11 @@ def get_settings_payload():
             "error": None, "balanced": True,
             "writable": _path_writable(CONFIG_PATH),
         },
-        # The admin-only copy of the purge status, carrying the failure text
-        # the public poll endpoint withholds. The Settings page is the only
-        # thing that needs it, and it already authenticates to load this.
+        # The admin-only copy of purge/compact status, carrying the failure
+        # text the public poll endpoints withhold. The Settings page is the
+        # only thing that needs it, and it already authenticates to load this.
         "purge": get_giftwrap_purge_status(include_detail=True),
+        "compact": get_db_compact_status(include_detail=True),
     }
 
 
@@ -3672,6 +3837,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_giftwrap_purge_status())
             return
 
+        if path == "/api/db-compact":
+            # Same public-poll / redacted-error shape as gift-wrap purge.
+            self._send_json(200, get_db_compact_status())
+            return
+
         if path == "/api/domain-bans":
             self._send_json(200, {"domains": get_domain_bans()})
             return
@@ -3767,6 +3937,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/console", "/api/undo",
             "/api/settings", "/api/settings/save", "/api/domain-unban",
             "/api/giftwrap-retention/estimate", "/api/giftwrap-retention/purge",
+            "/api/db-compact",
         ):
             self._send_json(404, {"error": "not found"})
             return
@@ -3942,6 +4113,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             # 202 while this job (or a blocker) is running so the client
             # knows to poll; 200 when nothing is in flight.
+            code = 202 if status.get("status") == "running" or status.get("blocked_by") else 200
+            self._send_json(code, status)
+            return
+
+        if path == "/api/db-compact":
+            status = start_db_compact(
+                on_started=lambda: audit_append({
+                    "type": "db_compact", "actor": auth.get("pubkey"),
+                    "via": "settings compact",
+                }),
+            )
             code = 202 if status.get("status") == "running" or status.get("blocked_by") else 200
             self._send_json(code, status)
             return

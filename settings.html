@@ -304,6 +304,8 @@ function buildFieldRow(field, onDirty) {
   var estimateEl = null;
   var purgeBtn = null;
   var purgeStatus = null;
+  var compactBtn = null;
+  var compactStatus = null;
   if (field.type === 'bool') {
     control = document.createElement('input');
     control.type = 'checkbox';
@@ -321,6 +323,10 @@ function buildFieldRow(field, onDirty) {
     purgeBtn = s86El('button', 'Purge now');
     purgeBtn.type = 'button';
     purgeStatus = s86El('span', '', 'muted');
+    compactBtn = s86El('button', 'Compact');
+    compactBtn.type = 'button';
+    compactBtn.title = 'Write a compacted copy of the database (does not shrink the live file by itself)';
+    compactStatus = s86El('span', '', 'muted');
   } else {
     control = document.createElement('input');
     control.type = field.type === 'int' ? 'number' : 'text';
@@ -337,10 +343,15 @@ function buildFieldRow(field, onDirty) {
     sliderRow.appendChild(control);
     sliderRow.appendChild(valueReadout);
     sliderRow.appendChild(purgeBtn);
+    sliderRow.appendChild(compactBtn);
     sliderRow.appendChild(purgeStatus);
     right.appendChild(sliderRow);
+    var compactRow = s86El('p', null, 'note');
+    compactRow.appendChild(document.createTextNode('After a purge, Compact writes a smaller copy next to the live database. Reclaiming that space needs a relay stop and a file swap — this button never replaces the live file while the relay is running. '));
+    compactRow.appendChild(compactStatus);
     right.appendChild(estimateEl);
-    wireGiftwrapRetention(control, valueReadout, estimateEl, purgeBtn, purgeStatus);
+    right.appendChild(compactRow);
+    wireGiftwrapRetention(control, valueReadout, estimateEl, purgeBtn, purgeStatus, compactBtn, compactStatus);
   } else {
     right.appendChild(control);
   }
@@ -351,11 +362,12 @@ function buildFieldRow(field, onDirty) {
   return row;
 }
 
-// Live estimate + Purge now for the gift-wrap retention slider. Event count
-// is an exact index --count; storage is proportional (delete/total × db
-// size) — labelled as an estimate so it is never mistaken for free-space
-// measurement.
-function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus) {
+// Live estimate + Purge now + Compact for the gift-wrap retention slider.
+// Event count is an exact index --count; storage is proportional
+// (delete/total × db size) — labelled as an estimate so it is never
+// mistaken for free-space measurement. Compact is a separate job that
+// only writes a dump; it does not free the live data.mdb.
+function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus, compactBtn, compactStatus) {
   var estimateTimer = null;
   var estimateSeq = 0;
 
@@ -472,13 +484,75 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
     return '';
   }
 
+  function setRetentionBusy(busy) {
+    // Purge and compact share the global job lock with every other scan —
+    // either button disabled while either job (or any other) is running.
+    purgeBtn.disabled = !!busy || !isAdmin;
+    if (compactBtn) {
+      compactBtn.disabled = !!busy || !isAdmin;
+    }
+  }
+
   function applyPurgeStatus(st) {
     purgeStatus.textContent = formatPurgeProgress(st);
     var busy = st && (st.status === 'running' || st.blocked_by);
-    purgeBtn.disabled = !!busy || !isAdmin;
+    setRetentionBusy(busy);
     if (st && st.status !== 'running' && !st.blocked_by && st.phase === 'done') {
       refreshEstimate();
     }
+  }
+
+  function formatCompactProgress(st) {
+    if (!st) {
+      return '';
+    }
+    if (st.blocked_by) {
+      return 'not started — ' + st.blocked_by
+        + ' is running. This button re-enables when it finishes.';
+    }
+    if (st.status === 'running') {
+      var elapsed = st.started_at
+        ? Math.max(0, Math.floor(Date.now() / 1000) - st.started_at)
+        : 0;
+      var elapsedTxt = elapsed < 60
+        ? (elapsed + 's')
+        : (Math.floor(elapsed / 60) + 'm ' + (elapsed % 60) + 's');
+      return 'compacting database… ' + elapsedTxt;
+    }
+    if (st.failed || st.phase === 'failed' || st.error) {
+      var detail = (payload && payload.compact) || null;
+      var text = st.error
+        || (detail && detail.finished_at === st.finished_at ? detail.error : null);
+      return 'failed — ' + (text || 'compact failed; reload to load the reason');
+    }
+    if (st.phase === 'done') {
+      var took = (st.started_at && st.finished_at)
+        ? (st.finished_at - st.started_at)
+        : null;
+      var line = 'compacted copy written'
+        + (took != null ? (' in ' + took + 's') : '');
+      if (st.live_bytes != null && st.compacted_bytes != null) {
+        line += ' — live ' + s86FormatBytes(st.live_bytes)
+          + ' → copy ' + s86FormatBytes(st.compacted_bytes);
+      }
+      if (st.reclaimable_bytes != null && st.reclaimable_bytes > 0) {
+        line += ' · ~' + s86FormatBytes(st.reclaimable_bytes)
+          + ' reclaimable after stop + swap of data.mdb';
+      } else {
+        line += ' · stop the relay and replace data.mdb with the compacted copy to free space';
+      }
+      return line;
+    }
+    return '';
+  }
+
+  function applyCompactStatus(st) {
+    if (!compactStatus) {
+      return;
+    }
+    compactStatus.textContent = formatCompactProgress(st);
+    var busy = st && (st.status === 'running' || st.blocked_by);
+    setRetentionBusy(busy);
   }
 
   function pollPurge() {
@@ -492,13 +566,34 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
     );
   }
 
-  // Resume a purge still running from a previous visit to this page.
+  function pollCompact() {
+    s86PollStatus(
+      function () {
+        return fetch('/api/db-compact').then(function (res) {
+          return res.json();
+        });
+      },
+      applyCompactStatus
+    );
+  }
+
+  // Resume a purge or compact still running from a previous visit.
   fetch('/api/giftwrap-retention/purge')
     .then(function (res) { return res.json(); })
     .then(function (st) {
       applyPurgeStatus(st);
       if (st.status === 'running' || st.blocked_by) {
         pollPurge();
+      }
+    })
+    .catch(function () {});
+
+  fetch('/api/db-compact')
+    .then(function (res) { return res.json(); })
+    .then(function (st) {
+      applyCompactStatus(st);
+      if (st.status === 'running' || st.blocked_by) {
+        pollCompact();
       }
     })
     .catch(function () {});
@@ -519,6 +614,9 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
       return;
     }
     purgeBtn.disabled = true;
+    if (compactBtn) {
+      compactBtn.disabled = true;
+    }
     purgeStatus.textContent = 'starting…';
     s86SignAndPost('/api/giftwrap-retention/purge', { days: days })
       .then(function (result) {
@@ -526,7 +624,7 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
         // is true for both (2xx).
         var st = result.body || {};
         if (!result.ok) {
-          purgeBtn.disabled = false;
+          setRetentionBusy(false);
           purgeStatus.textContent = 'failed — ' + s86ErrMsg(result);
           return;
         }
@@ -536,10 +634,46 @@ function wireGiftwrapRetention(slider, daysEl, estimateEl, purgeBtn, purgeStatus
         }
       })
       .catch(function () {
-        purgeBtn.disabled = false;
+        setRetentionBusy(false);
         purgeStatus.textContent = 'failed — request error';
       });
   });
+
+  if (compactBtn) {
+    compactBtn.addEventListener('click', function () {
+      if (!isAdmin) {
+        return;
+      }
+      if (!window.confirm(
+        'Write a compacted copy of the database?\n\n'
+        + 'This does NOT shrink the live database by itself. It creates '
+        + 'data.mdb.compacted next to the live file. Freeing disk space '
+        + 'means stopping the relay, replacing data.mdb with that copy, '
+        + 'and starting again. Needs free disk roughly the size of the copy.'
+      )) {
+        return;
+      }
+      setRetentionBusy(true);
+      compactStatus.textContent = 'starting…';
+      s86SignAndPost('/api/db-compact', {})
+        .then(function (result) {
+          var st = result.body || {};
+          if (!result.ok) {
+            setRetentionBusy(false);
+            compactStatus.textContent = 'failed — ' + s86ErrMsg(result);
+            return;
+          }
+          applyCompactStatus(st);
+          if (st.status === 'running' || st.blocked_by) {
+            pollCompact();
+          }
+        })
+        .catch(function () {
+          setRetentionBusy(false);
+          compactStatus.textContent = 'failed — request error';
+        });
+    });
+  }
 }
 
 function controlValue(control) {

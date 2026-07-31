@@ -828,6 +828,11 @@ _argv, _err = server86.validate_console_command("info")
 check(_argv is not None and _err is None, "console allowlist accepts info")
 _argv, _err = server86.validate_console_command("export")
 check(_argv is not None and _err is None, "console allowlist accepts export")
+# compact is Settings-only: confirm dialog, audit trail, fixed output path.
+# A free console command would skip all three (WHY.md §5).
+_argv, _err = server86.validate_console_command("compact data.mdb.compacted")
+check(_argv is None and _err and "refused" in _err,
+      "console allowlist refuses compact — Settings Compact is the only path")
 
 # --- Reports cache: kind-1984 tallied by DISTINCT reporter per p-tag -----
 _orig_scan = server86.run_strfry_scan
@@ -1864,6 +1869,82 @@ check(server86.get_giftwrap_purge_status().get("failed") is False,
 server86.run_strfry_count = _orig_count
 server86.run_giftwrap_retention_purge = _orig_retention_purge
 server86._active_scan["name"] = None
+
+
+# --- DB compact: dump only, never swaps live data.mdb ----------------------
+# Settings Compact only (console refuses the verb). Fixed path under db/,
+# global lock, audit only when launched, public status withholds paths.
+
+import tempfile as _tf_dbcompact, shutil as _sh_dbcompact
+
+_compact_audit = {"n": 0}
+
+
+def _count_compact_audit():
+    _compact_audit["n"] += 1
+
+
+_compact_db2 = _tf_dbcompact.mkdtemp()
+_live_mdb = os.path.join(_compact_db2, "data.mdb")
+with open(_live_mdb, "wb") as _fh:
+    _fh.write(b"x" * 10_000)
+_orig_db_bytes2 = server86._strfry_db_bytes
+_orig_run_compact = server86.run_db_compact
+server86._strfry_db_bytes = lambda: (10_000, _compact_db2)
+
+
+def _fake_run_compact(output_path=None):
+    if output_path is None:
+        output_path = os.path.join(_compact_db2, server86.COMPACT_OUTPUT_NAME)
+    with open(output_path, "wb") as _fh:
+        _fh.write(b"y" * 4_000)
+    return True, None, {
+        "output_path": output_path,
+        "live_bytes": 10_000,
+        "compacted_bytes": 4_000,
+        "reclaimable_bytes": 6_000,
+    }
+
+
+server86.run_db_compact = _fake_run_compact
+server86._active_scan["name"] = None
+server86.compute_authors = _slow_compute_authors
+_compact_blocker = server86.start_authors_scan("recent")
+compact_blocked = server86.start_db_compact(on_started=_count_compact_audit)
+check(compact_blocked.get("blocked_by") == "authors" and _compact_audit["n"] == 0,
+      "db compact refused while another job holds the lock never fires on_started")
+_time.sleep(0.6)
+server86.compute_authors = _orig_compute_authors
+server86._active_scan["name"] = None
+
+compact_started = server86.start_db_compact(on_started=_count_compact_audit)
+check(compact_started.get("status") == "running" and _compact_audit["n"] == 1,
+      "db compact that launches fires on_started exactly once")
+_compact_again = server86.start_db_compact(on_started=_count_compact_audit)
+check(_compact_audit["n"] == 1 and _compact_again.get("blocked_by") is None,
+      "a second press while compact runs is the same job and does not audit again")
+_time.sleep(0.3)
+compact_done = server86.get_db_compact_status(include_detail=True)
+check(compact_done.get("phase") == "done" and compact_done.get("reclaimable_bytes") == 6_000,
+      "db compact reports reclaimable_bytes as live − compacted, never claims the live file shrank")
+check(compact_done.get("output_path") == os.path.join(_compact_db2, "data.mdb.compacted"),
+      "Settings compact always writes <db>/data.mdb.compacted")
+check("error" not in server86.get_db_compact_status(),
+      "public compact status withholds the failure text (and output_path)")
+check("output_path" not in server86.get_db_compact_status(),
+      "public compact status withholds output_path — it names this machine's filesystem")
+check("error" in server86.get_db_compact_status(include_detail=True),
+      "authenticated compact status still carries the failure field key")
+
+# Console and Settings share the fixed basename rule.
+_out, _err = server86.settings_compact_output_path()
+check(_out == os.path.join(_compact_db2, "data.mdb.compacted") and _err is None,
+      "settings_compact_output_path is always <db>/data.mdb.compacted")
+
+server86.run_db_compact = _orig_run_compact
+server86._strfry_db_bytes = _orig_db_bytes2
+server86._active_scan["name"] = None
+_sh_dbcompact.rmtree(_compact_db2, ignore_errors=True)
 
 
 # --- blocked tally: the ban list's only proof a ban is doing anything -------
