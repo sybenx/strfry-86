@@ -186,6 +186,17 @@ tbody th { font-weight:600; }        /* row label, not a column header */
 thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
            line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
            border-bottom:1px solid var(--rule); }
+/* Sortable list headers: a real button that wears the thead chrome, never a
+   second sort-control row elsewhere on the page. Active column is ink so the
+   ↑/↓ arrow is visible against the muted default. */
+thead th.sortable { color:var(--muted); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color:var(--ink); }
+button.th-sort { font:inherit; font-size:inherit; font-weight:inherit;
+                 letter-spacing:inherit; text-transform:inherit;
+                 color:inherit; background:none; border:none; padding:0;
+                 margin:0; cursor:pointer; text-align:left; border-radius:0; }
+button.th-sort:hover:not(:disabled) { background:none; color:var(--ink); }
 td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
 tbody tr:hover { background:var(--wash); }
 button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
@@ -280,6 +291,9 @@ var ACTION_LABELS = {
 
 var adminPubkey = null;
 var isAdmin = false;
+var lastRecords = [];
+var sortField = 'at';
+var sortDir = 'desc';
 
 var statusEl = document.getElementById('status');
 var chrome = s86BuildPageChrome(statusEl);
@@ -290,6 +304,32 @@ var truncatedLine = document.getElementById('truncated-line');
 var recordsContainer = document.getElementById('records-container');
 
 function setStatus(text) { statusEl.textContent = text; }
+
+function cmpStrEmptyLast(a, b) {
+  if (!a && !b) { return 0; }
+  if (!a) { return 1; }
+  if (!b) { return -1; }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+var AUDIT_SORT = {
+  at: function (a, b) { return (a.at || 0) - (b.at || 0); },
+  admin: function (a, b) {
+    return cmpStrEmptyLast((a.actor || '').toLowerCase(), (b.actor || '').toLowerCase());
+  },
+  action: function (a, b) {
+    return cmpStrEmptyLast(actionLabel(a).toLowerCase(), actionLabel(b).toLowerCase());
+  },
+  detail: function (a, b) {
+    return cmpStrEmptyLast(describeRecord(a).toLowerCase(), describeRecord(b).toLowerCase());
+  }
+};
+
+function setSort(field, dir) {
+  sortField = field;
+  sortDir = dir;
+  renderRecords(lastRecords);
+}
 
 function actionLabel(r) {
   if (r.type === 'ban' && r.domain) {
@@ -345,15 +385,23 @@ function buildDetailCell(r) {
 }
 
 function renderRecords(records) {
+  lastRecords = records || [];
   recordsContainer.textContent = '';
-  if (records.length === 0) {
+  if (lastRecords.length === 0) {
     recordsContainer.appendChild(s86El('p', 'no admin actions recorded yet'));
     return;
   }
+  var sorted = s86SortRows(lastRecords, AUDIT_SORT[sortField] || AUDIT_SORT.at, sortDir);
   var table = document.createElement('table');
-  table.appendChild(s86BuildTableHead(['Time', 'Admin', 'Action', 'Detail', ''], 3));
+  table.appendChild(s86BuildSortableTableHead([
+    { label: 'Time', key: 'at', dir: 'desc' },
+    { label: 'Admin', key: 'admin', dir: 'asc' },
+    { label: 'Action', key: 'action', dir: 'asc' },
+    { label: 'Detail', key: 'detail', dir: 'asc', grow: true },
+    { label: '' }
+  ], { field: sortField, dir: sortDir }, setSort));
   var tbody = document.createElement('tbody');
-  records.forEach(function (r) {
+  sorted.forEach(function (r) {
     var tr = document.createElement('tr');
 
     var timeTd = s86El('td', r.at ? s86FormatRelativeAge(r.at) : 'unknown', 'mono nowrap muted');

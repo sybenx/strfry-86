@@ -186,6 +186,17 @@ tbody th { font-weight:600; }        /* row label, not a column header */
 thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
            line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
            border-bottom:1px solid var(--rule); }
+/* Sortable list headers: a real button that wears the thead chrome, never a
+   second sort-control row elsewhere on the page. Active column is ink so the
+   ↑/↓ arrow is visible against the muted default. */
+thead th.sortable { color:var(--muted); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color:var(--ink); }
+button.th-sort { font:inherit; font-size:inherit; font-weight:inherit;
+                 letter-spacing:inherit; text-transform:inherit;
+                 color:inherit; background:none; border:none; padding:0;
+                 margin:0; cursor:pointer; text-align:left; border-radius:0; }
+button.th-sort:hover:not(:disabled) { background:none; color:var(--ink); }
 td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
 tbody tr:hover { background:var(--wash); }
 button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
@@ -347,7 +358,62 @@ var bulkReasonInput = document.getElementById('bulk-reason-input');
 var bulkReasonReplaceBtn = document.getElementById('bulk-reason-replace-btn');
 var bulkReasonAppendBtn = document.getElementById('bulk-reason-append-btn');
 
+var sortField = 'banned_at';
+var sortDir = 'desc';
+var domainSortField = 'banned_at';
+var domainSortDir = 'desc';
+
 function setStatus(text) { statusEl.textContent = text; }
+
+function cmpStrEmptyLast(a, b) {
+  if (!a && !b) { return 0; }
+  if (!a) { return 1; }
+  if (!b) { return -1; }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+var BAN_SORT = {
+  user: function (a, b) {
+    return cmpStrEmptyLast(
+      (a.name || a.nip05 || a.npub || a.pubkey || '').toLowerCase(),
+      (b.name || b.nip05 || b.npub || b.pubkey || '').toLowerCase()
+    );
+  },
+  banned_at: function (a, b) { return (a.banned_at || 0) - (b.banned_at || 0); },
+  source: function (a, b) {
+    return cmpStrEmptyLast((a.report_type || '').toLowerCase(), (b.report_type || '').toLowerCase());
+  },
+  blocked: function (a, b) { return (a.blocked || 0) - (b.blocked || 0); },
+  reason: function (a, b) {
+    return cmpStrEmptyLast((a.reason || '').toLowerCase(), (b.reason || '').toLowerCase());
+  }
+};
+
+var DOMAIN_SORT = {
+  domain: function (a, b) {
+    return cmpStrEmptyLast((a.domain || '').toLowerCase(), (b.domain || '').toLowerCase());
+  },
+  banned_at: function (a, b) { return (a.banned_at || 0) - (b.banned_at || 0); },
+  pubkeys: function (a, b) {
+    return (a.still_banned || 0) - (b.still_banned || 0)
+      || (a.pubkey_count || 0) - (b.pubkey_count || 0);
+  },
+  reason: function (a, b) {
+    return cmpStrEmptyLast((a.reason || '').toLowerCase(), (b.reason || '').toLowerCase());
+  }
+};
+
+function setBanSort(field, dir) {
+  sortField = field;
+  sortDir = dir;
+  renderBans(lastBanned);
+}
+
+function setDomainSort(field, dir) {
+  domainSortField = field;
+  domainSortDir = dir;
+  renderDomains(lastDomains);
+}
 
 function updateBulkReasonButtons() {
   var n = tableContainer.querySelectorAll('.ban-checkbox:checked').length;
@@ -361,8 +427,13 @@ function matchesQuery(ban, q) {
   if (!q) {
     return true;
   }
-  return [ban.name, ban.nip05, ban.npub, ban.pubkey, ban.reason, ban.report_type]
-    .join(' ').toLowerCase().indexOf(q) !== -1;
+  return [
+    ban.name, ban.nip05, s86Nip05Domain(ban.nip05),
+    ban.npub, ban.pubkey, ban.reason, ban.report_type,
+    ban.blocked != null ? String(ban.blocked) : '',
+    ban.banned_at ? s86FormatDate(ban.banned_at) : '',
+    ban.banned_at ? s86FormatRelativeAge(ban.banned_at) : ''
+  ].join(' ').toLowerCase().indexOf(q) !== -1;
 }
 
 // How many events this pubkey has had REJECTED since the decision log's
@@ -412,7 +483,8 @@ function renderBans(banned) {
 
   var q = filterInput.value.trim().toLowerCase();
   var filtered = banned.filter(function (b) { return matchesQuery(b, q); });
-  var truncation = s86TruncateForRender(filtered, S86_RENDER_MAX);
+  var sorted = s86SortRows(filtered, BAN_SORT[sortField] || BAN_SORT.banned_at, sortDir);
+  var truncation = s86TruncateForRender(sorted, S86_RENDER_MAX);
 
   if (truncation.shown.length === 0) {
     tableContainer.appendChild(s86El('p', banned.length === 0
@@ -420,8 +492,17 @@ function renderBans(banned) {
       : 'no bans match this filter'));
   } else {
     var table = document.createElement('table');
-    var head = ['Pubkey', 'Banned on', 'Source', 'Blocked', 'Reason'];
-    table.appendChild(s86BuildTableHead(isAdmin ? [''].concat(head) : head, isAdmin ? 5 : 4));
+    var headCols = [
+      { label: 'Pubkey', key: 'user', dir: 'asc' },
+      { label: 'Banned on', key: 'banned_at', dir: 'desc' },
+      { label: 'Source', key: 'source', dir: 'asc' },
+      { label: 'Blocked', key: 'blocked', dir: 'desc' },
+      { label: 'Reason', key: 'reason', dir: 'asc', grow: true }
+    ];
+    if (isAdmin) {
+      headCols = [{ label: '' }].concat(headCols);
+    }
+    table.appendChild(s86BuildSortableTableHead(headCols, { field: sortField, dir: sortDir }, setBanSort));
     var tbody = document.createElement('tbody');
     truncation.shown.forEach(function (ban) {
       var tr = document.createElement('tr');
@@ -478,10 +559,17 @@ function renderDomains(domains) {
     domainTableContainer.appendChild(s86El('p', 'no domains banned — ban one from the Domain page'));
     return;
   }
+  var sorted = s86SortRows(domains, DOMAIN_SORT[domainSortField] || DOMAIN_SORT.banned_at, domainSortDir);
   var table = document.createElement('table');
-  table.appendChild(s86BuildTableHead(['Domain', 'Banned on', 'Pubkeys', 'Reason', ''], 3));
+  table.appendChild(s86BuildSortableTableHead([
+    { label: 'Domain', key: 'domain', dir: 'asc' },
+    { label: 'Banned on', key: 'banned_at', dir: 'desc' },
+    { label: 'Pubkeys', key: 'pubkeys', dir: 'desc' },
+    { label: 'Reason', key: 'reason', dir: 'asc', grow: true },
+    { label: '' }
+  ], { field: domainSortField, dir: domainSortDir }, setDomainSort));
   var tbody = document.createElement('tbody');
-  domains.forEach(function (d) {
+  sorted.forEach(function (d) {
     var tr = document.createElement('tr');
 
     var domainTd = s86El('td', null, 'mono');

@@ -186,6 +186,17 @@ tbody th { font-weight:600; }        /* row label, not a column header */
 thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
            line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
            border-bottom:1px solid var(--rule); }
+/* Sortable list headers: a real button that wears the thead chrome, never a
+   second sort-control row elsewhere on the page. Active column is ink so the
+   ↑/↓ arrow is visible against the muted default. */
+thead th.sortable { color:var(--muted); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color:var(--ink); }
+button.th-sort { font:inherit; font-size:inherit; font-weight:inherit;
+                 letter-spacing:inherit; text-transform:inherit;
+                 color:inherit; background:none; border:none; padding:0;
+                 margin:0; cursor:pointer; text-align:left; border-radius:0; }
+button.th-sort:hover:not(:disabled) { background:none; color:var(--ink); }
 td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
 tbody tr:hover { background:var(--wash); }
 button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
@@ -278,7 +289,6 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   <div id="domain-tiles"></div>
   <p id="provenance-line"></p>
   <p><input id="filter-input" type="search" placeholder="filter roster — name, nip05, or npub"></p>
-  <div id="sort-row"></div>
   <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
   <button id="ban-btn" type="button">Ban selected</button>
   <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
@@ -320,7 +330,6 @@ var pasteTextarea = document.getElementById('paste-textarea');
 var pasteSubmitBtn = document.getElementById('paste-submit-btn');
 var provenanceLine = document.getElementById('provenance-line');
 var filterInput = document.getElementById('filter-input');
-var sortRowEl = document.getElementById('sort-row');
 var selectAll = document.getElementById('select-all');
 var banBtn = document.getElementById('ban-btn');
 var copyPurgeBtn = document.getElementById('copy-purge-btn');
@@ -505,34 +514,51 @@ pasteSubmitBtn.addEventListener('click', function () {
 });
 
 // --- sort -------------------------------------------------------------
+// Header-click sort. NIP-05 / claims column orders by the claimed domain
+// half so hosts group together.
+
+function cmpStrEmptyLast(a, b) {
+  if (!a && !b) { return 0; }
+  if (!a) { return 1; }
+  if (!b) { return -1; }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
 
 var SORT_COMPARATORS = {
   name: function (a, b) {
-    var an = a.name || '', bn = b.name || '';
-    if (!an && !bn) { return 0; }
-    if (!an) { return 1; }
-    if (!bn) { return -1; }
-    return an < bn ? -1 : (an > bn ? 1 : 0);
+    var an = (localPartByPubkey[a.pubkey] || a.name || '').toLowerCase();
+    var bn = (localPartByPubkey[b.pubkey] || b.name || '').toLowerCase();
+    return cmpStrEmptyLast(an, bn);
+  },
+  pubkey: function (a, b) {
+    return cmpStrEmptyLast(
+      (a.npub || a.pubkey || '').toLowerCase(),
+      (b.npub || b.pubkey || '').toLowerCase()
+    );
   },
   events: function (a, b) { return (a.scan_count || 0) - (b.scan_count || 0); },
-  banned: function (a, b) { return (a.banned ? 1 : 0) - (b.banned ? 1 : 0); },
-  claims_domain: function (a, b) { return (a.claims_domain ? 1 : 0) - (b.claims_domain ? 1 : 0); }
+  status: function (a, b) {
+    // banned first when desc, then verified, then listed
+    function rank(r) {
+      if (r.banned) { return 2; }
+      if (r.claims_domain) { return 1; }
+      return 0;
+    }
+    return rank(a) - rank(b);
+  },
+  nip05: function (a, b) {
+    var ad = s86Nip05Domain(a.nip05);
+    var bd = s86Nip05Domain(b.nip05);
+    return cmpStrEmptyLast(ad, bd)
+      || cmpStrEmptyLast((a.nip05 || '').toLowerCase(), (b.nip05 || '').toLowerCase());
+  }
 };
 
-sortRowEl.appendChild(s86BuildSortRow(
-  [
-    { key: 'name', label: 'name', dir: 'asc' },
-    { key: 'events', label: 'events', dir: 'desc' },
-    { key: 'banned', label: 'banned', dir: 'desc' },
-    { key: 'claims_domain', label: 'claims domain', dir: 'desc' }
-  ],
-  sortField, sortDir,
-  function (field, dir) {
-    sortField = field;
-    sortDir = dir;
-    renderRoster();
-  }
-));
+function setSort(field, dir) {
+  sortField = field;
+  sortDir = dir;
+  renderRoster();
+}
 
 // --- rendering ------------------------------------------------------------
 
@@ -566,8 +592,15 @@ function matchesQuery(r, q) {
   if (!q) {
     return true;
   }
-  return [r.name, r.nip05, r.npub, r.pubkey, localPartByPubkey[r.pubkey]]
-    .join(' ').toLowerCase().indexOf(q) !== -1;
+  return [
+    r.name, localPartByPubkey[r.pubkey],
+    r.nip05, s86Nip05Domain(r.nip05),
+    r.npub, r.pubkey,
+    r.scan_count != null ? String(r.scan_count) : '',
+    r.banned ? 'banned' : '',
+    r.claims_domain ? 'verified' : 'listed',
+    claimsDomainLabel(r)
+  ].join(' ').toLowerCase().indexOf(q) !== -1;
 }
 
 function renderRoster() {
@@ -592,8 +625,14 @@ function renderRoster() {
   }
 
   var table = document.createElement('table');
-  table.appendChild(s86BuildTableHead(
-    ['', 'Name', 'Pubkey', 'Events', 'Status', 'NIP-05'], 5));
+  table.appendChild(s86BuildSortableTableHead([
+    { label: '' },
+    { label: 'Name', key: 'name', dir: 'asc' },
+    { label: 'Pubkey', key: 'pubkey', dir: 'asc' },
+    { label: 'Events', key: 'events', dir: 'desc' },
+    { label: 'Status', key: 'status', dir: 'desc' },
+    { label: 'NIP-05', key: 'nip05', dir: 'asc', grow: true }
+  ], { field: sortField, dir: sortDir }, setSort));
   var tbody = document.createElement('tbody');
   currentRenderedRows.forEach(function (r) {
     var tr = document.createElement('tr');

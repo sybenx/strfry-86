@@ -186,6 +186,17 @@ tbody th { font-weight:600; }        /* row label, not a column header */
 thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
            line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
            border-bottom:1px solid var(--rule); }
+/* Sortable list headers: a real button that wears the thead chrome, never a
+   second sort-control row elsewhere on the page. Active column is ink so the
+   ↑/↓ arrow is visible against the muted default. */
+thead th.sortable { color:var(--muted); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color:var(--ink); }
+button.th-sort { font:inherit; font-size:inherit; font-weight:inherit;
+                 letter-spacing:inherit; text-transform:inherit;
+                 color:inherit; background:none; border:none; padding:0;
+                 margin:0; cursor:pointer; text-align:left; border-radius:0; }
+button.th-sort:hover:not(:disabled) { background:none; color:var(--ink); }
 td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
 tbody tr:hover { background:var(--wash); }
 button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
@@ -290,6 +301,8 @@ var CONTENT_PREVIEW_MAX = 120;
 var adminPubkey = null;
 var isAdmin = false;
 var lastData = null;
+var sortField = 'time';
+var sortDir = 'desc';
 
 var statusEl = document.getElementById('status');
 var feedAgeEl = document.getElementById('feed-age');
@@ -388,6 +401,36 @@ function matchesFilters(ev) {
   return [ev.pubkey, ev.npub, ev.content || ''].join(' ').toLowerCase().indexOf(q) !== -1;
 }
 
+function cmpStrEmptyLast(a, b) {
+  if (!a && !b) { return 0; }
+  if (!a) { return 1; }
+  if (!b) { return -1; }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+var FEED_SORT = {
+  time: function (a, b) { return (a.created_at || 0) - (b.created_at || 0); },
+  kind: function (a, b) { return (a.kind || 0) - (b.kind || 0); },
+  author: function (a, b) {
+    return cmpStrEmptyLast(
+      (a.npub || a.pubkey || '').toLowerCase(),
+      (b.npub || b.pubkey || '').toLowerCase()
+    );
+  },
+  content: function (a, b) {
+    return cmpStrEmptyLast((a.content || '').toLowerCase(), (b.content || '').toLowerCase());
+  },
+  result: function (a, b) {
+    return cmpStrEmptyLast((a.result || '').toLowerCase(), (b.result || '').toLowerCase());
+  }
+};
+
+function setSort(field, dir) {
+  sortField = field;
+  sortDir = dir;
+  reRender();
+}
+
 function renderFeed(data) {
   lastData = data;
   feedContainer.textContent = '';
@@ -406,10 +449,13 @@ function renderFeed(data) {
     feedAgeEl.textContent = '';
   }
 
+  // Buffer is oldest-first from the server; reverse for newest-first default
+  // then apply the active column sort (default time desc matches that).
   var all = (data.events || []).slice().reverse();
   syncKindOptions(all);
   var filtered = all.filter(matchesFilters);
-  var truncation = s86TruncateForRender(filtered, S86_RENDER_MAX);
+  var sorted = s86SortRows(filtered, FEED_SORT[sortField] || FEED_SORT.time, sortDir);
+  var truncation = s86TruncateForRender(sorted, S86_RENDER_MAX);
   var shown = truncation.shown;
 
   if (shown.length === 0) {
@@ -420,7 +466,13 @@ function renderFeed(data) {
   }
 
   var table = document.createElement('table');
-  table.appendChild(s86BuildTableHead(['Time', 'Kind', 'Author', 'Content', 'Result'], 3));
+  table.appendChild(s86BuildSortableTableHead([
+    { label: 'Time', key: 'time', dir: 'desc' },
+    { label: 'Kind', key: 'kind', dir: 'asc' },
+    { label: 'Author', key: 'author', dir: 'asc' },
+    { label: 'Content', key: 'content', dir: 'asc', grow: true },
+    { label: 'Result', key: 'result', dir: 'asc' }
+  ], { field: sortField, dir: sortDir }, setSort));
   var tbody = document.createElement('tbody');
   shown.forEach(function (ev) {
     var tr = document.createElement('tr');

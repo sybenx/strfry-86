@@ -186,6 +186,17 @@ tbody th { font-weight:600; }        /* row label, not a column header */
 thead th { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
            line-height:1.25; color:var(--muted); border-top:2px solid var(--ink);
            border-bottom:1px solid var(--rule); }
+/* Sortable list headers: a real button that wears the thead chrome, never a
+   second sort-control row elsewhere on the page. Active column is ink so the
+   ↑/↓ arrow is visible against the muted default. */
+thead th.sortable { color:var(--muted); }
+thead th.sortable[aria-sort="ascending"],
+thead th.sortable[aria-sort="descending"] { color:var(--ink); }
+button.th-sort { font:inherit; font-size:inherit; font-weight:inherit;
+                 letter-spacing:inherit; text-transform:inherit;
+                 color:inherit; background:none; border:none; padding:0;
+                 margin:0; cursor:pointer; text-align:left; border-radius:0; }
+button.th-sort:hover:not(:disabled) { background:none; color:var(--ink); }
 td[colspan] { color:var(--muted); }  /* the "+ N more …" tail summary row */
 tbody tr:hover { background:var(--wash); }
 button { font-family:var(--sans); font-size:.82rem; font-weight:600; padding:.5em 1em;
@@ -259,7 +270,7 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 <body>
 <div class="page-head">
   <h1>Users</h1>
-  <input id="filter-input" type="search" placeholder="search pubkey or NIP-05…" aria-label="search users">
+  <input id="filter-input" type="search" placeholder="search any column…" aria-label="search users">
 </div>
 <p id="status"></p>
 <div id="admin-section" style="display:none">
@@ -284,7 +295,6 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 
   <div class="toolbar">
     <label><input id="hide-singletons" type="checkbox" checked> hide single-event authors</label>
-    <div id="sort-row"></div>
   </div>
   <p id="hidden-singletons-line"></p>
   <div class="toolbar">
@@ -339,7 +349,7 @@ var compositionLine = document.getElementById('composition-line');
 var filterInput = document.getElementById('filter-input');
 var hideSingletonsBox = document.getElementById('hide-singletons');
 var hiddenSingletonsLine = document.getElementById('hidden-singletons-line');
-var sortRowEl = document.getElementById('sort-row');
+
 var selectAll = document.getElementById('select-all');
 var banBtn = document.getElementById('ban-btn');
 var copyPurgeBtn = document.getElementById('copy-purge-btn');
@@ -463,34 +473,42 @@ function renderComposition(data) {
 }
 
 // --- sort -------------------------------------------------------------
+// Header-click sort (no separate sort-row). NIP-05 orders by domain so
+// every alice@/bob@ on the same host groups together.
+
+function cmpStrEmptyLast(a, b) {
+  if (!a && !b) { return 0; }
+  if (!a) { return 1; }
+  if (!b) { return -1; }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
 
 var SORT_COMPARATORS = {
-  reports: function (a, b) { return (a.reporters || 0) - (b.reporters || 0) || (a.event_count - b.event_count); },
-  events: function (a, b) { return (a.event_count || 0) - (b.event_count || 0); },
-  name: function (a, b) {
-    var an = a.name || '', bn = b.name || '';
-    if (!an && !bn) { return 0; }
-    if (!an) { return 1; }
-    if (!bn) { return -1; }
-    return an < bn ? -1 : (an > bn ? 1 : 0);
+  user: function (a, b) {
+    return cmpStrEmptyLast(
+      (a.name || a.nip05 || a.npub || a.pubkey || '').toLowerCase(),
+      (b.name || b.nip05 || b.npub || b.pubkey || '').toLowerCase()
+    );
   },
+  nip05: function (a, b) {
+    var ad = s86Nip05Domain(a.nip05);
+    var bd = s86Nip05Domain(b.nip05);
+    return cmpStrEmptyLast(ad, bd)
+      || cmpStrEmptyLast((a.nip05 || '').toLowerCase(), (b.nip05 || '').toLowerCase());
+  },
+  events: function (a, b) { return (a.event_count || 0) - (b.event_count || 0); },
+  reports: function (a, b) {
+    return (a.reporters || 0) - (b.reporters || 0) || (a.event_count || 0) - (b.event_count || 0);
+  },
+  giftwraps: function (a, b) { return (a.giftwrap_count || 0) - (b.giftwrap_count || 0); },
   last_seen: function (a, b) { return (a.last_seen || 0) - (b.last_seen || 0); }
 };
 
-sortRowEl.appendChild(s86BuildSortRow(
-  [
-    { key: 'reports', label: 'reports', dir: 'desc' },
-    { key: 'events', label: 'events', dir: 'desc' },
-    { key: 'name', label: 'name', dir: 'asc' },
-    { key: 'last_seen', label: 'last active', dir: 'desc' }
-  ],
-  sortField, sortDir,
-  function (field, dir) {
-    sortField = field;
-    sortDir = dir;
-    renderUsers();
-  }
-));
+function setSort(field, dir) {
+  sortField = field;
+  sortDir = dir;
+  renderUsers();
+}
 
 // --- rendering ----------------------------------------------------------
 
@@ -505,11 +523,22 @@ function giftwrapLabel(count, saturated) {
   return (saturated ? '≥ ' : '') + Number(count).toLocaleString();
 }
 
+// Search matches every visible column plus the raw keys behind them
+// (npub/hex, domain half of NIP-05, absolute UTC of last active).
 function matchesQuery(row, q) {
   if (!q) {
     return true;
   }
-  return [row.name, row.nip05, row.npub, row.pubkey].join(' ').toLowerCase().indexOf(q) !== -1;
+  var hay = [
+    row.name, row.nip05, s86Nip05Domain(row.nip05),
+    row.npub, row.pubkey,
+    row.event_count != null ? String(row.event_count) : '',
+    row.reporters != null ? String(row.reporters) : '',
+    row.giftwrap_count != null ? String(row.giftwrap_count) : '',
+    row.last_seen ? s86FormatDate(row.last_seen) : '',
+    row.last_seen ? s86FormatRelativeAge(row.last_seen) : ''
+  ].join(' ').toLowerCase();
+  return hay.indexOf(q) !== -1;
 }
 
 function renderUsers() {
@@ -548,11 +577,17 @@ function renderUsers() {
   }
 
   var table = document.createElement('table');
-  table.appendChild(s86BuildTableHead([
-    '', 'User', 'NIP-05', 'Events', 'Reports',
-    saturated ? 'Gift-wraps (floor — scan capped)' : 'Gift-wraps (p-tag)',
-    'Last active', ''
-  ], 2));
+  table.appendChild(s86BuildSortableTableHead([
+    { label: '' },
+    { label: 'User', key: 'user', dir: 'asc' },
+    { label: 'NIP-05', key: 'nip05', dir: 'asc', grow: true },
+    { label: 'Events', key: 'events', dir: 'desc' },
+    { label: 'Reports', key: 'reports', dir: 'desc' },
+    { label: saturated ? 'Gift-wraps (floor — scan capped)' : 'Gift-wraps (p-tag)',
+      key: 'giftwraps', dir: 'desc' },
+    { label: 'Last active', key: 'last_seen', dir: 'desc' },
+    { label: '' }
+  ], { field: sortField, dir: sortDir }, setSort));
   var tbody = document.createElement('tbody');
   currentRenderedRows.forEach(function (r) {
     var tr = document.createElement('tr');
@@ -572,7 +607,13 @@ function renderUsers() {
     tr.appendChild(boxTd);
 
     tr.appendChild(s86BuildIdentityCell(r, true));
-    tr.appendChild(s86El('td', dash(r.nip05), r.nip05 ? 'mono clip' : 'mono muted'));
+
+    var nipTd = s86El('td', dash(r.nip05), r.nip05 ? 'mono clip' : 'mono muted');
+    if (r.nip05) {
+      nipTd.title = r.nip05;
+    }
+    tr.appendChild(nipTd);
+
     tr.appendChild(s86El('td', r.event_count != null ? Number(r.event_count).toLocaleString() : '—', 'num'));
 
     var reportsTd = s86El('td', r.reporters != null ? Number(r.reporters).toLocaleString() : '—', 'num');

@@ -332,11 +332,64 @@ function s86BuildTiles(tiles) {
 // Header row for a data table. Labels are the design's words; every caller
 // passes them in the design's order. `growIndex` names the one column that
 // should absorb the leftover width (the free-text column, always).
+// Prefer s86BuildSortableTableHead for list tables the operator can re-order.
 function s86BuildTableHead(labels, growIndex) {
   var thead = document.createElement('thead');
   var tr = document.createElement('tr');
   labels.forEach(function (label, i) {
     tr.appendChild(s86El('th', label, i === growIndex ? 'grow' : null));
+  });
+  thead.appendChild(tr);
+  return thead;
+}
+
+// Domain half of a NIP-05 address (`alice@example.com` → `example.com`).
+// Used for sort and search so "example.com" finds and groups every local-part
+// on that domain rather than ordering by the name before the @.
+function s86Nip05Domain(nip05) {
+  if (typeof nip05 !== 'string' || !nip05) {
+    return '';
+  }
+  var at = nip05.lastIndexOf('@');
+  return at === -1 ? nip05.toLowerCase() : nip05.slice(at + 1).toLowerCase();
+}
+
+// Clickable column headers for list tables. `columns` is
+// [{label, key?, dir?, grow?}, …] — omit `key` for non-sortable cells
+// (checkbox, Ban/Undo). Active column shows ↑/↓ and aria-sort; a second
+// click on the active field flips direction. `state` is {field, dir};
+// `onSort(field, dir)` re-renders. A real <button> inside the <th> keeps
+// keyboard and screen-reader behaviour honest.
+function s86BuildSortableTableHead(columns, state, onSort) {
+  var thead = document.createElement('thead');
+  var tr = document.createElement('tr');
+  (columns || []).forEach(function (col) {
+    var th = document.createElement('th');
+    if (col.grow) {
+      th.className = 'grow';
+    }
+    if (!col.key) {
+      th.textContent = col.label || '';
+      tr.appendChild(th);
+      return;
+    }
+    th.classList.add('sortable');
+    var active = !!(state && state.field === col.key);
+    th.setAttribute('aria-sort', active
+      ? (state.dir === 'asc' ? 'ascending' : 'descending')
+      : 'none');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'th-sort';
+    btn.textContent = col.label + (active ? (state.dir === 'asc' ? ' ↑' : ' ↓') : '');
+    btn.addEventListener('click', function () {
+      var nextDir = active
+        ? (state.dir === 'asc' ? 'desc' : 'asc')
+        : (col.dir || 'desc');
+      onSort(col.key, nextDir);
+    });
+    th.appendChild(btn);
+    tr.appendChild(th);
   });
   thead.appendChild(tr);
   return thead;
