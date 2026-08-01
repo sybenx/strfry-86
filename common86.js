@@ -554,7 +554,7 @@ function s86BuildProfileEntryField(statusEl) {
 // until login, so they stay out of the nav until the admin is signed in.
 // [label, path, adminOnly]
 var S86_NAV_LINKS = [
-  ['Live Feed', '/home', false],
+  ['Live Feed', '/', false],
   ['Stats & Console', '/stats', false],
   ['Users', '/users', true],
   ['Banlist', '/bans', false],
@@ -589,7 +589,7 @@ function s86BuildPageChrome(statusEl) {
 
   var logo = document.createElement('a');
   logo.className = 'logo';
-  logo.href = '/home';
+  logo.href = '/';
   logo.textContent = 'strfry-86';
   brand.appendChild(logo);
 
@@ -665,7 +665,7 @@ function s86BuildPageChrome(statusEl) {
 
 // --- live layer (shared SSE connection) -------------------------------------
 // GET /api/live is ONE server-side strfry poll loop fanned out to every
-// connected /home and /stats tab (CLAUDE.md "Endpoints"). onMessage(data)
+// connected / and /stats tab (CLAUDE.md "Endpoints"). onMessage(data)
 // fires for every `event: live` frame, including the very first one, which
 // carries the server's current state (ring buffer + delta counters) — never
 // this browser's own history, per the "no history fetch" rule. EventSource

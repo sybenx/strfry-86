@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/favicon.ico">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>strfry-86 — profile</title>
+<title>Profile — strfry-86</title>
 <style>
 /* strfry-86 style block — canonical source. tools/stamp_style.py copies this
    file verbatim into every page's <style>, so "identical character-for-character
@@ -454,7 +454,7 @@ function runProfilePage() {
     // The heading is who this is; the document title is where you are. They
     // used to be the same string, which made the page shout its own name at
     // the operator instead of the account's.
-    document.title = 'strfry-86 — ' + (p.name || truncatedNpub(p.npub));
+    document.title = (p.name || truncatedNpub(p.npub)) + ' — strfry-86';
     pageTitle.textContent = 'Profile';
     profileName.textContent = p.name || p.nip05 || truncatedNpub(p.npub);
     profileDot.replaceWith(s86BuildIdentityDot(p.pubkey));

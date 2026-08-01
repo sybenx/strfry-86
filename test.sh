@@ -848,21 +848,23 @@ check(_reports["counts"].get("x" * 64) == 2 and _reports["counts"].get("y" * 64)
       "compute_reports tallies DISTINCT reporters per p-tag, not raw report events")
 
 # --- Static routes: home landing + Bans moved -----------------------------
-check(server86.STATIC_ROUTES["/home"][0] == "home.html",
-      "STATIC_ROUTES maps /home to home.html (public landing)")
+check(server86.STATIC_ROUTES["/"][0] == "home.html",
+      "STATIC_ROUTES maps / to home.html (public landing)")
 check(server86.STATIC_ROUTES["/bans"][0] == "bans.html",
       "STATIC_ROUTES maps /bans to bans.html")
 for _path, _file in (("/stats", "stats.html"), ("/users", "users.html"),
                      ("/audit", "audit.html"), ("/settings", "settings.html")):
     check(server86.STATIC_ROUTES.get(_path, (None,))[0] == _file,
           f"STATIC_ROUTES maps {_path} to {_file}")
-check("/" not in server86.STATIC_ROUTES,
-      "'/' is not a static route — do_GET redirects it to /home instead")
+check("/home" not in server86.STATIC_ROUTES,
+      "'/home' is not a static route — LEGACY_REDIRECTS sends it to /")
 
-# --- Merged pages: the old paths redirect, they do not 404 or double-serve
-# Report became a section of Stats & Console and Authors became Users. A
-# bookmark that 404s teaches the operator the feature was deleted.
-for _old, _new in (("/report", "/stats"), ("/authors", "/users"), ("/userlist", "/users")):
+# --- Merged / moved pages: old paths redirect, they do not 404 or double-serve
+# Landing moved from /home to /. Report became a section of Stats & Console
+# and Authors became Users. A bookmark that 404s teaches the operator the
+# feature was deleted.
+for _old, _new in (("/home", "/"), ("/report", "/stats"),
+                   ("/authors", "/users"), ("/userlist", "/users")):
     check(server86.LEGACY_REDIRECTS.get(_old) == _new,
           f"{_old} redirects to {_new} rather than serving or 404ing")
     check(_old not in server86.STATIC_ROUTES,
@@ -2062,8 +2064,11 @@ try:
         https_response = http_response
     _opener = _urllib_request.build_opener(_NoRedirect)
     _resp = _opener.open(_urllib_request.Request(_base_url + "/", method="GET"), timeout=5)
-    check(_resp.status == 302 and _resp.headers.get("Location") == "/home",
-          "GET / redirects (302) to /home")
+    check(_resp.status == 200 and b"<title>strfry-86</title>" in _resp.read(),
+          "GET / serves the live feed (home.html) with title strfry-86")
+    _resp = _opener.open(_urllib_request.Request(_base_url + "/home", method="GET"), timeout=5)
+    check(_resp.status == 302 and _resp.headers.get("Location") == "/",
+          "GET /home redirects (302) to /")
 
     _status, _body = _get_bytes("/api/audit?q=")
     _audit_page = json.loads(_body)

@@ -75,7 +75,7 @@ account controls; row two (`.bar`) is the nav tabs and the search box. Only ONE 
 differs between pages, and it differs by attribute rather than by markup: the current
 tab carries `aria-current="page"` and the accent underline.
 
-- `strfry-86` text logo, left of row one: an `<a href="/home">` styled as plain text via
+- `strfry-86` text logo, left of row one: an `<a href="/">` styled as plain text via
   `a.logo`, followed by the fixed `.tagline` (hidden under 600px, never page-specific).
 - Search box `#q`, right end of row two, grows: accepts npub / 64-hex / domain; routes to
   `/profile?npub=` or `/domain?d=` by what was typed. Invalid input sets a plain status
@@ -99,7 +99,7 @@ sections of Stats & Console, Authors is the Users page. Both old paths, plus `/u
 `/profile` and `/domain` are detail pages reached from a row or the search box, never
 from the nav.
 
-### `/home` — Live Event Feed (public landing page)
+### `/` — Live Event Feed (public landing page; `/home` 302s here)
 Logged out this IS the site, and it shows the relay working: Time · Kind · Author ·
 Content · Result. Author and content are public — the earlier no-leak rule is
 **withdrawn**, deliberately; a relay's accepted events are already readable by any client
@@ -244,7 +244,7 @@ older than itself. `test.sh` fails only on the single-kind alarm.
 - `POST /api/settings` (read) and `POST /api/settings/save` (write) — POST for both,
   because every admin-only read in this project carries its NIP-98 auth in the body.
   `save` takes `target:"relay"|"app"` and either `edits` (per-path) or `raw`.
-- Live layer: one server-side strfry poll fanned out over SSE to `/home` and `/stats`;
+- Live layer: one server-side strfry poll fanned out over SSE to `/` and `/stats`;
   deltas only, no history replay, reconnect resets deltas and re-reads baseline. Its
   `events` are decision-log rows when one exists (carrying `pubkey`, `npub`, `content`,
   `result`, `msg`) and scan-ring rows otherwise (with `result` null, never "accepted").
@@ -260,8 +260,9 @@ line contains an `<input>`. `report.html` DOM has no checkbox and no set-bound h
 Empty authors page: both buttons, `recent` checked, duration sourced from `modes`.
 Console: a `delete` verb is refused and nothing executes. Users: saturated gift-wrap
 cell renders `≥`. Style block byte-identical across every page
-(`tools/stamp_style.py --check`). Legacy paths `/report`, `/authors`, `/userlist` each 302
-rather than 404. A feed row with no decision renders `—` in Result, never "accepted".
+(`tools/stamp_style.py --check`). Legacy paths `/home`, `/report`, `/authors`, `/userlist`
+each 302 rather than 404. A feed row with no decision renders `—` in Result, never
+"accepted".
 `strfry.conf` field edits change ONE line and leave every comment and blank line intact;
 an unbalanced-brace raw save writes nothing. `config.json` raw save without a valid
 `admin_pubkey_hex` is refused.

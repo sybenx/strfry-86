@@ -6,8 +6,8 @@ configured port is already taken, this process exits 0 silently, so repeated
 spawns from the plugin are harmless.
 
 Routes:
-  GET  /                  -> 302 redirect to /home
-  GET  /home              -> home.html (public live activity feed)
+  GET  /                  -> home.html (public live activity feed)
+  GET  /home              -> 302 redirect to / (legacy)
   GET  /stats             -> stats.html (totals, live delta, console)
   GET  /report            -> report.html (admin-only cached-scan results page)
   GET  /authors           -> authors.html (admin-only active-author page)
@@ -19,7 +19,7 @@ Routes:
   GET  /common86.js       -> shared client JS for all pages
   GET  /favicon.ico       -> browser-tab icon for all pages
   GET  /api/live          -> text/event-stream: one shared strfry poll loop fanned
-                             out as deltas (new events, kind-5 deletes) to /home & /stats
+                             out as deltas (new events, kind-5 deletes) to / and /stats
   GET  /api/banned        -> public read of the ban list
   GET  /api/authors       -> public read of the last author-scan result (never scans)
   POST /api/authors/scan  -> NIP-98 authenticated: run exactly one bounded scan
@@ -95,7 +95,7 @@ STRFRY_BIN_CANDIDATES = ("/app/strfry", "/usr/local/bin/strfry", "/usr/bin/strfr
 # path traversal is not mitigated here, it is impossible. config.json and
 # blacklist.json sit next to these files and must never be reachable.
 STATIC_ROUTES = {
-    "/home": ("home.html", "text/html; charset=utf-8"),
+    "/": ("home.html", "text/html; charset=utf-8"),
     "/stats": ("stats.html", "text/html; charset=utf-8"),
     "/users": ("users.html", "text/html; charset=utf-8"),
     "/bans": ("bans.html", "text/html; charset=utf-8"),
@@ -107,10 +107,12 @@ STATIC_ROUTES = {
     "/favicon.ico": ("favicon.ico", "image/x-icon"),
 }
 
-# The Report and Authors pages became sections of Stats & Console and the
-# Users page respectively. Old links, bookmarks and the operator's muscle
-# memory keep working; nothing serves two copies of a page.
+# Old links, bookmarks and the operator's muscle memory keep working;
+# nothing serves two copies of a page. /home was the original landing path
+# before the feed moved to /; Report and Authors became sections of Stats
+# and Users respectively.
 LEGACY_REDIRECTS = {
+    "/home": "/",
     "/report": "/stats",
     "/authors": "/users",
     "/userlist": "/users",
@@ -518,7 +520,7 @@ def run_strfry_scan(filter_obj, timeout=SCAN_TIMEOUT):
 # --- live layer: one shared strfry poll loop fanned out over SSE -----------
 # A single background thread polls `strfry scan {"since": ...}` on an
 # interval and keeps a small ring buffer plus running deltas that every
-# connected /home and /stats tab reads from the SAME state — N open tabs
+# connected / and /stats tab reads from the SAME state — N open tabs
 # cost ONE poll loop, never N (WHY.md §6). This is a delta layer only: a
 # freshly connected client renders nothing until the next tick finds
 # something new (rule 9's progressive fill, never a history replay), and a
@@ -537,7 +539,7 @@ _live_seen_at_since = set()         # ids already counted AT exactly _live_since
 _live_delta_baseline_at = None      # scanned_at this delta count is relative to
 _live_new_events = 0
 _live_deletes = 0
-_live_recent = []                   # ring buffer for /home, capped at LIVE_RECENT_MAX
+_live_recent = []                   # ring buffer for the live feed, capped at LIVE_RECENT_MAX
 _live_error = None
 _live_subscribers = []              # list of queue.Queue, one per open SSE connection
 
@@ -3827,12 +3829,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-
-        if path == "/":
-            self.send_response(302)
-            self.send_header("Location", "/home")
-            self.end_headers()
-            return
 
         if path in LEGACY_REDIRECTS:
             self.send_response(302)
