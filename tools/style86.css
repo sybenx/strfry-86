@@ -120,6 +120,10 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Destructive / dependency warnings on a setting (e.g. writePolicy.plugin).
+   --accent is the project's "bad" colour; weight makes it read before the
+   muted help line under it. */
+.field-control .note.bad { color:var(--accent); font-weight:600; }
 /* Compact progress: the "N of ~M" size figure is the one number that matters
    mid-run, so it steps out of the muted note colour into full ink + bold. */
 .field-control .note .figure { color:var(--ink); font-weight:700;

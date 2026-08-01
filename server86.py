@@ -1978,6 +1978,17 @@ CONF_FIELD_HELP = {
         "(default 300; live broadcast still requires a brief write)",
 }
 
+# Warnings render in red on the Settings page. writePolicy.plugin is the path
+# the running relay uses to call into plugin86 — changing it is how operators
+# accidentally turn off bans and the decision log while everything still
+# "looks configured".
+CONF_FIELD_WARNING = {
+    "relay.writePolicy.plugin":
+        "Do not change this path. strfry-86 depends on writePolicy.plugin "
+        "pointing at plugin86.py — changing it disables ban enforcement and "
+        "the decision log.",
+}
+
 
 def _config_raw():
     try:
@@ -2019,6 +2030,9 @@ def get_settings_payload():
         help_text = CONF_FIELD_HELP.get(f["path"])
         if help_text:
             f["help"] = help_text
+        warning = CONF_FIELD_WARNING.get(f["path"])
+        if warning:
+            f["warning"] = warning
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             cfg_data = json.load(fh)

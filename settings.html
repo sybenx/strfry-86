@@ -129,6 +129,10 @@ dl.tiles .note.bad { color:var(--accent); }
 .field-label { font-size:.85rem; color:var(--muted); }
 .field-control input[type="text"], .field-control input[type="number"] { width:100%; max-width:24em; }
 .field-control .note { margin:.2rem 0 0; font-size:.72rem; color:var(--muted); }
+/* Destructive / dependency warnings on a setting (e.g. writePolicy.plugin).
+   --accent is the project's "bad" colour; weight makes it read before the
+   muted help line under it. */
+.field-control .note.bad { color:var(--accent); font-weight:600; }
 /* Compact progress: the "N of ~M" size figure is the one number that matters
    mid-run, so it steps out of the muted note colour into full ink + bold. */
 .field-control .note .figure { color:var(--ink); font-weight:700;
@@ -369,11 +373,53 @@ function buildFieldRow(field, onDirty) {
   } else {
     right.appendChild(control);
   }
+  if (field.warning) {
+    right.appendChild(s86El('p', field.warning, 'note bad'));
+  }
   if (field.help) {
     right.appendChild(s86El('p', field.help, 'note'));
   }
   row.appendChild(right);
   return row;
+}
+
+// Fields the operator usually edits stay in the open form; everything else
+// folds into Advanced. relay.info is NIP-11 identity — always fully visible.
+// bind/port are the next most-touched connection settings. The write-policy
+// plugin path is deliberately advanced (and carries a red warning): it is
+// what points the relay at plugin86.
+function isRelayPrimaryField(field) {
+  var section = field.section || '';
+  if (section === 'relay.info' || section.indexOf('relay.info.') === 0) {
+    return true;
+  }
+  return field.path === 'relay.bind' || field.path === 'relay.port';
+}
+
+function groupFieldsBySection(fieldList) {
+  var groups = [];
+  var byName = {};
+  (fieldList || []).forEach(function (f) {
+    if (!byName[f.section]) {
+      byName[f.section] = { name: f.section, fields: [] };
+      groups.push(byName[f.section]);
+    }
+    byName[f.section].fields.push(f);
+  });
+  return groups;
+}
+
+function appendFieldGroups(container, fieldList, onDirty, original, controls) {
+  groupFieldsBySection(fieldList).forEach(function (group) {
+    container.appendChild(s86El('h3', sectionTitle(group.name)));
+    group.fields.forEach(function (f) {
+      var row = buildFieldRow(f, onDirty);
+      container.appendChild(row);
+      var control = row.querySelector('[data-path]');
+      original[f.path] = controlValue(control);
+      controls.push(control);
+    });
+  });
 }
 
 // Live estimate + Purge now + Compact for the gift-wrap retention slider.
@@ -809,31 +855,35 @@ function buildSection(container, target, title, data) {
     statusLine.textContent = dirty ? 'unsaved changes' : '';
   }
 
-  // Group in file order — the order the operator's own file already has, not
-  // an order invented here.
-  var groups = [];
-  var byName = {};
-  (data.fields || []).forEach(function (f) {
-    if (!byName[f.section]) {
-      byName[f.section] = { name: f.section, fields: [] };
-      groups.push(byName[f.section]);
-    }
-    byName[f.section].fields.push(f);
-  });
-
-  if (groups.length === 0) {
-    structured.appendChild(s86El('p', 'no scalar settings were recognised in this file — use the raw editor.'));
+  // Relay: primary fields (info + bind/port) open; everything else —
+  // including writePolicy.plugin — under a closed <details>. App config is
+  // short enough that every field stays open. Within each list, section
+  // order still follows the file, not an invented order.
+  var allFields = data.fields || [];
+  var primaryFields = allFields;
+  var advancedFields = [];
+  if (target === 'relay') {
+    primaryFields = allFields.filter(isRelayPrimaryField);
+    advancedFields = allFields.filter(function (f) { return !isRelayPrimaryField(f); });
   }
-  groups.forEach(function (group) {
-    structured.appendChild(s86El('h3', sectionTitle(group.name)));
-    group.fields.forEach(function (f) {
-      var row = buildFieldRow(f, markDirty);
-      structured.appendChild(row);
-      var control = row.querySelector('[data-path]');
-      original[f.path] = controlValue(control);
-      controls.push(control);
-    });
-  });
+
+  if (allFields.length === 0) {
+    structured.appendChild(s86El('p', 'no scalar settings were recognised in this file — use the raw editor.'));
+  } else {
+    appendFieldGroups(structured, primaryFields, markDirty, original, controls);
+    if (advancedFields.length > 0) {
+      var details = document.createElement('details');
+      var summary = document.createElement('summary');
+      summary.textContent = 'Advanced settings (' + advancedFields.length + ')';
+      details.appendChild(summary);
+      details.appendChild(s86El('p',
+        'Rarely changed knobs — database paths, limits, threading, logging, '
+        + 'and the write-policy plugin path. Expand only when you mean to.',
+        'muted'));
+      appendFieldGroups(details, advancedFields, markDirty, original, controls);
+      structured.appendChild(details);
+    }
+  }
   container.appendChild(structured);
 
   var textarea = document.createElement('textarea');
