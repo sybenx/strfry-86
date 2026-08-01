@@ -1549,6 +1549,49 @@ function s86PyKindTallyScript() {
   ].join('\n');
 }
 
+// Stream-sum authored events for one pubkey. Reports JSONL line bytes
+// (serialized event body as strfry prints it) and content-field UTF-8
+// bytes. That is the best per-author size strfry can give from the
+// outside — LMDB page overhead is shared and not attributable per key,
+// so freeable disk after a delete is a different, larger question.
+function s86PyStorageByAuthorScript() {
+  return [
+    'import sys, json',
+    'n = 0',
+    'raw = 0',
+    'content = 0',
+    'kinds = {}',
+    'for line in sys.stdin:',
+    '    line = line.strip()',
+    '    if not line:',
+    '        continue',
+    '    raw += len(line.encode("utf-8"))',
+    '    n += 1',
+    '    try:',
+    '        e = json.loads(line)',
+    '    except ValueError:',
+    '        continue',
+    '    k = e.get("kind")',
+    '    kinds[k] = kinds.get(k, 0) + 1',
+    '    c = e.get("content") or ""',
+    '    if isinstance(c, str):',
+    '        content += len(c.encode("utf-8"))',
+    'def fmt(b):',
+    '    for u, d in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):',
+    '        if b >= d:',
+    '            return "%.2f %s" % (b / float(d), u)',
+    '    return "%d B" % b',
+    'print("events:", n)',
+    'print("jsonl bytes:", raw, "(" + fmt(raw) + ")")',
+    'print("content field bytes:", content, "(" + fmt(content) + ")")',
+    'print("mean jsonl bytes/event:", (raw // n) if n else 0)',
+    'print("kind histogram:")',
+    'for k, c in sorted(kinds.items(), key=lambda kv: -kv[1]):',
+    '    print("  kind", k, ":", c)',
+    'print("note: authored-event payload size only; LMDB page overhead is extra")',
+  ].join('\n');
+}
+
 // Returns [countCommand, deleteCommand] — two commands, meant to be
 // copied and run one at a time (count first), never as one pasted blob.
 function s86RenderDeleteWithCountFirst(filterObj) {
@@ -1641,6 +1684,13 @@ var S86_COMMAND_INTENTS = [
   {
     key: 'kinds_by_author',
     label: 'Event kinds by author, lifetime',
+    fields: [
+      { key: 'pubkey', type: 'pubkey', label: 'pubkey (npub or hex): ' }
+    ]
+  },
+  {
+    key: 'storage_by_author',
+    label: 'Storage used by author',
     fields: [
       { key: 'pubkey', type: 'pubkey', label: 'pubkey (npub or hex): ' }
     ]
@@ -1890,6 +1940,44 @@ function s86BuildCommandGenerator(options) {
     setCommands(["strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + JSON.stringify({ authors: [hex] }) + "' | python3 -c '\n" + s86PyKindTallyScript() + "\n'"]);
   }
 
+  // Storage for one npub: strfry has no per-author disk metric. We can
+  // (1) count authored events from the index in seconds, (2) stream those
+  // events and sum JSONL/content bytes for a real payload figure, and
+  // (3) count gift wraps addressed TO them (kind 1059 + #p) — those
+  // bodies sit under the *sender's* author key, so size would be a
+  // different, heavier scan and is left as a count only.
+  function renderStorageByAuthor() {
+    var hex = s86PubkeyInputToHex(fieldInputs.pubkey.value);
+    if (!hex) {
+      setMessage('enter a pubkey above');
+      return;
+    }
+    var authorFilter = JSON.stringify({ authors: [hex] });
+    var gwFilter = JSON.stringify({ kinds: [1059], '#p': [hex] });
+    extraEl.appendChild(s86El('p',
+      'Authored payload size is measured by streaming every event this '
+      + 'pubkey published. Freeable LMDB disk after a delete is larger '
+      + '(page overhead) and is not attributable per author. Gift wraps '
+      + 'they received are counted separately — the encrypted bodies are '
+      + 'stored under the senders, not this key.',
+      'muted'));
+    setCommands([
+      {
+        label: 'fast authored-event count (index, seconds):',
+        command: "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '" + authorFilter + "'"
+      },
+      {
+        label: 'authored payload size — streams every event (minutes if large):',
+        command: "strfry " + S86_STRFRY_CONFIG_FLAG + " scan '" + authorFilter + "' | python3 -c '\n"
+          + s86PyStorageByAuthorScript() + "\n'"
+      },
+      {
+        label: 'gift wraps addressed TO this pubkey (count only):',
+        command: "strfry " + S86_STRFRY_CONFIG_FLAG + " scan --count '" + gwFilter + "'"
+      }
+    ]);
+  }
+
   function render() {
     extraEl.textContent = '';
     var intent = currentIntent();
@@ -1899,6 +1987,8 @@ function s86BuildCommandGenerator(options) {
       renderGiftwrapPurge();
     } else if (intent.key === 'kinds_by_author') {
       renderKindsByAuthor();
+    } else if (intent.key === 'storage_by_author') {
+      renderStorageByAuthor();
     }
   }
 
