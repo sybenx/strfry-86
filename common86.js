@@ -1184,6 +1184,7 @@ var S86_JOB_LABELS = {
   'report-totals': 'the database totals refresh',
   'report-walk': 'the database walk',
   'giftwrap-purge': 'the gift-wrap purge',
+  'ephemeral-purge': 'the ephemeral-kinds purge',
   'db-compact': 'database compact'
 };
 

@@ -274,6 +274,8 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   <div id="relay-section"></div>
   <hr>
   <div id="app-section"></div>
+  <hr>
+  <div id="ephemeral-section"></div>
 </div>
 <script src="/common86.js"></script>
 <script>
@@ -966,9 +968,184 @@ function buildSection(container, target, title, data) {
   });
 }
 
+// NIP-16 ephemeral kinds (20000–29999): written so live subscriptions can
+// receive them, then RelayCron deletes after ephemeralEventsLifetimeSeconds.
+// They do touch disk. This panel counts leftovers and offers a one-shot
+// purge when lifetime was high or cron lagged.
+function buildEphemeralSection(container) {
+  container.textContent = '';
+  container.appendChild(s86El('h2', 'Ephemeral kinds (NIP-16)'));
+  container.appendChild(s86El('p',
+    'Kinds 20000–29999 are accepted by the write policy so open clients get '
+    + 'live fan-out. strfry writes them to LMDB with expiration=1; RelayCron '
+    + 'deletes them after events.ephemeralEventsLifetimeSeconds (default 300s). '
+    + 'They do touch disk — briefly when healthy, longer if that lifetime is '
+    + 'raised or cron falls behind. This purge deletes every event still in '
+    + 'that kind range. Lifetime itself is under Relay → Advanced → events.',
+    'muted'));
+
+  var estimateEl = s86El('p', 'estimating…', 'note');
+  var toolbar = s86El('div', null, 'toolbar');
+  var purgeBtn = s86El('button', 'Purge ephemeral kinds');
+  purgeBtn.type = 'button';
+  var refreshBtn = s86El('button', 'Refresh estimate');
+  refreshBtn.type = 'button';
+  var purgeStatus = s86El('span', '', 'muted');
+  toolbar.appendChild(purgeBtn);
+  toolbar.appendChild(refreshBtn);
+  toolbar.appendChild(purgeStatus);
+  container.appendChild(estimateEl);
+  container.appendChild(toolbar);
+
+  function formatEstimate(est) {
+    if (!est || est.ephemeral_events == null) {
+      return 'could not estimate';
+    }
+    var n = est.ephemeral_events.toLocaleString();
+    var pct = est.event_share != null
+      ? ((est.event_share * 100).toFixed(est.event_share < 0.01 ? 2 : 1) + '% of all events')
+      : null;
+    var bytes = est.bytes_estimate != null ? s86FormatBytes(est.bytes_estimate) : null;
+    var parts = [n + ' ephemeral events on disk'];
+    if (pct) {
+      parts.push(pct);
+    }
+    if (bytes) {
+      parts.push('~' + bytes + ' (estimate)');
+    }
+    return parts.join(' · ');
+  }
+
+  function refreshEstimate() {
+    estimateEl.textContent = 'estimating…';
+    s86SignAndPost('/api/ephemeral/estimate', {})
+      .then(function (result) {
+        if (!result.ok) {
+          estimateEl.textContent = 'estimate unavailable — ' + s86ErrMsg(result);
+          return;
+        }
+        estimateEl.textContent = formatEstimate(result.body);
+      })
+      .catch(function () {
+        estimateEl.textContent = 'estimate unavailable';
+      });
+  }
+
+  function formatPurgeProgress(st) {
+    if (!st) {
+      return '';
+    }
+    if (st.blocked_by) {
+      return 'not started — ' + (S86_JOB_LABELS[st.blocked_by] || st.blocked_by)
+        + ' is running. This button re-enables when it finishes.';
+    }
+    if (st.status === 'running') {
+      var elapsed = st.started_at
+        ? Math.max(0, Math.floor(Date.now() / 1000) - st.started_at)
+        : 0;
+      var elapsedTxt = elapsed < 60
+        ? (elapsed + 's')
+        : (Math.floor(elapsed / 60) + 'm ' + (elapsed % 60) + 's');
+      if (st.phase === 'counting' || st.phase === 'starting') {
+        return 'counting ephemeral events… ' + elapsedTxt;
+      }
+      if (st.phase === 'deleting') {
+        var total = st.total != null ? st.total.toLocaleString() : '?';
+        return 'deleting ~' + total + ' ephemeral events… ' + elapsedTxt;
+      }
+      return 'running… ' + elapsedTxt;
+    }
+    if (st.failed) {
+      var detail = (payload && payload.ephemeral_purge) || null;
+      var text = (detail && detail.error) || st.error || '';
+      return 'failed — ' + (text || 'purge failed; reload to load the reason');
+    }
+    if (st.phase === 'done' && st.counted != null) {
+      return 'purged ~' + Number(st.counted).toLocaleString()
+        + ' ephemeral events (kinds 20000–29999)';
+    }
+    return '';
+  }
+
+  function applyPurgeStatus(st) {
+    var busy = !!(st && (st.status === 'running' || st.blocked_by));
+    purgeBtn.disabled = busy || !isAdmin;
+    refreshBtn.disabled = busy || !isAdmin;
+    purgeStatus.textContent = formatPurgeProgress(st);
+  }
+
+  function pollPurge() {
+    s86PollStatus(
+      function () {
+        return fetch('/api/ephemeral/purge').then(function (res) {
+          return res.json();
+        });
+      },
+      function (st) {
+        applyPurgeStatus(st);
+        if (st && st.phase === 'done') {
+          refreshEstimate();
+        }
+      }
+    );
+  }
+
+  var prior = (payload && payload.ephemeral_purge) || null;
+  if (prior) {
+    applyPurgeStatus(prior);
+    if (prior.status === 'running' || prior.blocked_by) {
+      pollPurge();
+    }
+  }
+
+  refreshEstimate();
+
+  refreshBtn.addEventListener('click', function () {
+    if (isAdmin) {
+      refreshEstimate();
+    }
+  });
+
+  purgeBtn.addEventListener('click', function () {
+    if (!isAdmin) {
+      return;
+    }
+    if (!window.confirm(
+      'Delete every event of kind 20000–29999 now?\n\n'
+      + 'These are NIP-16 ephemeral events (typing indicators, presence, etc.). '
+      + 'strfry is supposed to drop them after ephemeralEventsLifetimeSeconds; '
+      + 'this purge removes anything still on disk. Cannot be undone from this UI.'
+    )) {
+      return;
+    }
+    purgeBtn.disabled = true;
+    purgeStatus.textContent = 'starting…';
+    s86SignAndPost('/api/ephemeral/purge', {})
+      .then(function (result) {
+        var st = result.body || {};
+        if (!result.ok) {
+          purgeBtn.disabled = false;
+          purgeStatus.textContent = 'failed — ' + s86ErrMsg(result);
+          return;
+        }
+        applyPurgeStatus(st);
+        if (st.status === 'running' || st.blocked_by) {
+          pollPurge();
+        } else if (st.phase === 'done') {
+          refreshEstimate();
+        }
+      })
+      .catch(function () {
+        purgeBtn.disabled = false;
+        purgeStatus.textContent = 'failed — request error';
+      });
+  });
+}
+
 function render() {
   buildSection(document.getElementById('relay-section'), 'relay', 'Relay', payload.relay);
   buildSection(document.getElementById('app-section'), 'app', 'Admin console', payload.app);
+  buildEphemeralSection(document.getElementById('ephemeral-section'));
 }
 
 function loadSettings() {

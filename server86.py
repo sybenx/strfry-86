@@ -925,6 +925,147 @@ def run_giftwrap_retention_purge(days=None):
     return True, None, filt
 
 
+def ephemeral_kinds_filter():
+    """Nostr filter matching every NIP-16 ephemeral kind (20000–29999).
+    Kind ranges do not exist in NIP-01, so this is the full list."""
+    return {"kinds": _EPHEMERAL_KINDS}
+
+
+def is_ephemeral_kind(kind):
+    return isinstance(kind, int) and EPHEMERAL_KIND_MIN <= kind <= EPHEMERAL_KIND_MAX
+
+
+def estimate_ephemeral_storage():
+    """Index count of kinds 20000–29999 plus a proportional storage estimate.
+    Same shape as gift-wrap estimate: event count is exact; bytes are
+    count/total × db size (planning figure, not free-space measurement)."""
+    filt = ephemeral_kinds_filter()
+    ephemeral_events = run_strfry_count(filt, timeout=AUTHOR_SCAN_DEADLINE)
+    totals = (get_report_status().get("totals") or {})
+    total_events = totals.get("total_events")
+    if total_events is None:
+        total_events = run_strfry_count({}, timeout=AUTHOR_SCAN_DEADLINE)
+    db_bytes, _ = _strfry_db_bytes()
+    event_share = (ephemeral_events / total_events) if total_events else None
+    bytes_est = int(db_bytes * event_share) if db_bytes is not None and event_share is not None else None
+    return {
+        "ephemeral_events": ephemeral_events,
+        "total_events": total_events,
+        "event_share": event_share,
+        "bytes_estimate": bytes_est,
+        "db_bytes": db_bytes,
+        "kind_min": EPHEMERAL_KIND_MIN,
+        "kind_max": EPHEMERAL_KIND_MAX,
+        "estimate_note": "storage is proportional to event count, not measured free space",
+    }
+
+
+def run_ephemeral_purge():
+    """Delete every event of kind 20000–29999. Synchronous; Settings uses
+    the async job wrapper. Failures are returned so a stuck delete never
+    kills the server process."""
+    try:
+        strfry_bin = require_strfry_bin()
+        conf = require_strfry_conf()
+    except RuntimeError as e:
+        log(f"server86: ephemeral purge skipped: {e}")
+        return False, str(e), None
+    filt = ephemeral_kinds_filter()
+    filter_json = json.dumps(filt, separators=(",", ":"))
+    argv = [strfry_bin, "--config", conf, "delete", "--filter", filter_json]
+    try:
+        result = subprocess.run(
+            argv, cwd=get_relay_cwd(), capture_output=True,
+            timeout=EPHEMERAL_PURGE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"server86: ephemeral purge timed out after {EPHEMERAL_PURGE_TIMEOUT}s")
+        return False, "timeout", None
+    except Exception as e:
+        log(f"server86: ephemeral purge failed: {type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}", None
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", "replace")[-300:]
+        log(f"server86: ephemeral purge exit {result.returncode}: {err}")
+        return False, err or f"exit {result.returncode}", None
+    log("server86: ephemeral purge ok (kinds 20000–29999)")
+    return True, None, filt
+
+
+# --- ephemeral purge job (Settings "Purge ephemeral kinds") -----------------
+# Same shape as giftwrap-purge: count → delete under the global scan lock.
+# No hourly auto loop — RelayCron is supposed to keep these short-lived;
+# this is the operator cleanup when that has lagged or lifetime was high.
+_ephemeral_purge_job = {
+    "status": "idle", "started_at": None, "progress": None, "total": None,
+    "rate": None, "eta": None, "phase": None, "error": None,
+    "finished_at": None, "counted": None,
+}
+_JOB_REGISTRY["ephemeral-purge"] = _ephemeral_purge_job
+
+
+def get_ephemeral_purge_status(include_detail=False):
+    with _scan_lock:
+        status = dict(_ephemeral_purge_job)
+        running = _active_scan["name"]
+    status["blocked_by"] = running if running not in (None, "ephemeral-purge") else None
+    error = status.get("error")
+    status["failed"] = bool(error) or status.get("phase") == "failed"
+    if not include_detail:
+        status.pop("error", None)
+    return status
+
+
+def _run_ephemeral_purge_job():
+    error = None
+    counted = None
+    try:
+        with _scan_lock:
+            _ephemeral_purge_job["phase"] = "counting"
+            _ephemeral_purge_job["progress"] = 0
+            _ephemeral_purge_job["total"] = None
+        filt = ephemeral_kinds_filter()
+        total = run_strfry_count(filt, timeout=AUTHOR_SCAN_DEADLINE)
+        with _scan_lock:
+            _ephemeral_purge_job["total"] = total
+            _ephemeral_purge_job["progress"] = 0
+            _ephemeral_purge_job["phase"] = "deleting"
+        ok, err, _used = run_ephemeral_purge()
+        if not ok:
+            error = err or "purge failed"
+        else:
+            counted = total
+            with _scan_lock:
+                _ephemeral_purge_job["progress"] = total
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"[:600]
+        log(f"server86: ephemeral purge job failed: {error}")
+    with _scan_lock:
+        _ephemeral_purge_job["status"] = "idle"
+        _ephemeral_purge_job["phase"] = "failed" if error else "done"
+        _ephemeral_purge_job["error"] = error
+        _ephemeral_purge_job["counted"] = counted
+        _ephemeral_purge_job["finished_at"] = int(time.time())
+        _ephemeral_purge_job["rate"] = None
+        _ephemeral_purge_job["eta"] = None
+        _active_scan["name"] = None
+
+
+def start_ephemeral_purge(on_started=None):
+    """Start one ephemeral-kind purge under the global job lock."""
+    def run():
+        _run_ephemeral_purge_job()
+
+    return _start_scan_job(
+        "ephemeral-purge", _ephemeral_purge_job, run,
+        on_started=on_started,
+        extra_job_fields={
+            "phase": "starting", "error": None,
+            "finished_at": None, "counted": None,
+        },
+    )
+
+
 # --- gift-wrap purge job (Settings "Purge now") -----------------------------
 # Async so the request is not held open for the whole delete. strfry's
 # `delete` collects every matching levId then deletes in one write txn —
@@ -1949,6 +2090,16 @@ GIFTWRAP_RETENTION_MAX = 30
 GIFTWRAP_RETENTION_INTERVAL = 3600   # seconds between purge attempts
 GIFTWRAP_RETENTION_TIMEOUT = 3600   # hard cap on one strfry delete run
 
+# NIP-16 ephemeral kinds. strfry WRITES them (so open subscriptions get the
+# fan-out) and marks them expiration=1; RelayCron then deletes after
+# events.ephemeralEventsLifetimeSeconds. They do touch disk — briefly when
+# healthy, longer when lifetime is high or cron lags. Nostr filters have
+# no kind range, so the filter is the full integer list once.
+EPHEMERAL_KIND_MIN = 20000
+EPHEMERAL_KIND_MAX = 29999
+_EPHEMERAL_KINDS = list(range(EPHEMERAL_KIND_MIN, EPHEMERAL_KIND_MAX + 1))
+EPHEMERAL_PURGE_TIMEOUT = 3600
+
 CONFIG_EDITABLE_FIELDS = {
     # config.json keys the Settings page may write. admin_pubkey_hex is
     # deliberately NOT here: it is the credential that authorises the very
@@ -2076,6 +2227,7 @@ def get_settings_payload():
         # text the public poll endpoints withhold. The Settings page is the
         # only thing that needs it, and it already authenticates to load this.
         "purge": get_giftwrap_purge_status(include_detail=True),
+        "ephemeral_purge": get_ephemeral_purge_status(include_detail=True),
         "compact": get_db_compact_status(include_detail=True),
     }
 
@@ -2987,6 +3139,7 @@ def _empty_report_walk():
         "distinct_authors_giftwrap": None, "kinds": {}, "unlisted_kinds": {},
         "unlisted_total": None, "unlisted_kind_count": None,
         "expired_events": None,
+        "ephemeral_events": None,
         "warning": None, "error": None,
     }
 
@@ -3097,15 +3250,18 @@ def compute_report_walk(progress_cb=None):
     distinct_prefixes = set()
     giftwrap_count = 0
     expired_count = 0
+    ephemeral_count = 0
     walk_now = int(time.time())
 
     def on_event(ev):
-        nonlocal giftwrap_count, expired_count
+        nonlocal giftwrap_count, expired_count, ephemeral_count
         if not isinstance(ev, dict):
             return
         kind = ev.get("kind")
         if isinstance(kind, int):
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            if is_ephemeral_kind(kind):
+                ephemeral_count += 1
         tags = ev.get("tags")
         if isinstance(tags, list):
             exp = event_expiration(tags)
@@ -3163,6 +3319,7 @@ def compute_report_walk(progress_cb=None):
         "unlisted_total": sum(unlisted_kinds.values()),
         "unlisted_kind_count": len(unlisted_kinds),
         "expired_events": expired_count,
+        "ephemeral_events": ephemeral_count,
         "warning": None,
         "error": None,
     }
@@ -3903,6 +4060,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, get_giftwrap_purge_status())
             return
 
+        if path == "/api/ephemeral/purge":
+            # Same public-poll / redacted-error shape as gift-wrap purge.
+            self._send_json(200, get_ephemeral_purge_status())
+            return
+
         if path == "/api/db-compact":
             # Same public-poll / redacted-error shape as gift-wrap purge.
             self._send_json(200, get_db_compact_status())
@@ -4003,6 +4165,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/console", "/api/undo",
             "/api/settings", "/api/settings/save", "/api/domain-unban",
             "/api/giftwrap-retention/estimate", "/api/giftwrap-retention/purge",
+            "/api/ephemeral/estimate", "/api/ephemeral/purge",
             "/api/db-compact",
         ):
             self._send_json(404, {"error": "not found"})
@@ -4179,6 +4342,26 @@ class Handler(BaseHTTPRequestHandler):
             )
             # 202 while this job (or a blocker) is running so the client
             # knows to poll; 200 when nothing is in flight.
+            code = 202 if status.get("status") == "running" or status.get("blocked_by") else 200
+            self._send_json(code, status)
+            return
+
+        if path == "/api/ephemeral/estimate":
+            try:
+                est = estimate_ephemeral_storage()
+            except Exception as e:
+                self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
+                return
+            self._send_json(200, est)
+            return
+
+        if path == "/api/ephemeral/purge":
+            status = start_ephemeral_purge(
+                on_started=lambda: audit_append({
+                    "type": "ephemeral_purge", "actor": auth.get("pubkey"),
+                    "via": "settings purge ephemeral",
+                }),
+            )
             code = 202 if status.get("status") == "running" or status.get("blocked_by") else 200
             self._send_json(code, status)
             return

@@ -1619,7 +1619,9 @@ def _streaming_walk(filter_obj, on_event, timeout, on_progress=None):
     on_event({"kind": 1059, "pubkey": "c" * 64, "tags": [["expiration", "1"]]})
     on_event({"kind": 1059, "pubkey": "d" * 64})
     on_event({"kind": 99999, "pubkey": pk_a, "tags": [["expiration", "soon"]]})
-    return 5
+    on_event({"kind": 20000, "pubkey": pk_a})  # NIP-16 ephemeral leftover
+    on_event({"kind": 22242, "pubkey": pk_b})
+    return 7
 
 
 server86.run_strfry_count = lambda filter_obj, timeout=None: 5
@@ -1638,10 +1640,40 @@ check(99999 in walk_result["walk"]["unlisted_kinds"] and walk_result["walk"]["un
       "compute_report_walk: unlisted_kinds reports a kind that is neither in AUTHOR_SCAN_KINDS nor 1059")
 check(1059 not in walk_result["walk"]["unlisted_kinds"] and 1 not in walk_result["walk"]["unlisted_kinds"],
       "compute_report_walk: unlisted_kinds excludes gift wraps and allowlisted kinds")
-check(walk_result["walk"]["unlisted_total"] == 1 and walk_result["walk"]["unlisted_kind_count"] == 1,
+# 99999 + two NIP-16 ephemeral kinds (20000, 22242) sit outside the allowlist.
+check(walk_result["walk"]["unlisted_total"] == 3 and walk_result["walk"]["unlisted_kind_count"] == 3,
       "compute_report_walk: unlisted_total/unlisted_kind_count summarise unlisted_kinds so the page needs no client-side arithmetic")
 check(walk_result["walk"]["expired_events"] == 2,
       "compute_report_walk: expired_events counts NIP-40 past-expiration events (incl. an expired gift wrap), skipping future and malformed expirations")
+check(walk_result["walk"]["ephemeral_events"] == 2,
+      "compute_report_walk: ephemeral_events counts kinds 20000–29999 still on disk")
+
+# --- ephemeral kinds filter + estimate --------------------------------------
+_eph_filt = server86.ephemeral_kinds_filter()
+check(_eph_filt["kinds"][0] == 20000 and _eph_filt["kinds"][-1] == 29999
+      and len(_eph_filt["kinds"]) == 10000,
+      "ephemeral_kinds_filter is the full NIP-16 range 20000–29999 (no kind-range in NIP-01)")
+check(server86.is_ephemeral_kind(20000) and server86.is_ephemeral_kind(29999)
+      and not server86.is_ephemeral_kind(19999) and not server86.is_ephemeral_kind(30000),
+      "is_ephemeral_kind bounds the NIP-16 range inclusively")
+_orig_count_eph = server86.run_strfry_count
+_orig_db_eph = server86._strfry_db_bytes
+_eph_calls = []
+def _fake_eph_count(filter_obj, timeout=None):
+    _eph_calls.append(filter_obj)
+    if filter_obj == {}:
+        return 1000
+    return 42
+server86.run_strfry_count = _fake_eph_count
+server86._strfry_db_bytes = lambda: (10 * 1024 * 1024, None)
+_eph_est = server86.estimate_ephemeral_storage()
+server86.run_strfry_count = _orig_count_eph
+server86._strfry_db_bytes = _orig_db_eph
+check(_eph_est["ephemeral_events"] == 42 and _eph_est["total_events"] == 1000,
+      "estimate_ephemeral_storage counts kinds 20000–29999 and total events")
+check(abs(_eph_est["event_share"] - 0.042) < 1e-9
+      and _eph_est["bytes_estimate"] == int(10 * 1024 * 1024 * 0.042),
+      "estimate_ephemeral_storage proportional bytes use count/total × db size")
 
 # --- event_expiration (NIP-40) pure-function edges --------------------------
 check(server86.event_expiration([["expiration", "1700000000"]]) == 1700000000,

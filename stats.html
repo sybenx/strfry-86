@@ -632,6 +632,15 @@ var walkPanel = s86BuildScanPanel({
         : '';
       rows.push(['expired events', record.expired_events, expiredShare]);
     }
+    // NIP-16 ephemeral kinds (20000–29999): written briefly for live fan-out,
+    // then RelayCron deletes. Leftovers after lag or a high lifetime show
+    // here; Settings has the purge.
+    if (record.ephemeral_events != null) {
+      var ephShare = record.events_read > 0
+        ? (record.ephemeral_events / record.events_read * 100).toFixed(2) + '% of all'
+        : '';
+      rows.push(['ephemeral kinds (20000–29999)', record.ephemeral_events, ephShare]);
+    }
     container.appendChild(s86BuildKeyValueTable(rows));
 
     var nonGiftwrap = record.events_read - giftwraps;
