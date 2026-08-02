@@ -52,6 +52,7 @@ import json
 import os
 import queue
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -170,6 +171,20 @@ GAP_NOTICE_SHARE = 0.02         # gap worth a sentence, never an alarm on its ow
 KIND_ALARM_SHARE = 0.005        # ONE unlisted kind this big is the actionable alarm
 # --- stats console (read-only) ---------------------------------------------
 CONSOLE_VERBS = ("scan", "info", "export")  # --count/read-only; all else refused
+CONSOLE_STDOUT_MAX = 256 * 1024  # hard cap on captured console stdout (then kill)
+CONSOLE_STDERR_MAX = 64 * 1024   # hard cap on captured console stderr
+# --- memory ceilings -------------------------------------------------------
+# Soft: refuse NEW heavy jobs when current RSS is already this high (leave
+# headroom for the job itself). Hard: RLIMIT_AS at process start so a runaway
+# capture or set cannot take the host past 2GB. CACHE_LIST_MAX is the safety
+# valve on author/recipient row lists that otherwise grow with every distinct
+# pubkey a scan has ever seen — client search still runs over the retained
+# head (highest signal first); the omitted tail is named on the result.
+MEMORY_SOFT_BYTES = 400 * 1024 * 1024   # refuse new scan jobs above this RSS
+MEMORY_HARD_BYTES = 2 * 1024 * 1024 * 1024  # process address-space hard cap
+CACHE_LIST_MAX = 50000          # max author/recipient rows retained after a scan
+STREAM_STDERR_MAX = 64 * 1024   # stderr retained from a streaming scan
+POST_BODY_MAX = 2 * 1024 * 1024 # NIP-98 POST bodies (settings raw is the largest)
 # --- live layer: one shared strfry poll fanned out over SSE ----------------
 LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
 LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
@@ -212,6 +227,65 @@ _contact_appeal_last_checked = None
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+
+
+def _process_rss_bytes():
+    """Current resident set size in bytes, or None if unreadable.
+
+    Prefers /proc (Linux). Falls back to `ps` (macOS and most Unix). Used only
+    as a soft gate before launching a heavy job — never on the event path."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True, timeout=1,
+        ).strip()
+        return int(out) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _memory_soft_exceeded():
+    rss = _process_rss_bytes()
+    return rss is not None and rss >= MEMORY_SOFT_BYTES
+
+
+def apply_memory_hard_limit():
+    """Install RLIMIT_AS = MEMORY_HARD_BYTES when the OS supports it.
+
+    Address-space limits are best-effort: some kernels ignore them, and a
+    failed setrlimit must never prevent startup. Called once from main()."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    except (AttributeError, ValueError, OSError):
+        return
+    target = MEMORY_HARD_BYTES
+    # Never raise an existing hard ceiling; only lower when possible.
+    new_hard = hard if hard != resource.RLIM_INFINITY and hard < target else target
+    new_soft = min(target, new_hard) if new_hard != resource.RLIM_INFINITY else target
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (new_soft, new_hard))
+        log(f"server86: RLIMIT_AS soft={new_soft} hard={new_hard}")
+    except (ValueError, OSError) as e:
+        log(f"server86: RLIMIT_AS not applied ({type(e).__name__}: {e})")
+
+
+def _cap_list_rows(rows, max_rows=CACHE_LIST_MAX):
+    """Keep the head of an already-ranked list; return (rows, total, omitted).
+
+    Callers sort highest-signal first (event count, reporters, …). The tail
+    is dropped so a full author/recipient scan cannot pin hundreds of MB of
+    single-event keys for the life of the process."""
+    total = len(rows)
+    if total <= max_rows:
+        return rows, total, 0
+    return rows[:max_rows], total, total - max_rows
 
 
 def load_config():
@@ -1545,35 +1619,137 @@ def validate_console_command(raw):
     return ["strfry", "--config", conf] + parts, None
 
 
+def _pump_stream_capped(stream, cap, on_cap):
+    """Read stream into a list of chunks, stopping (and calling on_cap) once
+    `cap` bytes have been retained. Returns (chunks, total_kept, hit_cap)."""
+    chunks = []
+    kept = 0
+    hit_cap = False
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            if kept >= cap:
+                hit_cap = True
+                on_cap()
+                # Drain remainder so the child can exit, without retaining it.
+                while stream.read(65536):
+                    pass
+                break
+            room = cap - kept
+            if len(chunk) > room:
+                chunks.append(chunk[:room])
+                kept += room
+                hit_cap = True
+                on_cap()
+                while stream.read(65536):
+                    pass
+                break
+            chunks.append(chunk)
+            kept += len(chunk)
+    except (OSError, ValueError):
+        pass
+    return chunks, kept, hit_cap
+
+
 def run_console_command(raw):
     """Run one CONSOLE_VERBS-allowlisted strfry command; return a
-    JSON-serialisable result."""
+    JSON-serialisable result.
+
+    Stdout/stderr are streamed with hard byte caps (CONSOLE_STDOUT_MAX /
+    CONSOLE_STDERR_MAX). Hitting either cap kills the child — bare `export`
+    or an unbounded `scan` must never buffer the whole LMDB into this
+    process. The response still truncates further for the UI pane."""
     argv, err = validate_console_command(raw)
     if err:
-        return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "", "exit_code": None}
+        return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "",
+                "exit_code": None, "truncated": False}
     try:
         strfry_bin = require_strfry_bin()
         conf = require_strfry_conf()
         # Rebuild with the resolved binary and the actively-found conf —
         # validate may have filled a candidate path that is not present here.
         argv = [strfry_bin, "--config", conf] + argv[3:]
-        result = subprocess.run(
-            argv, cwd=get_relay_cwd(), capture_output=True, timeout=CONSOLE_TIMEOUT
+        proc = subprocess.Popen(
+            argv, cwd=get_relay_cwd(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+        killed = {"n": False}
+        pumps = {"out": ([], 0, False), "err": ([], 0, False)}
+
+        def kill_child():
+            if killed["n"]:
+                return
+            killed["n"] = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        def read_out():
+            pumps["out"] = _pump_stream_capped(
+                proc.stdout, CONSOLE_STDOUT_MAX, kill_child,
+            )
+
+        def read_err():
+            pumps["err"] = _pump_stream_capped(
+                proc.stderr, CONSOLE_STDERR_MAX, kill_child,
+            )
+
+        t_out = threading.Thread(target=read_out, daemon=True)
+        t_err = threading.Thread(target=read_err, daemon=True)
+        t_out.start()
+        t_err.start()
+        try:
+            proc.wait(timeout=CONSOLE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_child()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            return {
+                "ok": False, "error": f"timed out after {CONSOLE_TIMEOUT}s",
+                "argv": argv, "stdout": "", "stderr": "",
+                "exit_code": None, "truncated": False,
+            }
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        out_chunks, _out_n, out_capped = pumps["out"]
+        err_chunks, _err_n, err_capped = pumps["err"]
+        stdout = b"".join(out_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(err_chunks).decode("utf-8", errors="replace")
+        truncated = out_capped or err_capped
+        if truncated:
+            note = (
+                f"\n… truncated at {CONSOLE_STDOUT_MAX // 1024}KB stdout / "
+                f"{CONSOLE_STDERR_MAX // 1024}KB stderr (process killed to protect memory)"
+            )
+            stdout = stdout + note
+        exit_code = proc.returncode
+        # A kill for the cap yields a non-zero exit; still report the captured
+        # head as the answer, with truncated=true so the UI can say so.
+        ok = (exit_code == 0) and not truncated
+        error = None
+        if truncated:
+            error = "output exceeded memory cap — showing the first bytes only"
+        elif exit_code != 0:
+            error = f"exit {exit_code}"
         return {
-            "ok": result.returncode == 0,
-            "error": None if result.returncode == 0 else f"exit {result.returncode}",
+            "ok": ok,
+            "error": error,
             "argv": argv,
-            "stdout": result.stdout.decode("utf-8", errors="replace")[-8000:],
-            "stderr": result.stderr.decode("utf-8", errors="replace")[-4000:],
-            "exit_code": result.returncode,
+            "stdout": stdout[-8000:],
+            "stderr": stderr[-4000:],
+            "exit_code": exit_code,
+            "truncated": truncated,
         }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"timed out after {CONSOLE_TIMEOUT}s", "argv": argv,
-                "stdout": "", "stderr": "", "exit_code": None}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:600], "argv": argv,
-                "stdout": "", "stderr": "", "exit_code": None}
+                "stdout": "", "stderr": "", "exit_code": None, "truncated": False}
 
 
 def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
@@ -1620,7 +1796,10 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
         argv, cwd=get_relay_cwd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
-    stderr_chunks = []
+    # Keep only a rolling tail of stderr so a long walk cannot retain
+    # unbounded loguru noise for the life of the job.
+    stderr_buf = bytearray()
+    stderr_lock = threading.Lock()
 
     def read_stderr():
         try:
@@ -1628,7 +1807,10 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
                 chunk = proc.stderr.read(4096)
                 if not chunk:
                     break
-                stderr_chunks.append(chunk)
+                with stderr_lock:
+                    stderr_buf.extend(chunk)
+                    if len(stderr_buf) > STREAM_STDERR_MAX:
+                        del stderr_buf[:-STREAM_STDERR_MAX]
         except (OSError, ValueError):
             pass
 
@@ -1669,7 +1851,8 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
     if timed_out:
         raise RuntimeError(f"strfry scan exceeded {timeout}s budget after reading {count} events")
     if proc.returncode != 0:
-        tail = stderr_tail(b"".join(stderr_chunks))
+        with stderr_lock:
+            tail = stderr_tail(bytes(stderr_buf))
         raise RuntimeError(f"strfry scan exited {proc.returncode}: {tail}")
     return count
 
@@ -2503,6 +2686,25 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=Non
             status = dict(_JOB_REGISTRY[running])
             status["blocked_by"] = running
             return status
+        # Soft RSS gate: do not start another multi-minute scan when the
+        # process is already near the soft ceiling. Walk/author/recipient
+        # peaks need headroom; a refusal is better than an OOM mid-walk.
+        if _memory_soft_exceeded():
+            rss = _process_rss_bytes() or 0
+            status = {
+                "status": "idle", "started_at": None,
+                "progress": None, "total": None, "rate": None, "eta": None,
+                "blocked_by": "memory",
+                "error": (
+                    f"refused: process RSS {rss // (1024 * 1024)}MB is at or above "
+                    f"the {MEMORY_SOFT_BYTES // (1024 * 1024)}MB soft cap — "
+                    f"finish or restart before starting another scan"
+                ),
+            }
+            if extra_job_fields:
+                status.update({k: v for k, v in extra_job_fields.items()
+                               if k not in status})
+            return status
         _active_scan["name"] = name
         job.clear()
         job.update({
@@ -2618,23 +2820,29 @@ def compute_authors(mode, progress_cb=None):
     if reports_ok:
         all_pubkeys |= set(reporters_by_pubkey.keys())
 
+    # Rank first WITHOUT bech32/npub — encoding every pubkey on a large full
+    # scan is pure waste once CACHE_LIST_MAX will drop the tail. Free the
+    # streaming tally as soon as the compact rank rows exist.
     rows = []
     for pk in all_pubkeys:
-        try:
-            npub = bech32.npub_encode(pk)
-        except (ValueError, TypeError):
+        if not is_hex64(pk):
             continue
         entry = tally.get(pk, {"count": 0, "last_seen": None})
         reporters = len(reporters_by_pubkey.get(pk, ())) if reports_ok else None
         rows.append({
-            "pubkey": pk, "npub": npub,
+            "pubkey": pk,
             "count": entry["count"], "last_seen": entry["last_seen"],
             "reporters": reporters,
         })
+    tally.clear()
+    reporters_by_pubkey.clear()
+    all_pubkeys.clear()
     if reports_ok:
         rows.sort(key=lambda a: (a["reporters"] or 0, a["count"]), reverse=True)
     else:
         rows.sort(key=lambda a: a["count"], reverse=True)
+
+    rows, list_total, list_omitted = _cap_list_rows(rows)
 
     # Names: batched, capped at NAME_RESOLVE_MAX, taken from the top of
     # the ranking above. Single-event authors are skipped entirely — on a
@@ -2650,13 +2858,26 @@ def compute_authors(mode, progress_cb=None):
 
     authors = []
     for r in rows:
+        try:
+            npub = bech32.npub_encode(r["pubkey"])
+        except (ValueError, TypeError):
+            continue
         profile = profiles.get(r["pubkey"]) or {}
         authors.append({
-            "pubkey": r["pubkey"], "npub": r["npub"],
+            "pubkey": r["pubkey"], "npub": npub,
             "name": profile.get("name"), "nip05": profile.get("nip05"),
             "count": r["count"], "last_seen": r["last_seen"],
             "reporters": r["reporters"],
         })
+    del rows
+
+    warning = None if reports_ok else "reports tally failed — sorting by event count only"
+    if list_omitted:
+        trunc_note = (
+            f"author list truncated to top {CACHE_LIST_MAX:,} of "
+            f"{list_total:,} (lowest-activity tail dropped to protect memory)"
+        )
+        warning = (warning + " — " + trunc_note) if warning else trunc_note
 
     return {
         "scanned_at": int(time.time()),
@@ -2671,7 +2892,9 @@ def compute_authors(mode, progress_cb=None):
         "singleton_kinds": singleton_kinds,
         "reports_saturated": reports_saturated,
         "reports_scanned": reports_scanned,
-        "warning": None if reports_ok else "reports tally failed — sorting by event count only",
+        "list_total": list_total,
+        "list_omitted": list_omitted,
+        "warning": warning,
         "error": None,
         "authors": authors,
     }
@@ -2683,6 +2906,7 @@ def _empty_authors_result():
         "events_read": 0, "span_start": None, "span_end": None,
         "kinds": {}, "singleton_kinds": {},
         "reports_saturated": False, "reports_scanned": 0,
+        "list_total": 0, "list_omitted": 0,
         "warning": None, "error": None, "authors": [],
     }
 
@@ -2755,7 +2979,8 @@ def authors_scan_pubkeys():
 def _empty_recipients_result():
     return {
         "scanned_at": None, "events_read": 0, "span_start": None, "span_end": None,
-        "saturated": False, "warning": None, "error": None, "recipients": [],
+        "saturated": False, "list_total": 0, "list_omitted": 0,
+        "warning": None, "error": None, "recipients": [],
     }
 
 
@@ -2794,6 +3019,10 @@ def compute_recipients(progress_cb=None):
     saturated = events_read >= RECIPIENT_SCAN_LIMIT
 
     rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
+    list_total = len(rows)
+    list_omitted = max(0, list_total - CACHE_LIST_MAX)
+    rows = rows[:CACHE_LIST_MAX]
+    tally.clear()
     to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
     try:
         profiles = resolve_profiles(to_resolve)
@@ -2813,6 +3042,14 @@ def compute_recipients(progress_cb=None):
             "name": profile.get("name"), "nip05": profile.get("nip05"),
             "count": count,
         })
+    del rows
+
+    warning = None
+    if list_omitted:
+        warning = (
+            f"recipient list truncated to top {CACHE_LIST_MAX:,} of "
+            f"{list_total:,} (lowest-count tail dropped to protect memory)"
+        )
 
     return {
         "scanned_at": int(time.time()),
@@ -2820,7 +3057,9 @@ def compute_recipients(progress_cb=None):
         "span_start": span["start"],
         "span_end": span["end"],
         "saturated": saturated,
-        "warning": None,
+        "list_total": list_total,
+        "list_omitted": list_omitted,
+        "warning": warning,
         "error": None,
         "recipients": recipients,
     }
@@ -4176,6 +4415,13 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
+        if length < 0:
+            length = 0
+        if length > POST_BODY_MAX:
+            self._send_json(413, {
+                "error": f"request body too large (max {POST_BODY_MAX // (1024 * 1024)}MB)",
+            })
+            return
         try:
             raw = self.rfile.read(length) if length > 0 else b""
             body = json.loads(raw.decode("utf-8")) if raw else {}
@@ -4661,10 +4907,15 @@ def main():
         sys.exit(0)
 
     httpd.strfry86_config = cfg
+    apply_memory_hard_limit()
     threading.Thread(target=_live_poll_loop, daemon=True).start()
     threading.Thread(target=_giftwrap_retention_loop, daemon=True).start()
+    rss = _process_rss_bytes()
+    rss_note = f", rss={rss // (1024 * 1024)}MB" if rss is not None else ""
     log(f"server86: listening on {cfg['bind']}:{cfg['port']}"
-        f" (gift-wrap retention {get_giftwrap_retention_days()}d)")
+        f" (gift-wrap retention {get_giftwrap_retention_days()}d"
+        f", soft={MEMORY_SOFT_BYTES // (1024 * 1024)}MB"
+        f", hard={MEMORY_HARD_BYTES // (1024 * 1024)}MB{rss_note})")
     httpd.serve_forever()
 
 

@@ -13,6 +13,11 @@ KIND_ALARM_SHARE       = 0.005   # ONE unlisted kind this big = the actionable a
 SUBSCRIBER_SCAN_LIMIT  = 50000   # saturation here REFUSES the exempt purge (WHY.md §5)
 RECIPIENT_SCAN_LIMIT   = 250000  # permanently saturated; safe direction only (WHY.md §5)
 CONSOLE_VERBS          = ("scan", "info", "export")  # --count/read-only; all else refused
+CONSOLE_STDOUT_MAX     = 256KiB  # console capture hard cap; child killed past this
+CACHE_LIST_MAX         = 50000   # max author/recipient rows retained after a scan
+MEMORY_SOFT_BYTES      = 400MiB  # refuse new heavy jobs when RSS is already this high
+MEMORY_HARD_BYTES      = 2GiB    # RLIMIT_AS at process start (best-effort)
+POST_BODY_MAX          = 2MiB    # NIP-98 POST body ceiling
 DECISION_LOG_MAX_LINES = 2000    # plugin86.py: decision records per segment before rotation
 DECISION_TAIL_MAX      = 500     # decision records server86 reads back per poll
 ```

@@ -834,6 +834,31 @@ _argv, _err = server86.validate_console_command("compact data.mdb.compacted")
 check(_argv is None and _err and "refused" in _err,
       "console allowlist refuses compact — Settings Compact is the only path")
 
+# --- Memory ceilings: console capture cap + ranked list retention ----------
+# Bare export/scan must never buffer an entire LMDB into server86. The pump
+# keeps only CONSOLE_STDOUT_MAX bytes then kills the child.
+_chunks, _kept, _hit = server86._pump_stream_capped(
+    __import__("io").BytesIO(b"x" * (server86.CONSOLE_STDOUT_MAX + 50_000)),
+    server86.CONSOLE_STDOUT_MAX,
+    lambda: None,
+)
+check(_hit is True and _kept == server86.CONSOLE_STDOUT_MAX,
+      "console stdout pump stops at CONSOLE_STDOUT_MAX and reports truncated")
+check(sum(len(c) for c in _chunks) == server86.CONSOLE_STDOUT_MAX,
+      "console stdout pump retains exactly the cap, never the overflow")
+_kept_rows, _total, _omitted = server86._cap_list_rows(
+    list(range(server86.CACHE_LIST_MAX + 123)), server86.CACHE_LIST_MAX,
+)
+check(len(_kept_rows) == server86.CACHE_LIST_MAX and _total == server86.CACHE_LIST_MAX + 123
+      and _omitted == 123,
+      "author/recipient list cap keeps head and names the omitted tail count")
+check(server86.MEMORY_HARD_BYTES == 2 * 1024 * 1024 * 1024,
+      "hard address-space ceiling is 2GB")
+check(server86.MEMORY_SOFT_BYTES < server86.MEMORY_HARD_BYTES,
+      "soft RSS gate is strictly below the hard ceiling")
+check(server86.POST_BODY_MAX == 2 * 1024 * 1024,
+      "POST body ceiling is 2MB")
+
 # --- Reports cache: kind-1984 tallied by DISTINCT reporter per p-tag -----
 _orig_scan = server86.run_strfry_scan
 server86.run_strfry_scan = lambda filter_obj, timeout=10: [

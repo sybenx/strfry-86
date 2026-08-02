@@ -337,6 +337,41 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   table.cards tbody td.action:empty { display:none; }
   table.cards tbody td.action::before { content:none; }
   table.cards tbody td.clip { white-space:normal; max-width:none; }
+
+  /* Feed cards only: two compact meta lines (time · kind / author), content
+     keeps its stacked label, result is one inline line. Other card tables
+     keep the full stacked data-label layout above. */
+  table.cards.feed tbody td.time,
+  table.cards.feed tbody td.kind {
+    display:inline-flex; align-items:center; gap:.4em;
+    width:auto; max-width:none; padding:.1em 0 .25em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.feed tbody td.time { padding-right:.15em; }
+  table.cards.feed tbody td.time::before {
+    display:inline; margin:0 .4em 0 0; vertical-align:baseline;
+  }
+  table.cards.feed tbody td.time::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .45em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.feed tbody td.kind::before { content:none; }
+  table.cards.feed tbody td.identity {
+    display:block; padding:.1em 0 .45em;
+    border-bottom:1px solid var(--hair);
+  }
+  table.cards.feed tbody td.identity::before { content:none; }
+  table.cards.feed tbody td.clip {
+    display:block; padding:.45em 0;
+    border-bottom:1px solid var(--hair);
+  }
+  table.cards.feed tbody td.result {
+    display:flex; align-items:center; gap:.5em;
+    padding:.4em 0 0; border-bottom:none;
+  }
+  table.cards.feed tbody td.result::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
 }
 </style>
 </head>
