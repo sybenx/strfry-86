@@ -35,14 +35,14 @@ binding, then disclosure, then ops/UI contract drift.
   Server refuses or queues console while a scan/purge/compact holds the
   lock; Stats UI disables Run and shows “waiting on …”. Aligns CLAUDE.md.
 
-- [ ] **Phase 5 — Users panel + report soft-memory UX.**
+- [x] **Phase 5 — Users panel + report soft-memory UX.**
   Users author-scan provenance matches `s86BuildScanPanel` (failed ≠
   result). Poll continues while `blocked_by` is set. Report start surfaces
   soft-memory refusal from the POST body.
 
-- [ ] **Phase 6 — Small correctness fixes.**
+- [x] **Phase 6 — Small correctness fixes.**
   `REASON_MAX_LEN` on `/api/ban`; decision-log line counter on open;
-  `s86SignAndPost` never lets `extraBody` clobber `auth`.
+  `s86SignAndPost` never lets `extraBody` clobber `auth` (done in phase 2).
 
 - [ ] **Phase 7 — Resource caps if UI is not localhost-only.**
   Max SSE subscribers, POST body read timeout / connection caps.
@@ -123,3 +123,22 @@ operator’s trust boundary and wants a stricter perimeter.
 - Stats UI disables console input/Run while report/recipients/subscribers
   panels report running or blocked.
 - Tests: refuse while authors holds lock; scan blocked by console; release.
+
+## Phase 5 — landed
+
+**What changed**
+
+- `users.html` `renderProvenance`: `error` first; prior `scanned_at` labeled
+  last successful run, never as this attempt.
+- Users author poll continues while `blocked_by` is set (and on initial load).
+- `stats.html` `startReportJob`: soft-memory / idle refusals surface
+  `error` on the target record; poll only when running or waiting on a job.
+
+## Phase 6 — landed
+
+**What changed**
+
+- `/api/ban` rejects reasons longer than `REASON_MAX_LEN` (same as reason edit).
+- `plugin86` decision log open counts existing lines and rotates if already
+  over the segment max (no growth across restarts).
+- Auth clobber fix shipped with phase 2 (`Object.assign({}, data, {auth})`).

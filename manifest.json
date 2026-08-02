@@ -10,11 +10,11 @@
   "lib86/bip340.py": "c9c6eef55fddc912e2eaec93dcbd69a2f983a407764a0c7b19e49d9ce2bcb66d",
   "lib86/blacklist.py": "0b89b0146252ecb6dde26d93094caf8e321d0f324f0b9638f8d71a2b65a904b3",
   "lib86/namecache.py": "19d66757fa1be6e4dd7d2731effcc843c4ed62e3ce4798c374c897bc1bb45ffa",
-  "plugin86.py": "ff0c3cf8fd6a239647a84ad27c33b634e4a7b722cc078883f50d03cc867ad0ff",
+  "plugin86.py": "ea62993981001c9056afb3b53bdf9166adb7582685031c079f232c17fc1cb0ce",
   "profile.html": "9c9842e06db0c14b4e63411e3ec3668ae2840c45d5dbf8879aa71f1e224c2f7b",
-  "server86.py": "a2bfb6e8893b8ed52ef208d2ea423114d53b7f160e4ba7ac391f6fbd9388b203",
+  "server86.py": "4383f9893eb6e7e257a2c6a26b54e89078fa9ee13f4fea027db76edaa30b60fa",
   "settings.html": "ecf78d424dd25bd635829de32dbcb913dfaf91c8db872ebae259afee85c9a87c",
-  "stats.html": "a52f4eeccac0e83e848aea2de83c5f8ba2bf267c2e290ffa66edfa045439bc1e",
+  "stats.html": "645da222a3d1029ab602e03b01fa83e0f5589c75dee04cac17a9b6bbef27853d",
   "strfry-86-updater.py": "a0de5dc43b6d1a369dd121fd5ab8d512900ec8de34dc89c5d5fa5b3dc91366b2",
-  "users.html": "f60775637f8439de797af4f90d2df579f577e3ee4a418ae164f7bd58eebead4f"
+  "users.html": "d68503ae7b5c079d4ea3785c908d406fb0962c8da79b470750120c6b8179c882"
 }

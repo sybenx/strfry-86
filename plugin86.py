@@ -53,8 +53,21 @@ _decision_disabled = False
 def _decision_open():
     global _decision_fh, _decision_lines, _decision_disabled
     try:
+        # Count existing lines so a restart does not append another full
+        # DECISION_LOG_MAX_LINES before the first rotation (file growth).
+        existing = 0
+        try:
+            with open(DECISION_LOG_PATH, "rb") as fh:
+                existing = sum(1 for _ in fh)
+        except FileNotFoundError:
+            existing = 0
         _decision_fh = open(DECISION_LOG_PATH, "a", encoding="utf-8")
-        _decision_lines = 0
+        _decision_lines = existing
+        if _decision_lines >= DECISION_LOG_MAX_LINES:
+            _decision_fh.close()
+            os.replace(DECISION_LOG_PATH, DECISION_LOG_PREV_PATH)
+            _decision_fh = open(DECISION_LOG_PATH, "a", encoding="utf-8")
+            _decision_lines = 0
     except OSError as e:
         log(f"plugin86: decision log disabled ({e})")
         _decision_fh = None

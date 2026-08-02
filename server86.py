@@ -5140,6 +5140,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             raw_pk = entry.get("pubkey")
             reason = entry.get("reason") or ""
+            if not isinstance(reason, str) or len(reason) > REASON_MAX_LEN:
+                skipped.append(raw_pk)
+                continue
             pubkey = None
             if is_hex64(raw_pk):
                 pubkey = raw_pk.lower()

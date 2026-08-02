@@ -926,16 +926,33 @@ function fetchReport() {
 }
 
 function startReportJob(endpoint) {
+  var which = endpoint.indexOf('walk') >= 0 ? 'walk' : 'totals';
   return s86SignAndPost(endpoint, {}).then(function (result) {
     if (!result.ok) {
       throw new Error(s86ErrMsg(result));
     }
-    s86PollStatus(fetchReport, function (data) {
-      applyReportStatus(data);
-      if (data.status !== 'running') {
-        loadStats();
-        loadMetrics();
+    var body = result.body || {};
+    // Soft-memory and other idle refusals return 202 with error / blocked_by
+    // memory and never start a job — do not enter a poll that only sees idle.
+    if (body.status === 'running' || (body.blocked_by && body.blocked_by !== 'memory')) {
+      s86PollStatus(fetchReport, function (data) {
+        applyReportStatus(data);
+        if (data.status !== 'running' && !data.blocked_by) {
+          loadStats();
+          loadMetrics();
+        }
+      });
+      return;
+    }
+    return fetchReport().then(function (data) {
+      if (body.error) {
+        // Stamp the refusal onto the record the button was for so
+        // s86BuildScanPanel shows failed, not a silent "never run"/stale age.
+        var rec = Object.assign({}, data[which] || {}, { error: body.error });
+        data = Object.assign({}, data);
+        data[which] = rec;
       }
+      applyReportStatus(data);
     });
   });
 }

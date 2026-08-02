@@ -641,10 +641,29 @@ function emptyStateText(data) {
 }
 
 function renderProvenance(data) {
-  if (!data || data.scanned_at === null || data.scanned_at === undefined) {
+  // Four panel states (CLAUDE rule 6): failed never wears result's clothes.
+  // error first; previous scanned_at is "last successful run", not this try.
+  if (!data) {
     provenanceLine.textContent = '';
-    emptyStateLine.textContent = (data && data.error)
-      ? ('could not run — ' + data.error) : emptyStateText(data);
+    emptyStateLine.textContent = emptyStateText(data);
+    return;
+  }
+  if (data.error) {
+    emptyStateLine.textContent = 'could not run — ' + data.error;
+    if (data.scanned_at != null) {
+      provenanceLine.textContent = 'last successful run '
+        + s86FormatDate(data.scanned_at) + ' (' + s86FormatRelativeAge(data.scanned_at) + ')'
+        + (data.authors && data.authors.length
+          ? ('; ' + data.authors.length.toLocaleString() + ' authors still on file')
+          : '');
+    } else {
+      provenanceLine.textContent = '';
+    }
+    return;
+  }
+  if (data.scanned_at == null) {
+    provenanceLine.textContent = '';
+    emptyStateLine.textContent = emptyStateText(data);
     return;
   }
   emptyStateLine.textContent = '';
@@ -1049,13 +1068,16 @@ function pollAuthorsStatus() {
   fetch('/api/authors')
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      var wasRunning = lastAuthorsStatus && lastAuthorsStatus.status === 'running';
+      var prev = lastAuthorsStatus || {};
+      var wasActive = prev.status === 'running' || !!prev.blocked_by;
       applyAuthorsStatus(data);
-      if (data.status === 'running') {
+      // Keep polling while running OR blocked (same rule as s86PollStatus) —
+      // status alone is idle when waiting on another job.
+      if (data.status === 'running' || data.blocked_by) {
         pollTimer = setTimeout(pollAuthorsStatus, 3000);
       } else {
         stopPolling();
-        if (wasRunning) {
+        if (wasActive) {
           loadUserlist();
         }
       }
@@ -1073,7 +1095,7 @@ function loadAuthorsStatus() {
     .then(function (res) { return res.json(); })
     .then(function (data) {
       applyAuthorsStatus(data);
-      if (data.status === 'running') {
+      if (data.status === 'running' || data.blocked_by) {
         stopPolling();
         pollTimer = setTimeout(pollAuthorsStatus, 3000);
       }
