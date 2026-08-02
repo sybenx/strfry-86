@@ -882,6 +882,29 @@ _argv, _err = server86.validate_console_command("compact data.mdb.compacted")
 check(_argv is None and _err and "refused" in _err,
       "console allowlist refuses compact — Settings Compact is the only path")
 
+# Global job lock applies to console too (CLAUDE.md): refuse while a scan holds it.
+_prev_active = server86._active_scan["name"]
+server86._active_scan["name"] = "authors"
+_refusal = server86.acquire_console_slot()
+check(_refusal is not None and _refusal.get("blocked_by") == "authors"
+      and "refused" in (_refusal.get("error") or ""),
+      "console refuses while authors holds the global job lock")
+check(server86._active_scan["name"] == "authors",
+      "a refused console acquire leaves the running job's lock untouched")
+server86._active_scan["name"] = None
+_refusal = server86.acquire_console_slot()
+check(_refusal is None and server86._active_scan["name"] == "console",
+      "console acquire takes the global lock when idle")
+# A scan start while console holds the lock must see blocked_by=console
+_blocked = server86._start_scan_job(
+    "recipients", server86._recipients_job, lambda: None)
+check(_blocked.get("blocked_by") == "console",
+      "scan start is blocked while console holds the global lock")
+server86.release_console_slot()
+check(server86._active_scan["name"] is None,
+      "console release clears the global lock")
+server86._active_scan["name"] = _prev_active
+
 # --- Memory ceilings: console capture cap + ranked list retention ----------
 # Bare export/scan must never buffer an entire LMDB into server86. The pump
 # keeps only CONSOLE_STDOUT_MAX bytes then kills the child.

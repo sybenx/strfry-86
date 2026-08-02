@@ -31,7 +31,7 @@ binding, then disclosure, then ops/UI contract drift.
 - [x] **Phase 3 — Authenticate admin-shaped GETs.**
   Gate audit log behind NIP-98 (POST). Document what stays public.
 
-- [ ] **Phase 4 — Console under global job lock.**
+- [x] **Phase 4 — Console under global job lock.**
   Server refuses or queues console while a scan/purge/compact holds the
   lock; Stats UI disables Run and shows “waiting on …”. Aligns CLAUDE.md.
 
@@ -112,3 +112,14 @@ binding, then disclosure, then ops/UI contract drift.
 
 Revisit any of the above only if deployment exposes the UI beyond the
 operator’s trust boundary and wants a stricter perimeter.
+
+## Phase 4 — landed
+
+**What changed**
+
+- `acquire_console_slot` / `release_console_slot`: console takes
+  `_active_scan["name"] = "console"` for the whole command (and soft-RSS
+  gate). Scans see `blocked_by: "console"`; console sees the running job.
+- Stats UI disables console input/Run while report/recipients/subscribers
+  panels report running or blocked.
+- Tests: refuse while authors holds lock; scan blocked by console; release.

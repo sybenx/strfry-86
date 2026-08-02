@@ -1669,6 +1669,49 @@ def _pump_stream_capped(stream, cap, on_cap):
     return chunks, kept, hit_cap
 
 
+def acquire_console_slot():
+    """Try to take the global job lock for a console command.
+
+    Returns None on success (caller MUST release_console_slot). Returns a
+    refusal result dict when another job holds the lock or RSS is over the
+    soft cap — same shape as run_console_command errors so the handler can
+    return it as-is."""
+    with _scan_lock:
+        running = _active_scan["name"]
+        if running is not None:
+            return {
+                "ok": False,
+                "error": (
+                    f"refused: {running} is running — wait for it "
+                    f"to finish before using the console"
+                ),
+                "blocked_by": running,
+                "argv": None, "stdout": "", "stderr": "",
+                "exit_code": None, "truncated": False,
+            }
+        if _memory_soft_exceeded():
+            rss = _process_rss_bytes() or 0
+            return {
+                "ok": False,
+                "error": (
+                    f"refused: process RSS {rss // (1024 * 1024)}MB is at "
+                    f"or above the {MEMORY_SOFT_BYTES // (1024 * 1024)}MB "
+                    f"soft cap"
+                ),
+                "blocked_by": "memory",
+                "argv": None, "stdout": "", "stderr": "",
+                "exit_code": None, "truncated": False,
+            }
+        _active_scan["name"] = "console"
+    return None
+
+
+def release_console_slot():
+    with _scan_lock:
+        if _active_scan["name"] == "console":
+            _active_scan["name"] = None
+
+
 def run_console_command(raw):
     """Run one CONSOLE_VERBS-allowlisted strfry command; return a
     JSON-serialisable result.
@@ -2709,7 +2752,13 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=Non
             status["blocked_by"] = None
             return status
         if running is not None:
-            status = dict(_JOB_REGISTRY[running])
+            # Console holds the lock as name "console" without a registry
+            # entry; every other job is registered.
+            reg = _JOB_REGISTRY.get(running)
+            status = dict(reg) if reg is not None else {
+                "status": "running", "started_at": None,
+                "progress": None, "total": None, "rate": None, "eta": None,
+            }
             status["blocked_by"] = running
             return status
         # Soft RSS gate: do not start another multi-minute scan when the
@@ -4702,8 +4751,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/console":
             raw_cmd = body.get("command")
-            result = run_console_command(raw_cmd if isinstance(raw_cmd, str) else "")
-            self._send_json(200 if result.get("ok") else 400, result)
+            # Global job lock: console scan/export contends with walk/purge
+            # on the same LMDB. Hold the lock for the whole command so a
+            # scan cannot start under a long export either (CLAUDE.md).
+            refusal = acquire_console_slot()
+            if refusal is not None:
+                self._send_json(409, refusal)
+                return
+            try:
+                result = run_console_command(
+                    raw_cmd if isinstance(raw_cmd, str) else ""
+                )
+            finally:
+                release_console_slot()
+            code = 200 if result.get("ok") else 400
+            self._send_json(code, result)
             return
 
         if path == "/api/audit":

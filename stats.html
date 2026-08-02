@@ -918,6 +918,7 @@ function applyReportStatus(data) {
   lastReportData = data;
   totalsPanel.applyStatus(reportJobStatusFor(data, 'totals'), data.totals);
   walkPanel.applyStatus(reportJobStatusFor(data, 'walk'), data.walk);
+  noteConsoleJob('report', data);
 }
 
 function fetchReport() {
@@ -1048,8 +1049,14 @@ subscribersPanel.el.insertBefore(relayUrlBlock, subscribersPanel.el.children[1])
 
 function fetchRecipients() { return fetch('/api/recipients').then(function (res) { return res.json(); }); }
 function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
-function applyRecipientsStatus(data) { recipientsPanel.applyStatus(data, data); }
-function applySubscribersStatus(data) { subscribersPanel.applyStatus(data, data); }
+function applyRecipientsStatus(data) {
+  recipientsPanel.applyStatus(data, data);
+  noteConsoleJob('recipients', data);
+}
+function applySubscribersStatus(data) {
+  subscribersPanel.applyStatus(data, data);
+  noteConsoleJob('subscribers', data);
+}
 
 function startSimpleJob(postEndpoint, fetchFn, applyFn) {
   return s86SignAndPost(postEndpoint, {}).then(function (result) {
@@ -1150,8 +1157,34 @@ function scrollConsoleTo(node) {
   consoleLog.scrollTop = consoleLog.scrollHeight;
 }
 
+// Console shares the server global job lock. Disable Run while any scan
+// panel reports running/blocked so the operator is not surprised by a 409.
+var consoleBusyJobs = { report: false, recipients: false, subscribers: false };
+
+function updateConsoleGate() {
+  var busy = consoleBusyJobs.report || consoleBusyJobs.recipients || consoleBusyJobs.subscribers;
+  if (consoleRun) {
+    consoleRun.disabled = busy || !isAdmin;
+  }
+  if (consoleInput) {
+    consoleInput.disabled = busy || !isAdmin;
+    consoleInput.title = busy
+      ? 'waiting on a scan or purge to finish'
+      : '';
+  }
+}
+
+function noteConsoleJob(key, data) {
+  consoleBusyJobs[key] = !!(data && (data.status === 'running' || data.blocked_by));
+  updateConsoleGate();
+}
+
 function runConsole(command) {
   if (!isAdmin) {
+    return;
+  }
+  if (consoleRun && consoleRun.disabled) {
+    appendConsole('refused: a scan or purge is running — wait for it to finish', 'bad');
     return;
   }
   var cmd = (command != null ? command : consoleInput.value).trim();
@@ -1233,6 +1266,7 @@ function loadBanned() {
 function onLogin() {
   isAdmin = true;
   adminSection.style.display = '';
+  updateConsoleGate();
   fetchReport().then(applyReportStatus);
   fetchRecipients().then(applyRecipientsStatus);
   fetchSubscribers().then(applySubscribersStatus);
