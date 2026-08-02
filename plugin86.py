@@ -108,15 +108,18 @@ def load_admin_pubkey():
         with open(CONFIG_PATH, "r") as f:
             cfg = json.load(f)
         pk = cfg.get("admin_pubkey_hex")
+        # Accept mixed-case config; always return lowercase so ban checks
+        # and is_banned keys agree with event pubkeys.
         if is_valid_hex_pubkey(pk):
-            return pk
+            return pk.lower()
     except Exception as e:
         log(f"plugin86: failed to load config.json: {e}")
     return None
 
 
 def is_valid_hex_pubkey(s):
-    if not isinstance(s, str) or len(s) != 64 or s != s.lower():
+    """64 hex characters, any case. Callers that store keys must .lower()."""
+    if not isinstance(s, str) or len(s) != 64:
         return False
     try:
         int(s, 16)
@@ -152,11 +155,12 @@ def process_event(event, admin_pubkey):
     event_id = event.get("id")
     pubkey = event.get("pubkey")
     kind = event.get("kind")
+    pubkey_l = pubkey.lower() if is_valid_hex_pubkey(pubkey) else None
 
-    if blacklist.is_banned(pubkey):
+    if pubkey_l is not None and blacklist.is_banned(pubkey_l):
         return {"id": event_id, "action": "reject", "msg": "blocked: banned pubkey"}
 
-    if kind == 1984 and admin_pubkey is not None and pubkey == admin_pubkey:
+    if kind == 1984 and admin_pubkey is not None and pubkey_l == admin_pubkey:
         created_at = event.get("created_at")
         content = event.get("content", "")
         tags = event.get("tags", [])
@@ -187,8 +191,10 @@ def process_event(event, admin_pubkey):
                     # pipeline on this plugin's reply, so a name lookup in
                     # this hot path would stall the relay. Resolution
                     # happens later, from the admin's browser.
+                    # blacklist.add lowercases the target; pass lower here
+                    # so the key is unambiguous if add is ever bypassed.
                     blacklist.add(
-                        tag[1],
+                        tag[1].lower(),
                         banned_at=created_at,
                         report_event_id=event_id,
                         reason=content if isinstance(content, str) else "",

@@ -1186,6 +1186,58 @@ updated3, _ = server86.blacklist.set_reasons([pk_existing], "appended after race
 check(updated3[0]["old_reason"] == "changed out from under the cache",
       "set_reasons reloads blacklist.json from disk before writing, so append joins the CURRENT reason, not a stale cache")
 
+# --- Grok phase 1: lowercase keys + corrupt-safe reload + is_banned case --
+# A mixed-case ban must enforce against the lowercase event pubkey. On-disk
+# keys are always lowercase. Corrupt JSON must not wipe a good in-memory map.
+_upper_pk = "AB" * 32
+_lower_pk = _upper_pk.lower()
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({}, f)
+ok_add = server86.blacklist.add(
+    _upper_pk, banned_at=1, report_event_id=None, reason="case",
+    report_type="manual", admin_pubkey_hex="00" * 32,
+)
+check(ok_add is True, "blacklist.add accepts mixed-case hex pubkey")
+on_disk_case = json.load(open(server86.blacklist.BLACKLIST_PATH))
+check(_lower_pk in on_disk_case and _upper_pk not in on_disk_case,
+      "blacklist.add stores the key as lowercase only")
+check(server86.blacklist.is_banned(_upper_pk) is True,
+      "is_banned matches mixed-case lookup against a lowercase key")
+check(server86.blacklist.is_banned(_lower_pk) is True,
+      "is_banned matches lowercase lookup")
+# Legacy uppercase key on disk is normalized on read into lowercase.
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({_upper_pk: {"banned_at": 2, "report_event_id": None, "reason": "legacy",
+                           "report_type": "manual", "name": None, "nip05": None,
+                           "name_checked_at": None}}, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+check(server86.blacklist.is_banned(_lower_pk) is True,
+      "is_banned enforces a legacy uppercase key after normalize-on-read")
+# Corrupt file: keep last good cache, do not fail open to empty.
+server86.blacklist.load()
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    f.write("{not valid json")
+server86.blacklist._cache_mtime = None  # force re-stat path
+server86.blacklist._last_checked = None
+server86.blacklist._refresh(force=True)
+check(server86.blacklist.is_banned(_lower_pk) is True,
+      "corrupt blacklist.json does not replace a good in-memory cache with {}")
+check(server86.as_hex64(_upper_pk) == _lower_pk,
+      "as_hex64 lowercases valid mixed-case hex")
+check(server86.as_hex64("not-a-key") is None,
+      "as_hex64 returns None for non-hex")
+# Clean slate for subsequent tests that assume an empty/seeded banlist.
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({}, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._last_checked = None
+
 
 # --- Phase 4: POST /api/profile (server86.py) -----------------------------
 

@@ -5,6 +5,16 @@ Used by both plugin86.py (hot path: is_banned() per event) and server86.py
 from disk when the file's mtime changes, checked at most once per second so
 the hot path never stats the filesystem on every single event.
 
+Writers (add / remove / set_reasons / set_names) take an exclusive flock on
+a sibling `.lock` file, re-read, mutate, then replace via a unique temp —
+plugin86 and server86 can race without losing bans or truncating a shared
+`.tmp`. On corrupt JSON, the last good in-memory cache is kept rather than
+failing open to an empty banlist.
+
+All pubkey keys are stored lowercase. Callers may pass mixed-case hex;
+lookups and writes normalize first so a ban always matches event pubkeys
+(Nostr events use lowercase hex).
+
 Data on disk (blacklist.json) is a JSON object:
     { "<pubkey_hex>": {"banned_at": <int>, "report_event_id": "<hex or null>",
                        "reason": "<str>", "report_type": "<str or null>",
@@ -19,8 +29,10 @@ hit or miss; entries written before these fields existed simply lack the
 keys, which read as null via plain dict.get() — no migration needed.
 """
 
+import fcntl
 import json
 import os
+import tempfile
 import time
 
 from lib86 import namecache
@@ -35,13 +47,46 @@ _cache_mtime = None
 _last_checked = None
 
 
+def _as_hex64(s):
+    """Return lowercase 64-char hex if `s` is valid hex (any case), else None."""
+    if not isinstance(s, str) or len(s) != 64:
+        return None
+    try:
+        int(s, 16)
+    except ValueError:
+        return None
+    return s.lower()
+
+
+def _normalize_keys(data):
+    """Lowercase every key that is 64-hex; drop non-object values. Merges
+    case-variants of the same pubkey (last write in iteration order wins —
+    JSON object order is insertion order, which is stable enough for a
+    one-time migration of a mis-cased key)."""
+    out = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        nk = _as_hex64(k)
+        if nk is None:
+            continue
+        out[nk] = v
+    return out
+
+
 def _read_file():
+    """Return (data, ok). ok=False means the file was present but unreadable
+    or not a JSON object — callers must not replace a good cache with {}."""
     try:
         with open(BLACKLIST_PATH, "r") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
-        return {}
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    return _normalize_keys(data), True
 
 
 def _refresh(force=False):
@@ -63,16 +108,56 @@ def _refresh(force=False):
     except OSError:
         mtime = None
     if force or mtime != _cache_mtime:
-        _cache = _read_file()
+        data, ok = _read_file()
+        if not ok:
+            # Corrupt on disk: keep last good in-memory map. Do not adopt
+            # the corrupt mtime — next check will retry the read.
+            return
+        _cache = data
         _cache_mtime = mtime
 
 
 def _write_atomic(data):
-    tmp_path = BLACKLIST_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp_path, BLACKLIST_PATH)
+    """Write via a unique temp in the same directory, then os.replace.
+    Unique temps avoid two processes truncating the same fixed `.tmp`."""
+    directory = os.path.dirname(BLACKLIST_PATH) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".blacklist-", suffix=".tmp", dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, BLACKLIST_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class _FileLock:
+    """Exclusive flock around a sibling `.lock` file for the life of the
+    context. Cross-process: plugin86 and server86 both honor it."""
+
+    def __init__(self):
+        self._fh = None
+
+    def __enter__(self):
+        lock_path = BLACKLIST_PATH + ".lock"
+        self._fh = open(lock_path, "a+")
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 def load():
@@ -82,7 +167,10 @@ def load():
 
 
 def is_banned(pubkey_hex):
-    return pubkey_hex in load()
+    key = _as_hex64(pubkey_hex)
+    if key is None:
+        return False
+    return key in load()
 
 
 def add(pubkey_hex, banned_at, report_event_id, reason, report_type=None,
@@ -95,26 +183,31 @@ def add(pubkey_hex, banned_at, report_event_id, reason, report_type=None,
     enforcement site regardless of whether the ban came from plugin86.py's
     hot path or server86.py's /api/ban."""
     global _cache, _cache_mtime
-    if admin_pubkey_hex is not None and pubkey_hex == admin_pubkey_hex:
+    key = _as_hex64(pubkey_hex)
+    if key is None:
         return False
-    _refresh(force=True)
-    data = dict(_cache)
-    data[pubkey_hex] = {
-        "banned_at": banned_at,
-        "report_event_id": report_event_id,
-        "reason": reason,
-        "report_type": report_type,
-        "name": name,
-        "nip05": nip05,
-        "name_checked_at": name_checked_at,
-    }
-    _write_atomic(data)
-    _cache = data
-    try:
-        _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
-    except OSError:
-        _cache_mtime = None
-    namecache.drop(pubkey_hex)
+    admin = _as_hex64(admin_pubkey_hex) if admin_pubkey_hex is not None else None
+    if admin is not None and key == admin:
+        return False
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        data[key] = {
+            "banned_at": banned_at,
+            "report_event_id": report_event_id,
+            "reason": reason,
+            "report_type": report_type,
+            "name": name,
+            "nip05": nip05,
+            "name_checked_at": name_checked_at,
+        }
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None
+    namecache.drop(key)
     return True
 
 
@@ -128,27 +221,38 @@ def set_names(hits, queried, now):
     got a verified profile back. Returns the pubkeys actually stamped
     (i.e. still present after the reload)."""
     global _cache, _cache_mtime
-    _refresh(force=True)
-    data = dict(_cache)
-    stamped = []
+    queried_norm = []
     for pk in queried:
-        if pk not in data:
-            continue
-        entry = dict(data[pk])
-        hit = hits.get(pk)
-        if hit is not None:
-            entry["name"] = hit.get("name")
-            entry["nip05"] = hit.get("nip05")
-        entry["name_checked_at"] = now
-        data[pk] = entry
-        stamped.append(pk)
-    if stamped:
-        _write_atomic(data)
-        _cache = data
-        try:
-            _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
-        except OSError:
-            _cache_mtime = None
+        key = _as_hex64(pk)
+        if key is not None:
+            queried_norm.append(key)
+    hits_norm = {}
+    for pk, hit in (hits or {}).items():
+        key = _as_hex64(pk)
+        if key is not None:
+            hits_norm[key] = hit
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        stamped = []
+        for pk in queried_norm:
+            if pk not in data:
+                continue
+            entry = dict(data[pk])
+            hit = hits_norm.get(pk)
+            if hit is not None:
+                entry["name"] = hit.get("name")
+                entry["nip05"] = hit.get("nip05")
+            entry["name_checked_at"] = now
+            data[pk] = entry
+            stamped.append(pk)
+        if stamped:
+            _write_atomic(data)
+            _cache = data
+            try:
+                _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
+            except OSError:
+                _cache_mtime = None
     return stamped
 
 
@@ -167,46 +271,52 @@ def set_reasons(pubkeys, reason, mode, now):
     never null, so the client can restore it verbatim on undo); `skipped`
     is the subset of `pubkeys` that were not banned."""
     global _cache, _cache_mtime
-    _refresh(force=True)
-    data = dict(_cache)
-    updated = []
-    skipped = []
-    for pk in pubkeys:
-        if pk not in data:
-            skipped.append(pk)
-            continue
-        entry = dict(data[pk])
-        old_reason = entry.get("reason") or ""
-        if mode == "append" and old_reason:
-            new_reason = old_reason + " — " + reason
-        else:
-            new_reason = reason
-        entry["reason"] = new_reason
-        data[pk] = entry
-        updated.append({"pubkey": pk, "old_reason": old_reason, "new_reason": new_reason})
-    if updated:
-        _write_atomic(data)
-        _cache = data
-        try:
-            _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
-        except OSError:
-            _cache_mtime = None
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        updated = []
+        skipped = []
+        for pk in pubkeys:
+            key = _as_hex64(pk)
+            if key is None or key not in data:
+                skipped.append(pk if isinstance(pk, str) else pk)
+                continue
+            entry = dict(data[key])
+            old_reason = entry.get("reason") or ""
+            if mode == "append" and old_reason:
+                new_reason = old_reason + " — " + reason
+            else:
+                new_reason = reason
+            entry["reason"] = new_reason
+            data[key] = entry
+            updated.append({"pubkey": key, "old_reason": old_reason, "new_reason": new_reason})
+        if updated:
+            _write_atomic(data)
+            _cache = data
+            try:
+                _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
+            except OSError:
+                _cache_mtime = None
     return updated, skipped
 
 
 def remove(pubkeys):
     """Remove the given pubkeys from the blacklist. Returns the list actually removed."""
     global _cache, _cache_mtime
-    _refresh(force=True)
-    data = dict(_cache)
-    removed = [pk for pk in pubkeys if pk in data]
-    for pk in removed:
-        del data[pk]
-    if removed:
-        _write_atomic(data)
-        _cache = data
-        try:
-            _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
-        except OSError:
-            _cache_mtime = None
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        removed = []
+        for pk in pubkeys:
+            key = _as_hex64(pk)
+            if key is not None and key in data:
+                del data[key]
+                removed.append(key)
+        if removed:
+            _write_atomic(data)
+            _cache = data
+            try:
+                _cache_mtime = os.stat(BLACKLIST_PATH).st_mtime
+            except OSError:
+                _cache_mtime = None
     return removed

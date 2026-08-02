@@ -17,13 +17,15 @@ and are NEVER auto re-queried, hit or miss — the same once-ever discipline
 blacklist.json's name_checked_at enforces on banned pubkeys, for the same
 reason (an external query is the thing this project bounds hardest).
 
-Same mtime-cache / atomic-write shape as lib86/blacklist.py, checked at
-most once per second so repeated requests in a burst don't restat the
-filesystem.
+Same mtime-cache / flock / unique-temp write shape as lib86/blacklist.py,
+checked at most once per second so repeated requests in a burst don't
+restat the filesystem. Pubkey keys are stored lowercase.
 """
 
+import fcntl
 import json
 import os
+import tempfile
 import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,13 +44,39 @@ _cache_mtime = None
 _last_checked = None
 
 
+def _as_hex64(s):
+    if not isinstance(s, str) or len(s) != 64:
+        return None
+    try:
+        int(s, 16)
+    except ValueError:
+        return None
+    return s.lower()
+
+
+def _normalize_keys(data):
+    out = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        nk = _as_hex64(k)
+        if nk is None:
+            continue
+        out[nk] = v
+    return out
+
+
 def _read_file():
     try:
         with open(NAMES_PATH, "r") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
-        return {}
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    return _normalize_keys(data), True
 
 
 def _refresh(force=False):
@@ -68,16 +96,49 @@ def _refresh(force=False):
     except OSError:
         mtime = None
     if force or mtime != _cache_mtime:
-        _cache = _read_file()
+        data, ok = _read_file()
+        if not ok:
+            return
+        _cache = data
         _cache_mtime = mtime
 
 
 def _write_atomic(data):
-    tmp_path = NAMES_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp_path, NAMES_PATH)
+    directory = os.path.dirname(NAMES_PATH) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".names-", suffix=".tmp", dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, NAMES_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class _FileLock:
+    def __init__(self):
+        self._fh = None
+
+    def __enter__(self):
+        lock_path = NAMES_PATH + ".lock"
+        self._fh = open(lock_path, "a+")
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 def _evict(data, max_entries):
@@ -101,7 +162,12 @@ def get_many(pubkeys):
     decide staleness themselves (source + checked_at age) — this is a plain
     lookup, not a freshness filter."""
     data = load()
-    return {pk: data[pk] for pk in pubkeys if pk in data}
+    out = {}
+    for pk in pubkeys:
+        key = _as_hex64(pk)
+        if key is not None and key in data:
+            out[key] = data[key]
+    return out
 
 
 def set_local(results, now, max_entries=DEFAULT_MAX_ENTRIES):
@@ -109,17 +175,24 @@ def set_local(results, now, max_entries=DEFAULT_MAX_ENTRIES):
     still worth caching so it isn't rescanned every request within the
     24h window). `results` is {pubkey: {"name": str_or_None, "nip05": str_or_None}}."""
     global _cache, _cache_mtime
-    _refresh(force=True)
-    data = dict(_cache)
-    for pk, hit in results.items():
-        data[pk] = {"name": hit.get("name"), "nip05": hit.get("nip05"), "checked_at": now, "source": "local"}
-    data = _evict(data, max_entries)
-    _write_atomic(data)
-    _cache = data
-    try:
-        _cache_mtime = os.stat(NAMES_PATH).st_mtime
-    except OSError:
-        _cache_mtime = None
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        for pk, hit in results.items():
+            key = _as_hex64(pk)
+            if key is None:
+                continue
+            data[key] = {
+                "name": hit.get("name"), "nip05": hit.get("nip05"),
+                "checked_at": now, "source": "local",
+            }
+        data = _evict(data, max_entries)
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(NAMES_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None
 
 
 def set_external(hits, queried, now, max_entries=DEFAULT_MAX_ENTRIES):
@@ -128,45 +201,59 @@ def set_external(hits, queried, now, max_entries=DEFAULT_MAX_ENTRIES):
     gets a `source: "external"` entry stamped `now`, hit or miss — misses
     are never auto re-queried, same discipline as blacklist.json's
     name_checked_at. `hits` is {pubkey: {"name": ..., "nip05": ...}}.
-    Returns the list of pubkeys stamped (always == `queried`; returned for
-    symmetry with blacklist.set_names, whose "still present" gate has no
-    equivalent here)."""
+    Returns the list of pubkeys stamped (always == normalized `queried`;
+    returned for symmetry with blacklist.set_names, whose "still present"
+    gate has no equivalent here)."""
     global _cache, _cache_mtime
-    queried = list(queried)
-    if not queried:
-        return []
-    _refresh(force=True)
-    data = dict(_cache)
+    queried_norm = []
     for pk in queried:
-        hit = hits.get(pk)
-        data[pk] = {
-            "name": hit.get("name") if hit else None,
-            "nip05": hit.get("nip05") if hit else None,
-            "checked_at": now,
-            "source": "external",
-        }
-    data = _evict(data, max_entries)
-    _write_atomic(data)
-    _cache = data
-    try:
-        _cache_mtime = os.stat(NAMES_PATH).st_mtime
-    except OSError:
-        _cache_mtime = None
-    return queried
+        key = _as_hex64(pk)
+        if key is not None:
+            queried_norm.append(key)
+    if not queried_norm:
+        return []
+    hits_norm = {}
+    for pk, hit in (hits or {}).items():
+        key = _as_hex64(pk)
+        if key is not None:
+            hits_norm[key] = hit
+    with _FileLock():
+        _refresh(force=True)
+        data = dict(_cache)
+        for pk in queried_norm:
+            hit = hits_norm.get(pk)
+            data[pk] = {
+                "name": hit.get("name") if hit else None,
+                "nip05": hit.get("nip05") if hit else None,
+                "checked_at": now,
+                "source": "external",
+            }
+        data = _evict(data, max_entries)
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(NAMES_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None
+    return queried_norm
 
 
 def drop(pubkey_hex):
     """Remove one pubkey's cached entry, if present. Called on ban — a
     pubkey's name lives in blacklist.json once banned, never both places."""
     global _cache, _cache_mtime
-    _refresh(force=True)
-    if pubkey_hex not in _cache:
+    key = _as_hex64(pubkey_hex)
+    if key is None:
         return
-    data = dict(_cache)
-    del data[pubkey_hex]
-    _write_atomic(data)
-    _cache = data
-    try:
-        _cache_mtime = os.stat(NAMES_PATH).st_mtime
-    except OSError:
-        _cache_mtime = None
+    with _FileLock():
+        _refresh(force=True)
+        if key not in _cache:
+            return
+        data = dict(_cache)
+        del data[key]
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(NAMES_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None

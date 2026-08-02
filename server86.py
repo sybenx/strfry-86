@@ -291,8 +291,13 @@ def _cap_list_rows(rows, max_rows=CACHE_LIST_MAX):
 def load_config():
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
+    admin = cfg["admin_pubkey_hex"]
+    # Store lowercase only — plugin86 and ban enforcement match event
+    # pubkeys (always lowercase hex). Mixed-case config would desync the two.
+    if not is_hex64(admin):
+        raise ValueError("admin_pubkey_hex missing or not 64 hex characters")
     return {
-        "admin_pubkey_hex": cfg["admin_pubkey_hex"],
+        "admin_pubkey_hex": admin.lower(),
         "port": int(cfg.get("port", 8686)),
         "bind": cfg.get("bind", "0.0.0.0"),
     }
@@ -332,6 +337,9 @@ def compute_event_id(pubkey, created_at, kind, tags, content):
 
 
 def is_hex64(s):
+    """True if `s` is exactly 64 hex characters (any case). Callers that
+    store or compare pubkeys must use .lower() / as_hex64() so mixed-case
+    input cannot create a ban that never matches an event."""
     if not isinstance(s, str) or len(s) != 64:
         return False
     try:
@@ -339,6 +347,13 @@ def is_hex64(s):
     except ValueError:
         return False
     return True
+
+
+def as_hex64(s):
+    """Return lowercase 64-hex if valid, else None."""
+    if not is_hex64(s):
+        return None
+    return s.lower()
 
 
 def get_tag(tags, name):
@@ -2435,8 +2450,10 @@ def write_app_config(edits=None, raw=None):
             return False, f"not valid JSON: {e}"
         if not isinstance(parsed, dict):
             return False, "config.json must be a JSON object"
-        if not is_hex64(parsed.get("admin_pubkey_hex")):
+        admin_raw = parsed.get("admin_pubkey_hex")
+        if not is_hex64(admin_raw):
             return False, "admin_pubkey_hex missing or not 64 hex characters — refusing to lock you out"
+        parsed["admin_pubkey_hex"] = admin_raw.lower()
         new_data = parsed
     else:
         new_data = dict(current)
@@ -2456,6 +2473,10 @@ def write_app_config(edits=None, raw=None):
                 new_data.pop(key, None)
             else:
                 new_data[key] = str(value)
+        # Keep any pre-existing admin key lowercase even if an old file had
+        # mixed case; structured edits cannot change it, but we rewrite it.
+        if is_hex64(new_data.get("admin_pubkey_hex")):
+            new_data["admin_pubkey_hex"] = new_data["admin_pubkey_hex"].lower()
 
     try:
         tmp = CONFIG_PATH + ".tmp"
@@ -3704,7 +3725,8 @@ def validate_authors_scan_mode(body):
 def validate_reason_request(body):
     """Return (pubkeys, reason, mode, error) for a POST /api/reason body.
     On success `error` is None; on failure the first three are None. A
-    reason over REASON_MAX_LEN is rejected outright, never truncated."""
+    reason over REASON_MAX_LEN is rejected outright, never truncated.
+    Pubkeys are returned lowercase so they match blacklist keys."""
     pubkeys = body.get("pubkeys")
     reason = body.get("reason")
     mode = body.get("mode")
@@ -3714,7 +3736,7 @@ def validate_reason_request(body):
         return None, None, None, "reason missing or exceeds REASON_MAX_LEN"
     if mode not in ("replace", "append"):
         return None, None, None, "mode must be 'replace' or 'append'"
-    return pubkeys, reason, mode, None
+    return [pk.lower() for pk in pubkeys], reason, mode, None
 
 
 # --- single-pubkey profile -------------------------------------------------
@@ -4007,7 +4029,8 @@ def validate_profile_day_request(body):
     not whatever the browser's local timezone would offset it to."""
     pubkey_hex = body.get("pubkey")
     date_str = body.get("date")
-    if not is_hex64(pubkey_hex):
+    pubkey_hex = as_hex64(pubkey_hex)
+    if pubkey_hex is None:
         return None, None, None, "malformed pubkey"
     if not isinstance(date_str, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
         return None, None, None, "malformed date (expected YYYY-MM-DD)"
@@ -4044,9 +4067,9 @@ def validate_profile_new_request(body):
     exclusive lower bound the client computes so the boundary event it
     already has is never double-counted — never a raw relative offset the
     server would have to interpret."""
-    pubkey_hex = body.get("pubkey")
+    pubkey_hex = as_hex64(body.get("pubkey"))
     since = body.get("since")
-    if not is_hex64(pubkey_hex):
+    if pubkey_hex is None:
         return None, None, "malformed pubkey"
     if not isinstance(since, int) or isinstance(since, bool) or since < 0:
         return None, None, "malformed since (expected a non-negative integer)"
@@ -4098,7 +4121,7 @@ def validate_pubkeys_lookup_request(body):
         return None, None, "malformed pubkey in list"
     if not isinstance(domain, str) or not domain.strip():
         return None, None, "malformed domain"
-    return pubkeys, domain.strip(), None
+    return [pk.lower() for pk in pubkeys], domain.strip(), None
 
 
 def compute_pubkeys_lookup(pubkeys, domain):
@@ -4170,20 +4193,27 @@ def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
     except ValueError:
         return False, "malformed signature"
 
+    # Event id and BIP-340 verify use the bytes as signed; pubkey hex in
+    # the event is almost always lowercase. Compare admin as lowercase so
+    # a mixed-case config.json still authorises the same key.
+    pubkey_l = pubkey.lower()
+    event_id_l = event_id.lower()
+    admin_l = admin_pubkey_hex.lower() if isinstance(admin_pubkey_hex, str) else ""
+
     expected_id = compute_event_id(pubkey, created_at, kind, tags, content)
-    if expected_id != event_id:
+    if expected_id != event_id_l and expected_id != event_id:
         return False, "event id mismatch"
 
     try:
         sig_ok = bip340.schnorr_verify(
-            bytes.fromhex(event_id), bytes.fromhex(pubkey), bytes.fromhex(sig)
+            bytes.fromhex(event_id_l), bytes.fromhex(pubkey_l), bytes.fromhex(sig)
         )
     except ValueError:
         return False, "malformed signature"
     if not sig_ok:
         return False, "invalid signature"
 
-    if pubkey != admin_pubkey_hex:
+    if pubkey_l != admin_l:
         return False, "not the admin"
 
     if kind != NIP98_KIND:
@@ -4771,13 +4801,14 @@ class Handler(BaseHTTPRequestHandler):
             raw_pk = body.get("pubkey")
             pubkey_hex = None
             if is_hex64(raw_pk):
-                pubkey_hex = raw_pk
+                pubkey_hex = raw_pk.lower()
             elif isinstance(raw_pk, str):
                 try:
                     pubkey_hex = bech32.npub_decode(raw_pk)
                 except (ValueError, TypeError):
                     pubkey_hex = None
-            if not is_hex64(pubkey_hex):
+            pubkey_hex = as_hex64(pubkey_hex)
+            if pubkey_hex is None:
                 self._send_json(400, {"error": "malformed pubkey"})
                 return
             self._send_json(200, build_profile_response(pubkey_hex))
@@ -4822,7 +4853,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "malformed request body"})
                 return
 
-            queried = [pk for pk in queried_raw if is_hex64(pk)]
+            queried = [pk.lower() for pk in queried_raw if is_hex64(pk)]
             queried_set = set(queried)
             # The accept-bound is "banned OR present in the current
             # author-scan cache" — still a bound assembled from server-held
@@ -4860,10 +4891,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/unban":
-            pubkeys = body.get("pubkeys")
-            if not isinstance(pubkeys, list) or not all(is_hex64(pk) for pk in pubkeys):
+            pubkeys_raw = body.get("pubkeys")
+            if not isinstance(pubkeys_raw, list) or not all(is_hex64(pk) for pk in pubkeys_raw):
                 self._send_json(400, {"error": "malformed pubkeys list"})
                 return
+            pubkeys = [pk.lower() for pk in pubkeys_raw]
 
             # Snapshot ban rows before removal so audit undo can re-ban.
             data = blacklist.load()
@@ -4903,13 +4935,14 @@ class Handler(BaseHTTPRequestHandler):
             reason = entry.get("reason") or ""
             pubkey = None
             if is_hex64(raw_pk):
-                pubkey = raw_pk
+                pubkey = raw_pk.lower()
             elif isinstance(raw_pk, str):
                 try:
                     pubkey = bech32.npub_decode(raw_pk)
                 except (ValueError, TypeError):
                     pubkey = None
-            if not is_hex64(pubkey):
+            pubkey = as_hex64(pubkey)
+            if pubkey is None:
                 skipped.append(raw_pk)
                 continue
             ok_added = blacklist.add(
