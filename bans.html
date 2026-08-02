@@ -372,6 +372,102 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   table.cards.feed tbody td.result::before {
     display:inline; margin:0; vertical-align:baseline;
   }
+
+  /* Users cards: identity without label, NIP-05 one line, Events · Reports ·
+     Gift-wraps on one meta line, last-active inline, Ban via .action. */
+  table.cards.users tbody td.identity {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+  }
+  table.cards.users tbody td.identity::before { content:none; }
+  table.cards.users tbody td.nip05 {
+    display:flex; align-items:baseline; flex-wrap:wrap; gap:.35em .5em;
+    padding:.15em 0 .4em; border-bottom:1px solid var(--hair);
+    white-space:normal;
+  }
+  table.cards.users tbody td.nip05::before {
+    display:inline; margin:0; flex:none; vertical-align:baseline;
+  }
+  table.cards.users tbody td.events,
+  table.cards.users tbody td.reports,
+  table.cards.users tbody td.giftwraps {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.users tbody td.events::before,
+  table.cards.users tbody td.reports::before,
+  table.cards.users tbody td.giftwraps::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  table.cards.users tbody td.events::after,
+  table.cards.users tbody td.reports::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.users tbody td.last {
+    display:flex; align-items:center; gap:.5em;
+    padding:.35em 0 .15em; border-bottom:1px solid var(--hair);
+    white-space:nowrap;
+  }
+  table.cards.users tbody td.last::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+
+  /* Banned-pubkey cards: identity without label; banned · source · blocked
+     on one meta line; reason keeps stacked free-text label. */
+  table.cards.bans tbody td.identity {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+  }
+  table.cards.bans tbody td.identity::before { content:none; }
+  table.cards.bans tbody td.when,
+  table.cards.bans tbody td.source,
+  table.cards.bans tbody td.blocked {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.bans tbody td.when::before,
+  table.cards.bans tbody td.blocked::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  /* Source badge is self-explanatory — no SOURCE strip beside kind:spam. */
+  table.cards.bans tbody td.source::before { content:none; }
+  table.cards.bans tbody td.when::after,
+  table.cards.bans tbody td.source::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.bans tbody td.reason {
+    display:block; padding:.45em 0; border-bottom:none;
+    white-space:normal;
+  }
+
+  /* Domain-receipt cards: domain as heading; banned · count on one meta
+     line; reason stacked; Unban via .action. */
+  table.cards.domains tbody td.domain {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+    font-weight:600;
+  }
+  table.cards.domains tbody td.domain::before { content:none; }
+  table.cards.domains tbody td.when,
+  table.cards.domains tbody td.count {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.domains tbody td.when::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  /* Value already reads "n of m still banned" — no PUBKEYS strip. */
+  table.cards.domains tbody td.count::before { content:none; }
+  table.cards.domains tbody td.when::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.domains tbody td.reason {
+    display:block; padding:.45em 0; border-bottom:1px solid var(--hair);
+    white-space:normal;
+  }
 }
 </style>
 </head>
@@ -553,13 +649,13 @@ function matchesQuery(ban, q) {
 // and genuinely holds no rejection for this key.
 function blockedCell(row) {
   if (row.blocked == null) {
-    var unknown = s86El('td', '—', 'num muted');
+    var unknown = s86El('td', '—', 'num muted blocked');
     unknown.title = 'no decision log yet — plugin86 has not judged an event since it last started';
     return s86DataLabel(unknown, 'Blocked');
   }
   var capped = !!(blockedWindow && blockedWindow.truncated);
   var text = (capped && row.blocked > 0 ? '≥ ' : '') + Number(row.blocked).toLocaleString();
-  var td = s86El('td', text, row.blocked > 0 ? 'num bad' : 'num muted');
+  var td = s86El('td', text, row.blocked > 0 ? 'num bad blocked' : 'num muted blocked');
   td.title = row.last_blocked_at
     ? ('last blocked ' + s86FormatDate(row.last_blocked_at))
     : 'nothing blocked inside the log window';
@@ -600,7 +696,9 @@ function renderBans(banned) {
       : 'no bans match this filter'));
   } else {
     var table = document.createElement('table');
-    table.className = 'cards';
+    // `bans` opts mobile cards into compact meta (identity; banned · source ·
+    // blocked on one line); reason keeps the stacked free-text label.
+    table.className = 'cards bans';
     var headCols = [
       { label: 'Pubkey', key: 'user', dir: 'asc' },
       { label: 'Banned on', key: 'banned_at', dir: 'desc' },
@@ -627,12 +725,13 @@ function renderBans(banned) {
       }
       tr.appendChild(s86BuildIdentityCell(ban, isAdmin, 'Pubkey'));
 
-      var whenTd = s86El('td', ban.banned_at ? s86FormatRelativeAge(ban.banned_at) : '—', 'mono nowrap muted');
+      var whenTd = s86El('td', ban.banned_at ? s86FormatRelativeAge(ban.banned_at) : '—', 'when mono nowrap muted');
       whenTd.title = ban.banned_at ? s86FormatDate(ban.banned_at) : '';
       s86DataLabel(whenTd, 'Banned on');
       tr.appendChild(whenTd);
 
       var sourceTd = document.createElement('td');
+      sourceTd.className = 'source';
       if (ban.report_type) {
         sourceTd.appendChild(s86El('span', ban.report_type, 'badge'));
       } else {
@@ -642,7 +741,7 @@ function renderBans(banned) {
       tr.appendChild(sourceTd);
       tr.appendChild(blockedCell(ban));
 
-      var reasonTd = s86El('td', ban.reason || '—', ban.reason ? 'clip' : 'muted');
+      var reasonTd = s86El('td', ban.reason || '—', ban.reason ? 'reason clip' : 'reason muted');
       s86DataLabel(reasonTd, 'Reason');
       tr.appendChild(reasonTd);
       tbody.appendChild(tr);
@@ -674,7 +773,9 @@ function renderDomains(domains) {
   }
   var sorted = s86SortRows(domains, DOMAIN_SORT[domainSortField] || DOMAIN_SORT.banned_at, domainSortDir);
   var table = document.createElement('table');
-  table.className = 'cards';
+  // `domains` opts mobile cards into compact meta (domain heading; banned ·
+  // count on one line); reason keeps the stacked free-text label.
+  table.className = 'cards domains';
   table.appendChild(s86BuildSortableTableHead([
     { label: 'Domain', key: 'domain', dir: 'asc' },
     { label: 'Banned on', key: 'banned_at', dir: 'desc' },
@@ -686,7 +787,7 @@ function renderDomains(domains) {
   sorted.forEach(function (d) {
     var tr = document.createElement('tr');
 
-    var domainTd = s86El('td', null, 'mono');
+    var domainTd = s86El('td', null, 'domain mono');
     var link = document.createElement('a');
     link.href = '/domain?d=' + encodeURIComponent(d.domain);
     link.textContent = d.domain;
@@ -694,7 +795,7 @@ function renderDomains(domains) {
     s86DataLabel(domainTd, 'Domain');
     tr.appendChild(domainTd);
 
-    var whenTd = s86El('td', d.banned_at ? s86FormatRelativeAge(d.banned_at) : '—', 'mono nowrap muted');
+    var whenTd = s86El('td', d.banned_at ? s86FormatRelativeAge(d.banned_at) : '—', 'when mono nowrap muted');
     whenTd.title = d.banned_at ? s86FormatDate(d.banned_at) : '';
     s86DataLabel(whenTd, 'Banned on');
     tr.appendChild(whenTd);
@@ -703,11 +804,11 @@ function renderDomains(domains) {
     // since been unbanned one by one is a materially different row from one
     // that is still fully enforced, and only showing the snapshot size hides
     // exactly that.
-    var countTd = s86El('td', d.still_banned + ' of ' + d.pubkey_count + ' still banned', 'num nowrap');
+    var countTd = s86El('td', d.still_banned + ' of ' + d.pubkey_count + ' still banned', 'num nowrap count');
     s86DataLabel(countTd, 'Pubkeys');
     tr.appendChild(countTd);
 
-    var reasonTd = s86El('td', d.reason || '—', d.reason ? 'clip' : 'muted');
+    var reasonTd = s86El('td', d.reason || '—', d.reason ? 'reason clip' : 'reason muted');
     s86DataLabel(reasonTd, 'Reason');
     tr.appendChild(reasonTd);
 

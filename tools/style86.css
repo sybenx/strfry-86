@@ -363,4 +363,100 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   table.cards.feed tbody td.result::before {
     display:inline; margin:0; vertical-align:baseline;
   }
+
+  /* Users cards: identity without label, NIP-05 one line, Events · Reports ·
+     Gift-wraps on one meta line, last-active inline, Ban via .action. */
+  table.cards.users tbody td.identity {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+  }
+  table.cards.users tbody td.identity::before { content:none; }
+  table.cards.users tbody td.nip05 {
+    display:flex; align-items:baseline; flex-wrap:wrap; gap:.35em .5em;
+    padding:.15em 0 .4em; border-bottom:1px solid var(--hair);
+    white-space:normal;
+  }
+  table.cards.users tbody td.nip05::before {
+    display:inline; margin:0; flex:none; vertical-align:baseline;
+  }
+  table.cards.users tbody td.events,
+  table.cards.users tbody td.reports,
+  table.cards.users tbody td.giftwraps {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.users tbody td.events::before,
+  table.cards.users tbody td.reports::before,
+  table.cards.users tbody td.giftwraps::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  table.cards.users tbody td.events::after,
+  table.cards.users tbody td.reports::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.users tbody td.last {
+    display:flex; align-items:center; gap:.5em;
+    padding:.35em 0 .15em; border-bottom:1px solid var(--hair);
+    white-space:nowrap;
+  }
+  table.cards.users tbody td.last::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+
+  /* Banned-pubkey cards: identity without label; banned · source · blocked
+     on one meta line; reason keeps stacked free-text label. */
+  table.cards.bans tbody td.identity {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+  }
+  table.cards.bans tbody td.identity::before { content:none; }
+  table.cards.bans tbody td.when,
+  table.cards.bans tbody td.source,
+  table.cards.bans tbody td.blocked {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.bans tbody td.when::before,
+  table.cards.bans tbody td.blocked::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  /* Source badge is self-explanatory — no SOURCE strip beside kind:spam. */
+  table.cards.bans tbody td.source::before { content:none; }
+  table.cards.bans tbody td.when::after,
+  table.cards.bans tbody td.source::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.bans tbody td.reason {
+    display:block; padding:.45em 0; border-bottom:none;
+    white-space:normal;
+  }
+
+  /* Domain-receipt cards: domain as heading; banned · count on one meta
+     line; reason stacked; Unban via .action. */
+  table.cards.domains tbody td.domain {
+    display:block; padding:.1em 0 .35em; border-bottom:none;
+    font-weight:600;
+  }
+  table.cards.domains tbody td.domain::before { content:none; }
+  table.cards.domains tbody td.when,
+  table.cards.domains tbody td.count {
+    display:inline-flex; align-items:center; gap:.35em;
+    width:auto; max-width:none; padding:.35em 0 .15em;
+    border-bottom:none; white-space:nowrap;
+  }
+  table.cards.domains tbody td.when::before {
+    display:inline; margin:0; vertical-align:baseline;
+  }
+  /* Value already reads "n of m still banned" — no PUBKEYS strip. */
+  table.cards.domains tbody td.count::before { content:none; }
+  table.cards.domains tbody td.when::after {
+    content:"·"; color:var(--muted); margin:0 .15em 0 .4em;
+    font-weight:400; letter-spacing:0; text-transform:none;
+  }
+  table.cards.domains tbody td.reason {
+    display:block; padding:.45em 0; border-bottom:1px solid var(--hair);
+    white-space:normal;
+  }
 }
