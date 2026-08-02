@@ -246,7 +246,19 @@ function s86CopyTextFallback(text) {
 // linkIt (admin): the label navigates to this relay's profile page.
 // Otherwise, if an npub is known, a click copies it — public viewers have no
 // profile page to open, and the full npub is what they need to paste elsewhere.
-function s86BuildIdentityCell(row, linkIt) {
+// Column label for phone card layout (table.cards). Cells without a label —
+// checkbox picks and trailing Ban/Undo actions — omit this and the card CSS
+// does not draw a label strip. Figure tables never use cards or data-label.
+function s86DataLabel(td, label) {
+  if (td && label) {
+    td.setAttribute('data-label', label);
+  }
+  return td;
+}
+
+// Identity cell for a list row. Optional dataLabel (default "User") is the
+// phone-card column name; pass false to suppress it.
+function s86BuildIdentityCell(row, linkIt, dataLabel) {
   var td = s86El('td', null, 'identity');
   // Flex lives on this inner row, never on the <td> — display:flex on a
   // table-cell breaks border alignment with the rest of the row.
@@ -301,6 +313,9 @@ function s86BuildIdentityCell(row, linkIt) {
     idrow.appendChild(span);
   }
   td.appendChild(idrow);
+  if (dataLabel !== false) {
+    s86DataLabel(td, dataLabel || 'User');
+  }
   return td;
 }
 

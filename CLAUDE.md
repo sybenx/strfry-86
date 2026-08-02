@@ -66,7 +66,9 @@ CSS inside an HTML file is the bug, not the drift it causes. Rules that hold in 
 
 Presentational class names owned by the block, applied from `common86.js` and pages:
 `mono` · `nowrap` · `muted` · `badge` (kind/action chip) · `pill`/`pill live` (live state)
-· `page-head` (h1 + right-hand pill) · `console-row`.
+· `page-head` (h1 + right-hand pill) · `console-row` · `cards` (multi-column list tables only
+— under 600px each row stacks as a card via `data-label` on cells; figure/key-value tables
+never take this class).
 
 ## Header — identical on every page, same positions, always
 
