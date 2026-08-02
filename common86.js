@@ -838,19 +838,62 @@ function s86TryAutoLogin(adminPubkey, loginBtn, statusEl, onLogin) {
 }
 
 // --- NIP-98 signing -----------------------------------------------------
+// Auth is carried in the JSON body (not an Authorization header). The
+// signed event therefore cannot cover the raw wire body (which includes
+// auth itself). Instead both sides hash the non-auth object with sorted
+// keys (NIP-98 `payload` tag) and bind `u` to window.location.origin so a
+// phishing host's signature is useless on this relay.
+
+function s86CanonicalJson(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map(s86CanonicalJson).join(',') + ']';
+  }
+  var keys = Object.keys(value).sort();
+  var parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    parts.push(JSON.stringify(keys[i]) + ':' + s86CanonicalJson(value[keys[i]]));
+  }
+  return '{' + parts.join(',') + '}';
+}
+
+function s86Sha256Hex(text) {
+  var bytes = new TextEncoder().encode(text);
+  return crypto.subtle.digest('SHA-256', bytes).then(function (buf) {
+    var arr = new Uint8Array(buf);
+    var hex = '';
+    for (var i = 0; i < arr.length; i++) {
+      hex += arr[i].toString(16).padStart(2, '0');
+    }
+    return hex;
+  });
+}
 
 function s86SignAndPost(endpoint, extraBody) {
+  // Auth always wins: never let a caller-supplied `auth` field clobber the
+  // event this function is about to sign.
+  var data = Object.assign({}, extraBody || {});
+  delete data.auth;
   var url = window.location.origin + endpoint;
-  var event = {
-    kind: 27235,
-    created_at: Math.floor(Date.now() / 1000),
-    tags: [['u', url], ['method', 'POST']],
-    content: ''
-  };
 
-  return window.nostr.signEvent(event)
+  return s86Sha256Hex(s86CanonicalJson(data))
+    .then(function (payloadHex) {
+      var event = {
+        kind: 27235,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+          ['u', url],
+          ['method', 'POST'],
+          ['payload', payloadHex]
+        ],
+        content: ''
+      };
+      return window.nostr.signEvent(event);
+    })
     .then(function (signed) {
-      var body = Object.assign({ auth: signed }, extraBody);
+      var body = Object.assign({}, data, { auth: signed });
       return fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -121,6 +121,7 @@ LEGACY_REDIRECTS = {
 
 NIP98_KIND = 27235
 NIP98_MAX_SKEW = 60
+NIP98_REPLAY_TTL = NIP98_MAX_SKEW * 2  # remember used auth event ids this long
 NAME_CACHE_TTL = 24 * 3600
 
 # --- bounds --------------------------------------------------------------
@@ -2307,6 +2308,10 @@ CONFIG_EDITABLE_FIELDS = {
                          "leave blank to detect it from the running relay; set it only when "
                          "detection picks the wrong file"),
     "relay_url": ("string", "Relay URL", "wss:// URL this relay answers on — used to find its own subscribers"),
+    "public_origin": ("string", "Public origin",
+                      "https://host[:port] of this admin UI as browsers see it — binds NIP-98 "
+                      "auth to that host. Leave blank to use the request Host header; set it "
+                      "when a reverse proxy terminates TLS so signed u tags match."),
     "contact_appeal": ("string", "Contact appeal", "shown publicly to banned pubkeys on the Banlist"),
     "giftwrap_retention_days": ("range", "Gift-wrap retention",
                                 "kind-1059 older than this is deleted automatically (default 30 days, "
@@ -4168,10 +4173,114 @@ def compute_pubkeys_lookup(pubkeys, domain):
     return {"domain": domain, "results": results}
 
 
-def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
+# NIP-98 used-event ids: reject the same signed auth event twice within
+# NIP98_REPLAY_TTL. Keyed by event id (lowercase hex); value is unix expiry.
+_nip98_used_ids = {}
+_nip98_used_lock = threading.Lock()
+
+
+def _nip98_prune_used(now):
+    expired = [eid for eid, exp in _nip98_used_ids.items() if exp <= now]
+    for eid in expired:
+        del _nip98_used_ids[eid]
+
+
+def nip98_mark_used(event_id, now):
+    """Record a successfully verified auth event id. Return False if it was
+    already used and has not yet expired (replay)."""
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    eid = event_id.lower()
+    with _nip98_used_lock:
+        _nip98_prune_used(now)
+        exp = _nip98_used_ids.get(eid)
+        if exp is not None and exp > now:
+            return False
+        _nip98_used_ids[eid] = now + NIP98_REPLAY_TTL
+        return True
+
+
+def nip98_origin_of_u(u):
+    """scheme://netloc from a NIP-98 `u` tag, or None if unusable."""
+    if not isinstance(u, str) or not u:
+        return None
+    parsed = urlparse(u)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def normalize_public_origin(value):
+    """Return scheme://host[:port] lowercase, or None if blank/invalid."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().rstrip("/")
+    if not text:
+        return None
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def get_public_origin():
+    """Optional config.json public_origin — the UI URL as browsers see it."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if isinstance(cfg, dict):
+            return normalize_public_origin(cfg.get("public_origin"))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def request_expected_origin(handler):
+    """Origin this request must be NIP-98-bound to.
+
+    Prefer configured `public_origin` (correct behind TLS-terminating
+    proxies). Otherwise derive from Host + X-Forwarded-Proto (or http)."""
+    configured = get_public_origin()
+    if configured:
+        return configured
+    host = (handler.headers.get("Host") or "").strip()
+    if not host or "/" in host or " " in host or "\\" in host:
+        return None
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto not in ("http", "https"):
+        proto = "http"
+    return f"{proto}://{host}".lower()
+
+
+def payload_body_hash(body):
+    """SHA-256 hex of the canonical JSON of `body` without the `auth` key.
+
+    Auth is inside the JSON body in this project (not an Authorization
+    header), so the signed payload cannot be the raw wire body. Client and
+    server both hash the non-auth object with sorted keys so key order never
+    drifts between JS and Python."""
+    if not isinstance(body, dict):
+        body = {}
+    data = {k: v for k, v in body.items() if k != "auth"}
+    raw = json.dumps(data, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None,
+                 expected_origin=None, payload_sha256=None, consume_id=False):
     """Return (ok, error_message). `now` defaults to the real current time;
     a test harness may inject a fixed value to isolate the freshness check
-    against a pre-signed fixture."""
+    against a pre-signed fixture.
+
+    `expected_origin` is scheme://host[:port]; when provided, the `u` tag
+    must match both that origin and `expected_path` (phishing defence).
+    `payload_sha256` is the hex digest of the non-auth body; when provided,
+    a matching `payload` tag is required (body-substitution defence).
+    `consume_id` marks the event id used so the same signature cannot be
+    replayed within NIP98_REPLAY_TTL (live handlers pass True; pure unit
+    tests of the fixture pass False so the fixture can be reused)."""
     if not isinstance(auth, dict):
         return False, "malformed auth event"
 
@@ -4224,13 +4333,32 @@ def verify_nip98(auth, admin_pubkey_hex, expected_path, now=None):
         return False, "wrong method tag"
 
     u = get_tag(tags, "u")
-    if not isinstance(u, str) or urlparse(u).path != expected_path:
+    if not isinstance(u, str):
         return False, "wrong u tag"
+    parsed_u = urlparse(u)
+    if parsed_u.path != expected_path:
+        return False, "wrong u tag"
+    if expected_origin is not None:
+        origin = nip98_origin_of_u(u)
+        want = normalize_public_origin(expected_origin)
+        if origin is None or want is None or origin != want:
+            return False, "wrong u origin"
+
+    if payload_sha256 is not None:
+        if not isinstance(payload_sha256, str) or not is_hex64(payload_sha256):
+            return False, "payload hash missing"
+        tag_payload = get_tag(tags, "payload")
+        if not isinstance(tag_payload, str) or tag_payload.lower() != payload_sha256.lower():
+            return False, "payload hash mismatch"
 
     if now is None:
         now = int(time.time())
     if abs(created_at - now) > NIP98_MAX_SKEW:
         return False, "stale auth event"
+
+    if consume_id:
+        if not nip98_mark_used(event_id_l, now):
+            return False, "auth event already used"
 
     return True, None
 
@@ -4521,7 +4649,18 @@ class Handler(BaseHTTPRequestHandler):
 
         auth = body.get("auth")
 
-        ok, err = verify_nip98(auth, cfg["admin_pubkey_hex"], path)
+        expected_origin = request_expected_origin(self)
+        if expected_origin is None:
+            self._send_json(401, {
+                "error": "cannot determine request origin — set public_origin in config.json",
+            })
+            return
+        ok, err = verify_nip98(
+            auth, cfg["admin_pubkey_hex"], path,
+            expected_origin=expected_origin,
+            payload_sha256=payload_body_hash(body),
+            consume_id=True,
+        )
         if not ok:
             self._send_json(401, {"error": err})
             return

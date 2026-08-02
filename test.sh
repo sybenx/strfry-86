@@ -357,7 +357,9 @@ def with_field(event, **overrides):
     return ev
 
 
-ok, err = server86.verify_nip98(valid, admin, path, now=now)
+# Fixture u is https://relay.example/api/unban — bind origin like do_POST does.
+_origin = "https://relay.example"
+ok, err = server86.verify_nip98(valid, admin, path, now=now, expected_origin=_origin)
 check(ok, "nip98 fixture accepted unmodified", err)
 
 reject_cases = [
@@ -371,8 +373,54 @@ reject_cases = [
     ("now 120s after created_at (stale event)", valid, admin, path, now + 120),
 ]
 for name, ev, adm, p, n in reject_cases:
-    ok, err = server86.verify_nip98(ev, adm, p, now=n)
+    ok, err = server86.verify_nip98(ev, adm, p, now=n, expected_origin=_origin)
     check(not ok, f"nip98 rejects: {name}", None if not ok else "was wrongly accepted")
+
+# Origin binding: same path on a phishing host must fail even with a valid sig
+# over that evil u (fixture is signed for relay.example; evil origin is wrong).
+ok, err = server86.verify_nip98(valid, admin, path, now=now, expected_origin="https://evil.example")
+check(not ok and err == "wrong u origin",
+      "nip98 rejects: wrong u origin (phishing host)", err)
+
+# Path-only was the old check — origin mismatch is the new defence. Same
+# fixture against the correct origin still passes (above).
+ok, err = server86.verify_nip98(valid, admin, path, now=now, expected_origin="https://relay.example:443")
+# netloc differs (:443 explicit vs default) — treat as different origins
+check(not ok, "nip98 rejects: origin netloc must match exactly (incl. port)", err)
+
+# payload_body_hash: empty non-auth object is stable across languages
+_empty_hash = server86.payload_body_hash({"auth": valid})
+check(_empty_hash == "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "payload_body_hash of {auth-only} is sha256 of '{}'")
+_with_pubkeys = server86.payload_body_hash({"auth": valid, "pubkeys": ["aa" * 32]})
+check(_with_pubkeys == server86.payload_body_hash({"pubkeys": ["aa" * 32]}),
+      "payload_body_hash ignores the auth key")
+
+# Require payload tag when payload_sha256 is supplied — fixture has no tag
+ok, err = server86.verify_nip98(
+    valid, admin, path, now=now, expected_origin=_origin,
+    payload_sha256=_empty_hash,
+)
+check(not ok and err == "payload hash mismatch",
+      "nip98 rejects: missing payload tag when body hash is required", err)
+
+# Replay: first consume succeeds, second with same id fails
+server86._nip98_used_ids.clear()
+ok1, _ = server86.verify_nip98(
+    valid, admin, path, now=now, expected_origin=_origin, consume_id=True)
+ok2, err2 = server86.verify_nip98(
+    valid, admin, path, now=now, expected_origin=_origin, consume_id=True)
+check(ok1 and (not ok2) and err2 == "auth event already used",
+      "nip98 rejects: replay of the same auth event id within TTL", err2)
+server86._nip98_used_ids.clear()
+
+# normalize_public_origin strips path and trailing slash
+check(server86.normalize_public_origin("https://Relay.Example/") == "https://relay.example",
+      "normalize_public_origin lowercases and strips trailing slash")
+check(server86.normalize_public_origin("relay.example") == "https://relay.example",
+      "normalize_public_origin defaults bare host to https")
+check(server86.normalize_public_origin("") is None,
+      "normalize_public_origin returns None for blank")
 
 
 # --- kind-0 fixture + mutations (tests/kind0-fixture.json) ------------------

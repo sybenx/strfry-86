@@ -23,10 +23,10 @@ binding, then disclosure, then ops/UI contract drift.
   instead of replacing with `{}`. Tests for case-insensitive ban store and
   locked write path.
 
-- [ ] **Phase 2 — NIP-98 origin + payload hash (+ optional replay store).**
+- [x] **Phase 2 — NIP-98 origin + payload hash (+ replay store).**
   Bind `u` to scheme+host (configured public origin), not path alone.
   Hash the non-auth request body into the signed event; reject missing/
-  mismatch. Optionally remember accepted auth event ids for ≥2× skew.
+  mismatch. Remember accepted auth event ids for ≥2× skew.
 
 - [ ] **Phase 3 — Authenticate admin-shaped GETs.**
   Gate `GET /api/audit` (and decide policy for other large caches:
@@ -73,3 +73,22 @@ binding, then disclosure, then ops/UI contract drift.
 
 **Not in this phase:** NIP-98 origin/payload (phase 2), public audit auth
 (phase 3), console job lock (phase 4).
+
+## Phase 2 — landed
+
+**What changed**
+
+- `verify_nip98` takes `expected_origin`, `payload_sha256`, `consume_id`.
+  `u` must match scheme://host (and path); phishing host rejected.
+  `payload` tag must equal sha256 of canonical non-auth JSON body.
+  Successful live auths mark the event id used for `NIP98_REPLAY_TTL`.
+- `do_POST` always supplies origin (config `public_origin` or Host /
+  X-Forwarded-Proto) and body hash; fails closed if origin unknown.
+- Optional Settings field `public_origin` for reverse-proxy / TLS setups.
+- `common86.js` `s86SignAndPost`: canonical sorted JSON + SHA-256 payload
+  tag; `auth` always written last so it cannot be clobbered.
+- Tests: origin mismatch, port-exact origin, payload hash stability,
+  missing payload tag, replay within TTL.
+
+**Ops note:** Behind a TLS-terminating proxy, set `public_origin` in
+`config.json` (or Settings) to the browser-visible `https://host[:port]`.
