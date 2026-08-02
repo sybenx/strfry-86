@@ -2251,10 +2251,12 @@ try:
     check(_resp.status == 302 and _resp.headers.get("Location") == "/",
           "GET /home redirects (302) to /")
 
-    _status, _body = _get_bytes("/api/audit?q=")
-    _audit_page = json.loads(_body)
-    check(_status == 200 and "records" in _audit_page and "total" in _audit_page,
-          "GET /api/audit is a public, paged read (records + total)")
+    try:
+        _get_bytes("/api/audit?q=")
+        check(False, "GET /api/audit is no longer a public read")
+    except _urllib_error.HTTPError as _e:
+        check(_e.code == 401,
+              "GET /api/audit requires auth (401) — use POST with NIP-98")
 
     # /api/relay-url: GET is a public read (same stance as /api/authors,
     # /api/recipients, /api/subscribers — only the mutating POST needs

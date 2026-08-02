@@ -41,7 +41,7 @@ Routes:
   GET  /api/reports       -> public read of the last kind-1984-per-p-tag tally (never scans)
   POST /api/reports       -> NIP-98 authenticated: run exactly one bounded scan
   POST /api/console       -> NIP-98 authenticated: run one CONSOLE_VERBS-allowlisted command
-  GET  /api/audit         -> paged read of the server-side admin-action log
+  POST /api/audit         -> NIP-98 authenticated: paged read of the admin-action log
   POST /api/undo          -> NIP-98 authenticated: undo one audit record by id
 """
 
@@ -4528,17 +4528,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/audit":
-            q = (query.get("q") or [""])[0]
-            try:
-                offset = max(0, int((query.get("offset") or ["0"])[0]))
-            except ValueError:
-                offset = 0
-            records = get_audit_records(q)
-            page = records[offset:offset + RENDER_MAX]
-            self._send_json(200, {
-                "records": page, "total": len(records),
-                "offset": offset, "limit": RENDER_MAX,
-            })
+            # Admin action history is not public intelligence — reasons,
+            # settings deltas, and actor pubkeys used to ship unauthenticated.
+            self._send_json(401, {"error": "auth required — POST /api/audit with NIP-98"})
             return
 
         if path == "/api/banned":
@@ -4615,7 +4607,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/recipients", "/api/subscribers", "/api/reason", "/api/profile",
             "/api/profile/day", "/api/profile/new", "/api/pubkeys/lookup", "/api/report/totals",
             "/api/report/walk", "/api/relay-url", "/api/reports",
-            "/api/console", "/api/undo",
+            "/api/console", "/api/undo", "/api/audit",
             "/api/settings", "/api/settings/save", "/api/domain-unban",
             "/api/giftwrap-retention/estimate", "/api/giftwrap-retention/purge",
             "/api/ephemeral/estimate", "/api/ephemeral/purge",
@@ -4712,6 +4704,20 @@ class Handler(BaseHTTPRequestHandler):
             raw_cmd = body.get("command")
             result = run_console_command(raw_cmd if isinstance(raw_cmd, str) else "")
             self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/audit":
+            q = body.get("q") if isinstance(body.get("q"), str) else ""
+            try:
+                offset = max(0, int(body.get("offset") or 0))
+            except (TypeError, ValueError):
+                offset = 0
+            records = get_audit_records(q)
+            page = records[offset:offset + RENDER_MAX]
+            self._send_json(200, {
+                "records": page, "total": len(records),
+                "offset": offset, "limit": RENDER_MAX,
+            })
             return
 
         if path == "/api/undo":

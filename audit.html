@@ -698,9 +698,15 @@ function renderRecords(records) {
 
 function loadAudit() {
   var q = filterInput.value.trim();
-  return fetch('/api/audit?q=' + encodeURIComponent(q))
-    .then(function (res) { return res.json(); })
-    .then(function (data) {
+  // NIP-98: admin action history is not a public cache. Filter keystrokes
+  // share this path, so the extension will re-sign; callers debounce.
+  return s86SignAndPost('/api/audit', { q: q, offset: 0 })
+    .then(function (result) {
+      if (!result.ok) {
+        setStatus('failed to load audit log: ' + s86ErrMsg(result));
+        return;
+      }
+      var data = result.body || {};
       var records = data.records || [];
       renderRecords(records);
       truncatedLine.textContent = (data.total || 0) > records.length
@@ -719,10 +725,13 @@ function onLogin() {
 }
 
 s86WireLogin(loginBtn, statusEl, function () { return adminPubkey; }, onLogin);
+var filterTimer = null;
 filterInput.addEventListener('input', function () {
-  if (isAdmin) {
-    loadAudit();
+  if (!isAdmin) {
+    return;
   }
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(loadAudit, 300);
 });
 
 fetch('/api/banned')

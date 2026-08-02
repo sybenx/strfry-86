@@ -28,9 +28,8 @@ binding, then disclosure, then ops/UI contract drift.
   Hash the non-auth request body into the signed event; reject missing/
   mismatch. Remember accepted auth event ids for ≥2× skew.
 
-- [ ] **Phase 3 — Authenticate admin-shaped GETs.**
-  Gate `GET /api/audit` (and decide policy for other large caches:
-  userlist, banned reasons, subscribers). Document what stays public.
+- [x] **Phase 3 — Authenticate admin-shaped GETs.**
+  Gate audit log behind NIP-98 (POST). Document what stays public.
 
 - [ ] **Phase 4 — Console under global job lock.**
   Server refuses or queues console while a scan/purge/compact holds the
@@ -92,3 +91,24 @@ binding, then disclosure, then ops/UI contract drift.
 
 **Ops note:** Behind a TLS-terminating proxy, set `public_origin` in
 `config.json` (or Settings) to the browser-visible `https://host[:port]`.
+
+## Phase 3 — landed
+
+**What changed**
+
+- `GET /api/audit` → 401 (no longer public).
+- `POST /api/audit` with NIP-98: body `{q, offset}` returns the same
+  paged records shape as before.
+- `audit.html` loads via `s86SignAndPost`; filter input debounced 300ms
+  so each keystroke does not hammer the extension.
+
+**Still public (intentional)**
+
+- Ban list (`GET /api/banned`) — enforcement is public by design; admin
+  pubkey is needed for login compare.
+- Userlist / authors / recipients / subscribers / report caches — derived
+  relay intelligence; CLAUDE “logged out empty” is client-only UI.
+- Live feed / metrics / decision-log content — public landing.
+
+Revisit any of the above only if deployment exposes the UI beyond the
+operator’s trust boundary and wants a stricter perimeter.
