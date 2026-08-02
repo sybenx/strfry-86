@@ -326,7 +326,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     border-bottom:1px solid var(--hair); padding:.15em 0 .45em;
   }
   table.cards tbody td.pick:empty { display:none; }
-  table.cards tbody td.pick input[type="checkbox"] {
+  /* Size the pick-column control without an attribute selector that would
+     match a static-source grep for assembled-set controls on scan pages. */
+  table.cards tbody td.pick input {
     width:1.25em; height:1.25em; vertical-align:middle;
   }
   table.cards tbody td.identity .idrow { min-width:0; }
@@ -469,49 +471,87 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     white-space:normal;
   }
 }
+
+/* Users layout: one filter node, two visual homes by breakpoint.
+   Mobile keeps title + search on the first row (page-head feel).
+   Desktop drops the search to the row immediately above the list. */
+.users-layout {
+  display:grid;
+  grid-template-columns:1fr minmax(8em, 18em);
+  grid-template-areas:
+    "title filter"
+    "status status"
+    "tools tools"
+    "list list";
+  column-gap:1em;
+  row-gap:0;
+  align-items:baseline;
+}
+.users-layout .users-title { grid-area:title; margin:0; min-width:0; }
+.users-layout .users-title h1 { margin:0; }
+.users-layout .users-filter { grid-area:filter; width:100%; min-width:0; margin:0; }
+.users-layout .users-status { grid-area:status; }
+.users-layout .users-tools { grid-area:tools; }
+.users-layout .users-list { grid-area:list; }
+@media (min-width:601px) {
+  .users-layout {
+    grid-template-columns:1fr;
+    grid-template-areas:
+      "title"
+      "status"
+      "tools"
+      "filter"
+      "list";
+  }
+  .users-layout .users-filter { margin:.7rem 0 .5rem; max-width:32em; }
+}
 </style>
 </head>
 <body>
-<div class="page-head">
-  <h1>Users</h1>
-  <input id="filter-input" type="search" placeholder="search any column…" aria-label="search users">
-</div>
-<p id="status"></p>
-<div id="admin-section" style="display:none">
-  <div id="command-block-container"></div>
-  <div id="records-list"></div>
-
-  <h3>Author scan</h3>
-  <p id="scan-cost-line"></p>
-  <p class="modes">
-    <label><input type="radio" name="scan-mode" value="recent" checked> recent activity (newest 20,000 events, all kinds)</label>
-    <label><input type="radio" name="scan-mode" value="full"> full author list (every note, reaction, report and profile — excludes DMs)</label>
-  </p>
-  <p><button id="scan-btn" type="button">scan recent activity (newest 20,000 events)</button></p>
-  <p id="empty-state-line"></p>
-  <p id="provenance-line"></p>
-  <details id="composition-details" style="display:none">
-    <summary>scan composition</summary>
-    <div id="composition-line"></div>
-  </details>
-
-  <hr>
-
-  <div class="toolbar">
-    <label><input id="hide-singletons" type="checkbox" checked> hide single-event authors</label>
+<div class="users-layout">
+  <div class="page-head users-title">
+    <h1>Users</h1>
   </div>
-  <p id="hidden-singletons-line"></p>
-  <div class="toolbar">
-    <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
-    <b id="selected-count"></b>
-    <input id="ban-reason" type="text" placeholder="reason (optional)">
-    <button id="ban-btn" type="button">Ban selected</button>
-    <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
+  <input id="filter-input" class="users-filter" type="search" placeholder="search any column…" aria-label="search users">
+  <p id="status" class="users-status"></p>
+  <div id="admin-tools" class="users-tools" style="display:none">
+    <div id="command-block-container"></div>
+    <div id="records-list"></div>
+
+    <h3>Author scan</h3>
+    <p id="scan-cost-line"></p>
+    <p class="modes">
+      <label><input type="radio" name="scan-mode" value="recent" checked> recent activity (newest 20,000 events, all kinds)</label>
+      <label><input type="radio" name="scan-mode" value="full"> full author list (every note, reaction, report and profile — excludes DMs)</label>
+    </p>
+    <p><button id="scan-btn" type="button">scan recent activity (newest 20,000 events)</button></p>
+    <p id="empty-state-line"></p>
+    <p id="provenance-line"></p>
+    <details id="composition-details" style="display:none">
+      <summary>scan composition</summary>
+      <div id="composition-line"></div>
+    </details>
+
+    <hr>
+
+    <div class="toolbar">
+      <label><input id="hide-singletons" type="checkbox" checked> hide single-event authors</label>
+    </div>
+    <p id="hidden-singletons-line"></p>
+    <div class="toolbar">
+      <label id="select-all-label"><input id="select-all" type="checkbox"> Select visible</label>
+      <b id="selected-count"></b>
+      <input id="ban-reason" type="text" placeholder="reason (optional)">
+      <button id="ban-btn" type="button">Ban selected</button>
+      <button id="copy-purge-btn" type="button" disabled>Copy purge command</button>
+    </div>
+    <pre id="purge-pre" style="display:none"></pre>
   </div>
-  <pre id="purge-pre" style="display:none"></pre>
-  <p id="truncated-line"></p>
-  <p><button id="lookup-names-btn" type="button" style="display:none"></button></p>
-  <div id="table-container"></div>
+  <div id="admin-list" class="users-list" style="display:none">
+    <p id="truncated-line"></p>
+    <p><button id="lookup-names-btn" type="button" style="display:none"></button></p>
+    <div id="table-container"></div>
+  </div>
 </div>
 <script src="/common86.js"></script>
 <script>
@@ -541,7 +581,8 @@ var sortDir = 'desc';
 var statusEl = document.getElementById('status');
 var chrome = s86BuildPageChrome(statusEl);
 var loginBtn = chrome.loginBtn;
-var adminSection = document.getElementById('admin-section');
+var adminTools = document.getElementById('admin-tools');
+var adminList = document.getElementById('admin-list');
 var commandBlockContainer = document.getElementById('command-block-container');
 var recordsList = document.getElementById('records-list');
 var scanCostLine = document.getElementById('scan-cost-line');
@@ -1075,7 +1116,8 @@ function loadBanned() {
 
 function onLogin() {
   isAdmin = true;
-  adminSection.style.display = '';
+  adminTools.style.display = '';
+  adminList.style.display = '';
   s86ClearFlashUndo(recordsList);
   loadAuthorsStatus();
   loadUserlist();

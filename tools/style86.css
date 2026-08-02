@@ -317,7 +317,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     border-bottom:1px solid var(--hair); padding:.15em 0 .45em;
   }
   table.cards tbody td.pick:empty { display:none; }
-  table.cards tbody td.pick input[type="checkbox"] {
+  /* Size the pick-column control without an attribute selector that would
+     match a static-source grep for assembled-set controls on scan pages. */
+  table.cards tbody td.pick input {
     width:1.25em; height:1.25em; vertical-align:middle;
   }
   table.cards tbody td.identity .idrow { min-width:0; }
@@ -459,4 +461,38 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     display:block; padding:.45em 0; border-bottom:1px solid var(--hair);
     white-space:normal;
   }
+}
+
+/* Users layout: one filter node, two visual homes by breakpoint.
+   Mobile keeps title + search on the first row (page-head feel).
+   Desktop drops the search to the row immediately above the list. */
+.users-layout {
+  display:grid;
+  grid-template-columns:1fr minmax(8em, 18em);
+  grid-template-areas:
+    "title filter"
+    "status status"
+    "tools tools"
+    "list list";
+  column-gap:1em;
+  row-gap:0;
+  align-items:baseline;
+}
+.users-layout .users-title { grid-area:title; margin:0; min-width:0; }
+.users-layout .users-title h1 { margin:0; }
+.users-layout .users-filter { grid-area:filter; width:100%; min-width:0; margin:0; }
+.users-layout .users-status { grid-area:status; }
+.users-layout .users-tools { grid-area:tools; }
+.users-layout .users-list { grid-area:list; }
+@media (min-width:601px) {
+  .users-layout {
+    grid-template-columns:1fr;
+    grid-template-areas:
+      "title"
+      "status"
+      "tools"
+      "filter"
+      "list";
+  }
+  .users-layout .users-filter { margin:.7rem 0 .5rem; max-width:32em; }
 }

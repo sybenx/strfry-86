@@ -3776,13 +3776,53 @@ def _build_event_preview(ev):
     }
 
 
+def _parse_relay_list_event(ev):
+    """Extract NIP-65 kind-10002 `r` tags into a stable response shape.
+    Returns None when the event has no usable relay URLs. Markers are
+    optional per the NIP (read / write / omitted = both)."""
+    if not isinstance(ev, dict):
+        return None
+    relays = []
+    seen = set()
+    tags = ev.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    for tag in tags:
+        if not isinstance(tag, list) or len(tag) < 2:
+            continue
+        if tag[0] != "r":
+            continue
+        url = tag[1]
+        if not isinstance(url, str) or not url.strip():
+            continue
+        url = url.strip()
+        marker = None
+        if len(tag) >= 3 and isinstance(tag[2], str) and tag[2] in ("read", "write"):
+            marker = tag[2]
+        key = (url, marker)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {"url": url}
+        if marker:
+            entry["marker"] = marker
+        relays.append(entry)
+    if not relays:
+        return None
+    return {
+        "relays": relays,
+        "created_at": ev.get("created_at") if isinstance(ev.get("created_at"), int) else None,
+        "id": ev.get("id") if isinstance(ev.get("id"), str) else None,
+    }
+
+
 def compute_profile(pubkey_hex):
     """Everything server86 can say about ONE pubkey from the local
-    database: three subprocesses, each bounded by the single author or by
-    a constant. Admin-only because it scans; needs no button, because
-    opening /profile?npub=... IS the deliberate act. A failure in any one
-    subscan is reported in `warning` rather than failing the whole
-    response — the other two are still worth showing."""
+    database: bounded subprocesses per author or constant. Admin-only
+    because it scans; needs no button, because opening /profile?npub=...
+    IS the deliberate act. A failure in any one subscan is reported in
+    `warning` rather than failing the whole response — the other scans
+    are still worth showing."""
     warnings = []
 
     try:
@@ -3876,6 +3916,21 @@ def compute_profile(pubkey_hex):
             r["name"] = info.get("name")
             r["nip05"] = info.get("nip05")
 
+    # Newest kind-10002 (NIP-65 relay list) for this author only. Limit 1 —
+    # one more subprocess, still bounded; failure never kills the profile.
+    relay_list = None
+    try:
+        relay_events = run_strfry_scan(
+            {"authors": [pubkey_hex], "kinds": [10002], "limit": 1},
+            timeout=SCAN_TIMEOUT,
+        )
+        if relay_events:
+            relay_events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
+            relay_list = _parse_relay_list_event(relay_events[0])
+    except Exception as e:
+        log(f"server86: profile relay-list scan failed for {pubkey_hex}: {e}")
+        warnings.append("relay list scan failed")
+
     return {
         "total_events": total_events,
         "kinds": kinds,
@@ -3885,6 +3940,7 @@ def compute_profile(pubkey_hex):
         "previews": previews,
         "reports": reports,
         "reports_saturated": reports_saturated,
+        "relay_list": relay_list,
         "warning": "; ".join(warnings) if warnings else None,
     }
 

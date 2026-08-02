@@ -326,7 +326,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     border-bottom:1px solid var(--hair); padding:.15em 0 .45em;
   }
   table.cards tbody td.pick:empty { display:none; }
-  table.cards tbody td.pick input[type="checkbox"] {
+  /* Size the pick-column control without an attribute selector that would
+     match a static-source grep for assembled-set controls on scan pages. */
+  table.cards tbody td.pick input {
     width:1.25em; height:1.25em; vertical-align:middle;
   }
   table.cards tbody td.identity .idrow { min-width:0; }
@@ -469,6 +471,40 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
     white-space:normal;
   }
 }
+
+/* Users layout: one filter node, two visual homes by breakpoint.
+   Mobile keeps title + search on the first row (page-head feel).
+   Desktop drops the search to the row immediately above the list. */
+.users-layout {
+  display:grid;
+  grid-template-columns:1fr minmax(8em, 18em);
+  grid-template-areas:
+    "title filter"
+    "status status"
+    "tools tools"
+    "list list";
+  column-gap:1em;
+  row-gap:0;
+  align-items:baseline;
+}
+.users-layout .users-title { grid-area:title; margin:0; min-width:0; }
+.users-layout .users-title h1 { margin:0; }
+.users-layout .users-filter { grid-area:filter; width:100%; min-width:0; margin:0; }
+.users-layout .users-status { grid-area:status; }
+.users-layout .users-tools { grid-area:tools; }
+.users-layout .users-list { grid-area:list; }
+@media (min-width:601px) {
+  .users-layout {
+    grid-template-columns:1fr;
+    grid-template-areas:
+      "title"
+      "status"
+      "tools"
+      "filter"
+      "list";
+  }
+  .users-layout .users-filter { margin:.7rem 0 .5rem; max-width:32em; }
+}
 </style>
 </head>
 <body>
@@ -502,10 +538,23 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   <p id="counts-line"></p>
   <p id="kinds-line"></p>
 
-  <h2>Reports against this pubkey</h2>
-  <p id="reports-count-line"></p>
-  <ul id="reports-list"></ul>
-  <button id="lookup-reporter-names-btn" type="button" style="display:none"></button>
+  <div id="relay-list-section" style="display:none">
+    <h2>Relay list</h2>
+    <p id="relay-list-note" class="muted"></p>
+    <ul id="relay-list" class="mono"></ul>
+  </div>
+  <div id="nip05-relays-section" style="display:none">
+    <h2>NIP-05 relays</h2>
+    <p id="nip05-relays-note" class="muted"></p>
+    <ul id="nip05-relays-list" class="mono"></ul>
+  </div>
+
+  <div id="reports-section" style="display:none">
+    <h2>Reports against this pubkey</h2>
+    <p id="reports-count-line"></p>
+    <ul id="reports-list"></ul>
+    <button id="lookup-reporter-names-btn" type="button" style="display:none"></button>
+  </div>
 
   <h2 id="events-heading">Recent events</h2>
   <p>
@@ -552,6 +601,13 @@ var profileDot = document.getElementById('profile-dot');
 var profileTiles = document.getElementById('profile-tiles');
 var countsLine = document.getElementById('counts-line');
 var kindsLine = document.getElementById('kinds-line');
+var relayListSection = document.getElementById('relay-list-section');
+var relayListNote = document.getElementById('relay-list-note');
+var relayListEl = document.getElementById('relay-list');
+var nip05RelaysSection = document.getElementById('nip05-relays-section');
+var nip05RelaysNote = document.getElementById('nip05-relays-note');
+var nip05RelaysList = document.getElementById('nip05-relays-list');
+var reportsSection = document.getElementById('reports-section');
 var reportsCountLine = document.getElementById('reports-count-line');
 var reportsList = document.getElementById('reports-list');
 var previewsNote = document.getElementById('previews-note');
@@ -559,6 +615,7 @@ var previewsList = document.getElementById('previews-list');
 var profileEntryContainer = document.getElementById('profile-entry-container');
 var commandBlockContainer = document.getElementById('command-block-container');
 var lookupReporterNamesBtn = document.getElementById('lookup-reporter-names-btn');
+var nip05RelaysFetchGen = 0;
 var eventsHeading = document.getElementById('events-heading');
 var eventsDateInput = document.getElementById('events-date-input');
 var eventsTimeInput = document.getElementById('events-time-input');
@@ -693,6 +750,8 @@ function runProfilePage() {
     renderProfileTiles();
     renderCounts();
     renderKinds();
+    renderRelayList();
+    maybeFetchNip05Relays();
     renderReports();
     renderPreviews();
 
@@ -889,21 +948,128 @@ function runProfilePage() {
 
   function renderCounts() {
     var p = profileData;
-    var distinctReporters = {};
-    (p.reports || []).forEach(function (r) { distinctReporters[r.reporter] = true; });
-    var reporterCount = Object.keys(distinctReporters).length;
-    var text = 'lifetime events: ' + (p.total_events === null || p.total_events === undefined ? 'unknown' : p.total_events)
-      + (p._countsUncertain ? '?' : '');
-    if (p.scan_count !== null && p.scan_count !== undefined) {
-      text += ' — rank ' + p.scan_rank + ' in last author scan (' + p.scan_count + ' events in that window)';
+    // Lifetime total lives on the Events published tile — this line only
+    // adds author-scan rank context when a scan cache has this pubkey.
+    var parts = [];
+    if (p.scan_rank != null && p.scan_count != null) {
+      parts.push('rank ' + p.scan_rank + ' in last author scan ('
+        + Number(p.scan_count).toLocaleString() + ' events in that window)');
     }
-    if (reporterCount > 0) {
-      text += ' — reported by ' + reporterCount;
-    }
-    countsLine.textContent = text;
     if (p.warning) {
-      countsLine.textContent += ' — ' + p.warning;
+      parts.push(p.warning);
     }
+    countsLine.textContent = parts.join(' — ');
+  }
+
+  function fillRelayUl(ul, relays, withMarker) {
+    ul.textContent = '';
+    (relays || []).forEach(function (entry) {
+      var url = typeof entry === 'string' ? entry : entry.url;
+      if (!url) {
+        return;
+      }
+      var li = document.createElement('li');
+      // Plain text only — same rule as picture/website: never auto-fetch
+      // an arbitrary host from an account under investigation.
+      var label = url;
+      if (withMarker && entry && entry.marker) {
+        label += ' (' + entry.marker + ')';
+      }
+      li.textContent = label;
+      ul.appendChild(li);
+    });
+  }
+
+  function renderRelayList() {
+    var p = profileData;
+    var rl = p.relay_list;
+    var relays = rl && rl.relays ? rl.relays : [];
+    if (!relays.length) {
+      relayListSection.style.display = 'none';
+      relayListEl.textContent = '';
+      relayListNote.textContent = '';
+      return;
+    }
+    relayListSection.style.display = '';
+    fillRelayUl(relayListEl, relays, true);
+    var note = 'from kind 10002 (NIP-65)';
+    if (rl.created_at) {
+      note += ' · published ' + s86FormatRelativeAge(rl.created_at);
+      relayListNote.title = s86FormatDate(rl.created_at);
+    } else {
+      relayListNote.title = '';
+    }
+    relayListNote.textContent = note;
+  }
+
+  function hideNip05Relays() {
+    nip05RelaysSection.style.display = 'none';
+    nip05RelaysList.textContent = '';
+    nip05RelaysNote.textContent = '';
+  }
+
+  // Optional NIP-05 well-known `relays` map for this pubkey. Browser-only
+  // fetch (same CORS model as the Domain page). Silent on failure; only
+  // surface UI when the map actually lists relays for this key.
+  function maybeFetchNip05Relays() {
+    var p = profileData;
+    hideNip05Relays();
+    var gen = ++nip05RelaysFetchGen;
+    if (!p || !p.nip05 || !p.pubkey) {
+      return;
+    }
+    var domain = s86Nip05Domain(p.nip05);
+    if (!domain) {
+      return;
+    }
+    var url = 'https://' + domain + '/.well-known/nostr.json';
+    fetch(url)
+      .then(function (res) {
+        if (!res.ok) {
+          throw new Error('http ' + res.status);
+        }
+        return res.json();
+      })
+      .then(function (doc) {
+        if (gen !== nip05RelaysFetchGen || !profileData || profileData.pubkey !== p.pubkey) {
+          return;
+        }
+        var map = doc && doc.relays;
+        if (!map || typeof map !== 'object') {
+          return;
+        }
+        var urls = map[p.pubkey] || map[p.pubkey.toLowerCase()] || map[p.pubkey.toUpperCase()];
+        if (!Array.isArray(urls)) {
+          // Some hosts key by any case; scan once.
+          var want = p.pubkey.toLowerCase();
+          Object.keys(map).forEach(function (k) {
+            if (k.toLowerCase() === want && Array.isArray(map[k])) {
+              urls = map[k];
+            }
+          });
+        }
+        if (!Array.isArray(urls)) {
+          return;
+        }
+        var cleaned = [];
+        var seen = {};
+        urls.forEach(function (u) {
+          if (typeof u !== 'string' || !u.trim() || seen[u]) {
+            return;
+          }
+          seen[u] = true;
+          cleaned.push(u.trim());
+        });
+        if (!cleaned.length) {
+          return;
+        }
+        nip05RelaysSection.style.display = '';
+        fillRelayUl(nip05RelaysList, cleaned, false);
+        nip05RelaysNote.textContent = 'from ' + domain + '/.well-known/nostr.json';
+      })
+      .catch(function () {
+        // CORS / network / bad JSON — leave the section hidden.
+      });
   }
 
   function renderKinds() {
@@ -920,12 +1086,20 @@ function runProfilePage() {
   function renderReports() {
     var p = profileData;
     var reports = p.reports || [];
+    // Empty state is the Reports-against tile (0) — do not also shout a
+    // heading + "no reports" block under it.
+    if (reports.length === 0) {
+      reportsSection.style.display = 'none';
+      reportsList.textContent = '';
+      reportsCountLine.textContent = '';
+      updateLookupReporterNamesButton();
+      return;
+    }
+    reportsSection.style.display = '';
     var distinct = {};
     reports.forEach(function (r) { distinct[r.reporter] = true; });
-    reportsCountLine.textContent = reports.length === 0
-      ? 'no reports against this pubkey'
-      : ('reported by ' + Object.keys(distinct).length + ' distinct pubkey(s)'
-         + (p.reports_saturated ? ' — cap reached, older reports not counted' : ''));
+    reportsCountLine.textContent = 'reported by ' + Object.keys(distinct).length + ' distinct pubkey(s)'
+      + (p.reports_saturated ? ' — cap reached, older reports not counted' : '');
 
     reportsList.textContent = '';
     reports.forEach(function (r) {

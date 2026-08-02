@@ -1270,7 +1270,8 @@ _orig_compute_profile = server86.compute_profile
 _orig_resolve_profiles = server86.resolve_profiles
 server86.compute_profile = lambda pk: {"total_events": 7, "kinds": {}, "kinds_window": 500,
                                         "kinds_saturated": False, "profile": None, "previews": [],
-                                        "reports": [], "reports_saturated": False, "warning": None}
+                                        "reports": [], "reports_saturated": False,
+                                        "relay_list": None, "warning": None}
 server86.resolve_profiles = lambda pks: {pks[0]: {"name": "alice", "nip05": "alice@example.com"}}
 
 with server86._scan_lock:
@@ -1290,6 +1291,29 @@ check(resp["banned"] is False and resp["ban"] is None,
 check(resp["scan_rank"] == 2 and resp["scan_count"] == 42,
       "build_profile_response finds this pubkey's 1-indexed rank and count in the author-scan cache")
 check(resp["total_events"] == 7, "build_profile_response merges compute_profile()'s scan fields into the response")
+check(resp.get("relay_list") is None,
+      "build_profile_response passes through relay_list from compute_profile (null when none)")
+
+_parsed_relays = server86._parse_relay_list_event({
+    "id": "ab" * 32,
+    "created_at": 1700000000,
+    "tags": [
+        ["r", "wss://relay.example.com"],
+        ["r", "wss://read.example.com", "read"],
+        ["r", "wss://write.example.com", "write"],
+        ["r", "wss://relay.example.com"],  # dedupe
+        ["p", "not-a-relay"],
+        ["r", ""],
+    ],
+})
+check(_parsed_relays is not None and len(_parsed_relays["relays"]) == 3,
+      "parse_relay_list_event keeps three distinct r-tag URLs and drops empties/dupes")
+check(_parsed_relays["relays"][0] == {"url": "wss://relay.example.com"}
+      and _parsed_relays["relays"][1] == {"url": "wss://read.example.com", "marker": "read"}
+      and _parsed_relays["relays"][2] == {"url": "wss://write.example.com", "marker": "write"},
+      "parse_relay_list_event preserves NIP-65 read/write markers")
+check(server86._parse_relay_list_event({"tags": [["p", "x"]]}) is None,
+      "parse_relay_list_event returns None when no r tags exist")
 
 resp2 = server86.build_profile_response(banned_target)
 check(resp2["banned"] is True and resp2["ban"]["reason"] == "spam" and resp2["ban"]["report_type"] == "manual",
