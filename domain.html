@@ -28,6 +28,7 @@
   --wash:    light-dark(oklch(.18 .005 60 / .06),   oklch(.93 .004 60 / .08));
   --accent:  light-dark(oklch(.45 .18 25),          oklch(.72 .16 25));
   --good:    light-dark(oklch(.5 .12 145),          oklch(.75 .14 145));
+  --warn:    light-dark(oklch(.6 .14 80),           oklch(.8 .14 80));
   --term-bg: oklch(.14 .005 60);
   --term-fg: oklch(.9 .01 145);
   --term-edge: oklch(.3 .01 60);
@@ -38,7 +39,7 @@
 @supports not (color: light-dark(#000, #fff)) {
   :root { --paper:Canvas; --surface:Canvas; --ink:CanvasText; --muted:GrayText;
           --rule:GrayText; --hair:GrayText; --wash:transparent;
-          --accent:LinkText; --good:CanvasText; }
+          --accent:LinkText; --good:CanvasText; --warn:CanvasText; }
 }
 * { box-sizing:border-box; }
 body { max-width:68em; margin:0 auto; padding:0 1.5em 4em; font-size:.94rem;
@@ -183,7 +184,7 @@ textarea { width:100%; font-family:var(--mono); font-size:.78rem; line-height:1.
 .console-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.2em; align-items:start; }
 .console-grid h3 { display:flex; align-items:center; gap:.5em; }
 .dot-inline { width:.5em; height:.5em; border-radius:50%; background:var(--good); flex:none; }
-.dot-inline.warn { background:light-dark(oklch(.6 .14 80), oklch(.8 .14 80)); }
+.dot-inline.warn { background:var(--warn); }
 .dot-inline.off { background:var(--rule); }
 table { width:100%; border-collapse:collapse; margin:.8rem 0 1.4rem; font-size:.92em; }
 th, td { text-align:left; padding:.6em .7em; border-bottom:1px solid var(--hair);
