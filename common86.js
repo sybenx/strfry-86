@@ -1527,7 +1527,29 @@ function s86PollStatus(fetchFn, applyFn, onError) {
 var S86_GIFTWRAP_PURGE_DEFAULT_DAYS = 90;
 var S86_SUBSCRIBER_CACHE_STALE_SECONDS = 7 * 24 * 3600;
 var S86_GIFTWRAP_PURGE_CHUNK_SIZE = 200;
+// A guess, nothing more — the Docker image's mount point, true only for that
+// one deployment shape. s86ResolveStrfryConfFlag() below overwrites this with
+// server86's own resolved path (the same one /api/settings shows on the
+// Settings page) as soon as an admin session can ask for it; every command
+// generated before that answer lands is built from this placeholder, so a
+// source build or a relocated conf sends the operator a command that reads
+// the wrong database — or none — with no hint that it's wrong.
 var S86_STRFRY_CONFIG_FLAG = '--config /config/strfry.conf';
+
+// Admin-only (the path is filesystem detail GET /api/metrics deliberately
+// withholds from the public). Call once a page knows it is logged in as
+// admin; commands are rendered lazily off field input, so this only needs
+// to win the race against the operator actually typing something, not
+// against page load.
+function s86ResolveStrfryConfFlag() {
+  return s86SignAndPost('/api/strfry-conf-path', {})
+    .then(function (result) {
+      if (result.ok && result.body && result.body.exists && result.body.path) {
+        S86_STRFRY_CONFIG_FLAG = '--config ' + result.body.path;
+      }
+    })
+    .catch(function () {});
+}
 var S86_KNOWN_KINDS_LIST = [
   [0, 'profile'], [1, 'note'], [5, 'deletion'], [6, 'repost'], [7, 'reaction'],
   [1059, 'gift wrap'], [1984, 'report'], [9735, 'zap receipt'],

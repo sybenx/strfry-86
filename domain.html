@@ -1011,6 +1011,7 @@ var autoFetchedDomain = false;
 
 function onLogin() {
   isAdmin = true;
+  s86ResolveStrfryConfFlag();
   adminSection.style.display = '';
   s86ClearFlashUndo(recordsList);
   // Autofetch only fires here, not on page load — the fetch's own

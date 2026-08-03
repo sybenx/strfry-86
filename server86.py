@@ -4696,6 +4696,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/report/walk", "/api/relay-url", "/api/reports",
             "/api/console", "/api/undo", "/api/audit",
             "/api/settings", "/api/settings/save", "/api/domain-unban",
+            "/api/strfry-conf-path",
             "/api/giftwrap-retention/estimate", "/api/giftwrap-retention/purge",
             "/api/ephemeral/estimate", "/api/ephemeral/purge",
             "/api/db-compact",
@@ -4893,6 +4894,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             self._send_json(200, get_settings_payload())
+            return
+
+        if path == "/api/strfry-conf-path":
+            # The command-generator's copy-paste `--config` flag needs the
+            # SAME resolution get_settings_payload() already does, without
+            # paying for a full strfry.conf read/parse and purge-status
+            # computation on every Users/Bans/Stats page load just to learn
+            # one path. Admin-gated like everything else here — GET
+            # /api/metrics deliberately withholds filesystem paths from the
+            # public, and this is the same path by another door.
+            status = strfry_conf_status()
+            self._send_json(200, {
+                "path": status.get("path"),
+                "exists": bool(status.get("exists")),
+            })
             return
 
         if path == "/api/giftwrap-retention/estimate":
