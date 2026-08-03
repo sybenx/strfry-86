@@ -280,6 +280,14 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
   .toolbar > input[type="search"],
   .toolbar > input[type="text"] { min-width:0; }
   .console-grid { grid-template-columns:1fr; }
+  /* Same min-width:auto trap as .toolbar above: a flex/grid item will not
+     shrink below its intrinsic size, and an <input> carries the width of its
+     default ~20-character size attribute. That floor propagated out through
+     .console-row to the grid column and pushed the whole PAGE into sideways
+     scroll — the one thing rendering rule 5 forbids. (pre#decision-log still
+     scrolls sideways inside its own box; that is a terminal, not the page.) */
+  .console-row input { min-width:0; }
+  .console-grid > * { min-width:0; }
   .field-row { grid-template-columns:1fr; gap:.2em; }
   .profile-head { flex-direction:column; gap:1em; }
   .profile-head .idot.big { width:3em; height:3em; }
