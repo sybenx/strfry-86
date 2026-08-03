@@ -878,7 +878,20 @@ function s86SignAndPost(endpoint, extraBody) {
   delete data.auth;
   var url = window.location.origin + endpoint;
 
-  return s86Sha256Hex(s86CanonicalJson(data))
+  // Wrapped in Promise.resolve().then(...) so a synchronous throw here (no
+  // window.nostr, or no crypto.subtle because the page isn't in a secure
+  // context — plain http:// on anything but localhost) becomes a rejection
+  // instead of an exception that skips every caller's own .then/.catch.
+  return Promise.resolve()
+    .then(function () {
+      if (!window.crypto || !window.crypto.subtle) {
+        throw new Error('signing needs a secure context (https:// or localhost)');
+      }
+      if (!window.nostr) {
+        throw new Error('a NIP-07 extension is required');
+      }
+      return s86Sha256Hex(s86CanonicalJson(data));
+    })
     .then(function (payloadHex) {
       var event = {
         kind: 27235,
