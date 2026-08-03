@@ -252,11 +252,6 @@ def _process_rss_bytes():
         return None
 
 
-def _memory_soft_exceeded():
-    rss = _process_rss_bytes()
-    return rss is not None and rss >= MEMORY_SOFT_BYTES
-
-
 def apply_memory_hard_limit():
     """Install RLIMIT_AS = MEMORY_HARD_BYTES when the OS supports it.
 
@@ -1675,22 +1670,38 @@ def acquire_console_slot():
     Returns None on success (caller MUST release_console_slot). Returns a
     refusal result dict when another job holds the lock or RSS is over the
     soft cap — same shape as run_console_command errors so the handler can
-    return it as-is."""
+    return it as-is.
+
+    RSS is sampled OUTSIDE the lock, and only when nothing else is already
+    running — same reasoning as _start_scan_job: on a host with no /proc it
+    means a `ps` subprocess call, which must never happen while _scan_lock
+    is held, and must not be paid on the common already-blocked path
+    either. The lock is taken twice: once to cheaply rule out another job
+    holding it, and — only if none does — again after sampling RSS, with
+    the running-job check repeated in case one started meanwhile."""
+    def _running_refusal(running):
+        return {
+            "ok": False,
+            "error": (
+                f"refused: {running} is running — wait for it "
+                f"to finish before using the console"
+            ),
+            "blocked_by": running,
+            "argv": None, "stdout": "", "stderr": "",
+            "exit_code": None, "truncated": False,
+        }
+
     with _scan_lock:
         running = _active_scan["name"]
         if running is not None:
-            return {
-                "ok": False,
-                "error": (
-                    f"refused: {running} is running — wait for it "
-                    f"to finish before using the console"
-                ),
-                "blocked_by": running,
-                "argv": None, "stdout": "", "stderr": "",
-                "exit_code": None, "truncated": False,
-            }
-        if _memory_soft_exceeded():
-            rss = _process_rss_bytes() or 0
+            return _running_refusal(running)
+
+    rss = _process_rss_bytes()
+    with _scan_lock:
+        running = _active_scan["name"]
+        if running is not None:
+            return _running_refusal(running)
+        if rss is not None and rss >= MEMORY_SOFT_BYTES:
             return {
                 "ok": False,
                 "error": (
@@ -2743,8 +2754,32 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=Non
     itself: checking the lock before calling races with the call, so a
     destructive job that guesses either records a run that never happened or
     runs with no record at all. It is deliberately not a field on the
-    returned status — the two POSTs above must stay byte-identical."""
+    returned status — the two POSTs above must stay byte-identical.
+
+    RSS is sampled OUTSIDE the lock, and only on the path that is actually
+    about to launch a job: on a host with no /proc (macOS/BSD),
+    _process_rss_bytes() falls back to spawning `ps` and waiting up to a
+    second for it. Doing that while holding _scan_lock would stall every
+    other lock user (including the live-feed poll thread's baseline
+    lookup); doing it unconditionally on every call — including the
+    already-running/blocked fast paths below, which never needed an RSS
+    figure at all — adds needless subprocess latency to the common case.
+    So the lock is taken twice: once to cheaply resolve the already-
+    running/blocked outcomes, and — only when neither applies — again
+    after sampling RSS, re-checking nothing else grabbed the lock meanwhile."""
     launched = False
+
+    def _blocked_status(running):
+        # Console holds the lock as name "console" without a registry
+        # entry; every other job is registered.
+        reg = _JOB_REGISTRY.get(running)
+        status = dict(reg) if reg is not None else {
+            "status": "running", "started_at": None,
+            "progress": None, "total": None, "rate": None, "eta": None,
+        }
+        status["blocked_by"] = running
+        return status
+
     with _scan_lock:
         running = _active_scan["name"]
         if running == name:
@@ -2752,20 +2787,23 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=Non
             status["blocked_by"] = None
             return status
         if running is not None:
-            # Console holds the lock as name "console" without a registry
-            # entry; every other job is registered.
-            reg = _JOB_REGISTRY.get(running)
-            status = dict(reg) if reg is not None else {
-                "status": "running", "started_at": None,
-                "progress": None, "total": None, "rate": None, "eta": None,
-            }
-            status["blocked_by"] = running
+            return _blocked_status(running)
+
+    # Nothing was running a moment ago — sample RSS without the lock held,
+    # then re-take it and re-check before actually claiming the slot.
+    rss = _process_rss_bytes()
+    with _scan_lock:
+        running = _active_scan["name"]
+        if running == name:
+            status = dict(job)
+            status["blocked_by"] = None
             return status
+        if running is not None:
+            return _blocked_status(running)
         # Soft RSS gate: do not start another multi-minute scan when the
         # process is already near the soft ceiling. Walk/author/recipient
         # peaks need headroom; a refusal is better than an OOM mid-walk.
-        if _memory_soft_exceeded():
-            rss = _process_rss_bytes() or 0
+        if rss is not None and rss >= MEMORY_SOFT_BYTES:
             status = {
                 "status": "idle", "started_at": None,
                 "progress": None, "total": None, "rate": None, "eta": None,
