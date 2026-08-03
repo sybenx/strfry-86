@@ -1078,6 +1078,40 @@ check("# HTTP port" in _after[_diff[0]] and "# my relay" in _new_text,
 _, _unbalanced = server86.parse_strfry_conf("relay {\n  port = 1\n")
 check(not _unbalanced, "parse_strfry_conf reports UNBALANCED braces rather than guessing")
 
+# A `#` inside a quoted value is VALUE, not the start of a comment. Reading it
+# as a comment truncated the displayed value AND made an edit re-append the
+# salvaged tail after the new value, writing a corrupt line into the live conf.
+_HASH_CONF = (
+    'relay {\n'
+    '    info {\n'
+    '        description = "Relay for #bitcoin fans"\n'
+    '        icon = "https://ex.com/i.png#frag"\n'
+    '    }\n'
+    '    port = 7777  # trailing comment on a bare value\n'
+    '}\n'
+)
+_hash_fields, _ = server86.parse_strfry_conf(_HASH_CONF)
+_hash_vals = {f["path"]: f["value"] for f in _hash_fields}
+check(_hash_vals.get("relay.info.description") == "Relay for #bitcoin fans",
+      "a quoted strfry.conf value keeps a '#' instead of being truncated at it")
+check(_hash_vals.get("relay.info.icon") == "https://ex.com/i.png#frag",
+      "a URL fragment in a quoted conf value survives parsing intact")
+check(_hash_vals.get("relay.port") == "7777",
+      "a real trailing comment after a bare value is still not part of the value")
+_hash_out, _ = server86.apply_strfry_conf_edits(
+    _HASH_CONF, {"relay.info.icon": "https://new/i.png"})
+check('icon = "https://new/i.png"\n' in _hash_out,
+      "editing a value that contained '#' rewrites it cleanly, with no salvaged tail")
+check("#frag" not in _hash_out,
+      "the old value's '#' tail is not re-appended after the new value")
+_hash_reparsed = {f["path"]: f["value"]
+                  for f in server86.parse_strfry_conf(_hash_out)[0]}
+check(_hash_reparsed.get("relay.info.icon") == "https://new/i.png"
+      and _hash_reparsed.get("relay.port") == "7777",
+      "the rewritten conf reparses to exactly the intended values")
+check("# trailing comment on a bare value" in _hash_out,
+      "rewriting one field leaves an unrelated line's comment untouched")
+
 _conf_dir = tempfile.mkdtemp()
 _conf_file = os.path.join(_conf_dir, "strfry.conf")
 _orig_cfg_for_conf = server86.CONFIG_PATH

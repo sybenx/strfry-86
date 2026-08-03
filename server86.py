@@ -2180,7 +2180,18 @@ def get_domain_bans():
 # byte-identical. A config file the operator hand-tuned must survive a visit
 # to the Settings page unchanged except for what they changed.
 
-_CONF_ASSIGN = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*?)(\s*(?:#.*)?)$")
+# The value group tries a complete double-quoted string BEFORE the bare-token
+# branch, so a `#` inside quotes stays part of the value instead of being read
+# as the start of a comment. Without that alternation `description = "Relay for
+# #bitcoin fans"` parsed as the value `"Relay for`, and rewriting that field
+# re-appended the salvaged `#…` tail after the new value — emitting
+# `icon = "https://new/i.png"#frag"` into the operator's live relay config,
+# which only a brace check guards and nothing here restarts to reveal.
+_CONF_ASSIGN = re.compile(
+    r'^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)'
+    r'("(?:[^"\\]|\\.)*"|[^#]*?)'
+    r'(\s*(?:#.*)?)$'
+)
 _CONF_BLOCK_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
 
 

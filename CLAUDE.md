@@ -86,7 +86,8 @@ tab carries `aria-current="page"` and the accent underline.
 - `strfry-86` text logo, left of row one: an `<a href="/">` styled as plain text via
   `a.logo`, followed by the fixed `.tagline` (hidden under 600px, never page-specific).
 - Search box `#q`, right end of row two, grows: accepts npub / 64-hex / domain; routes to
-  `/profile?npub=` or `/domain?d=` by what was typed. Invalid input sets a plain status
+  `/profile?hex=` or `/domain?d=` by what was typed (`/profile` accepts either `hex` or
+  `npub`). Invalid input sets a plain status
   line and navigates nowhere. A domain typed here navigates; it NEVER bans.
   Focused by Ctrl-K / Cmd-K (`keydown`, `preventDefault`, in `common86.js`, once).
 - Theme button, right end of row one, inside the header (not `position:fixed`). Cycle
@@ -143,8 +144,12 @@ why; it must NEVER render "accepted" for an event nothing judged (rule 9).
     NOT strfry's own stderr: server86 is a sibling process, not the relay's parent, and
     cannot read it. Saying "tail of strfry stdout" would be a lie about the source.
   - *console* — input runs `strfry <verb> …` only when the first token is in
-    `CONSOLE_VERBS` and no write flag is present; anything else renders the refusal and
-    the reason, executes nothing. Quick-command chips may only contain `CONSOLE_VERBS`
+    `CONSOLE_VERBS`; anything else renders the refusal and the reason, executes nothing.
+    The verb allowlist IS the whole check, deliberately: `scan`, `info` and `export`
+    cannot mutate the database whatever flags follow them, so there is no per-verb flag
+    table to drift. argv is a list and `shell=True` is never used, so shell
+    metacharacters in the input are inert literals strfry itself rejects.
+    Quick-command chips may only contain `CONSOLE_VERBS`
     commands. The console NEVER runs `delete` or `compact` — purges and database compact
     go through the guarded Settings forms only (WHY.md §5). Global job lock applies to
     console commands too.
