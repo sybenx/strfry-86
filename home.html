@@ -682,7 +682,14 @@ function renderFeed(data) {
   feedContainer.textContent = '';
   truncatedLine.textContent = '';
 
-  if (data.error) {
+  // data.error comes from the scan-based delta poll (events/sec, new/deleted
+  // counts) — a SEPARATE source from the feed rows themselves once a
+  // decision log exists (judged: true), which are read straight off
+  // decisions.jsonl and keep arriving even while that scan is broken. Only
+  // the ring-buffer fallback (no decision log yet) actually stops when the
+  // scan does, so that is the only case worth calling the feed itself
+  // stalled; the scan failure is still visible on its own tile on Stats.
+  if (data.error && !data.judged) {
     setLivePill('STALLED', false);
     feedAgeEl.textContent = 'live feed could not run — ' + data.error;
   } else if (data.at != null) {
