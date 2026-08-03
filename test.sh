@@ -923,10 +923,20 @@ _kept_rows, _total, _omitted = server86._cap_list_rows(
 check(len(_kept_rows) == server86.CACHE_LIST_MAX and _total == server86.CACHE_LIST_MAX + 123
       and _omitted == 123,
       "author/recipient list cap keeps head and names the omitted tail count")
-check(server86.MEMORY_HARD_BYTES == 2 * 1024 * 1024 * 1024,
-      "hard address-space ceiling is 2GB")
-check(server86.MEMORY_SOFT_BYTES < server86.MEMORY_HARD_BYTES,
-      "soft RSS gate is strictly below the hard ceiling")
+_server86_src = open(os.path.join(REPO_ROOT, "server86.py")).read()
+# RLIMIT_AS caps ADDRESS SPACE and is inherited by every strfry child. strfry
+# mmaps its LMDB over dbParams.mapsize, which reserves far more address space
+# than the database occupies, so any such cap makes every scan, walk and
+# profile load die with `mdb_env_open: Out of memory` — and lowering the hard
+# limit can't be undone by a child, so there is no per-spawn escape hatch.
+check("setrlimit" not in _server86_src,
+      "server86 never sets an rlimit — RLIMIT_AS would kill every strfry LMDB mmap")
+check(not hasattr(server86, "MEMORY_HARD_BYTES"),
+      "no MEMORY_HARD_BYTES address-space ceiling exists to be re-applied")
+import resource as _resource
+check(_resource.getrlimit(_resource.RLIMIT_AS)[1] == _resource.RLIM_INFINITY
+      or "MEMORY_HARD_BYTES" not in _server86_src,
+      "importing server86 leaves the inherited address-space hard limit alone")
 check(server86.POST_BODY_MAX == 2 * 1024 * 1024,
       "POST body ceiling is 2MB")
 

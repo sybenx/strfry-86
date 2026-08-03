@@ -52,7 +52,6 @@ import json
 import os
 import queue
 import re
-import resource
 import shutil
 import subprocess
 import sys
@@ -176,13 +175,20 @@ CONSOLE_STDOUT_MAX = 256 * 1024  # hard cap on captured console stdout (then kil
 CONSOLE_STDERR_MAX = 64 * 1024   # hard cap on captured console stderr
 # --- memory ceilings -------------------------------------------------------
 # Soft: refuse NEW heavy jobs when current RSS is already this high (leave
-# headroom for the job itself). Hard: RLIMIT_AS at process start so a runaway
-# capture or set cannot take the host past 2GB. CACHE_LIST_MAX is the safety
-# valve on author/recipient row lists that otherwise grow with every distinct
-# pubkey a scan has ever seen — client search still runs over the retained
-# head (highest signal first); the omitted tail is named on the result.
+# headroom for the job itself). CACHE_LIST_MAX is the safety valve on
+# author/recipient row lists that otherwise grow with every distinct pubkey a
+# scan has ever seen — client search still runs over the retained head
+# (highest signal first); the omitted tail is named on the result.
+#
+# There is deliberately NO RLIMIT_AS hard cap. It limits ADDRESS SPACE, not
+# RSS, and every strfry subprocess inherits it — strfry opens its LMDB with
+# mmap over the configured dbParams.mapsize, which reserves address space far
+# larger than the database, so any modest RLIMIT_AS makes every single scan
+# die with `mdb_env_open: Out of memory`. Lowering the hard limit also can't
+# be undone by a child, so there is no per-spawn escape hatch either. Growth
+# this project actually controls is bounded where it happens: CONSOLE_STDOUT_MAX,
+# STREAM_STDERR_MAX, CACHE_LIST_MAX, POST_BODY_MAX, and the soft gate below.
 MEMORY_SOFT_BYTES = 400 * 1024 * 1024   # refuse new scan jobs above this RSS
-MEMORY_HARD_BYTES = 2 * 1024 * 1024 * 1024  # process address-space hard cap
 CACHE_LIST_MAX = 50000          # max author/recipient rows retained after a scan
 STREAM_STDERR_MAX = 64 * 1024   # stderr retained from a streaming scan
 POST_BODY_MAX = 2 * 1024 * 1024 # NIP-98 POST bodies (settings raw is the largest)
@@ -250,26 +256,6 @@ def _process_rss_bytes():
         return int(out) * 1024
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-
-
-def apply_memory_hard_limit():
-    """Install RLIMIT_AS = MEMORY_HARD_BYTES when the OS supports it.
-
-    Address-space limits are best-effort: some kernels ignore them, and a
-    failed setrlimit must never prevent startup. Called once from main()."""
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    except (AttributeError, ValueError, OSError):
-        return
-    target = MEMORY_HARD_BYTES
-    # Never raise an existing hard ceiling; only lower when possible.
-    new_hard = hard if hard != resource.RLIM_INFINITY and hard < target else target
-    new_soft = min(target, new_hard) if new_hard != resource.RLIM_INFINITY else target
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (new_soft, new_hard))
-        log(f"server86: RLIMIT_AS soft={new_soft} hard={new_hard}")
-    except (ValueError, OSError) as e:
-        log(f"server86: RLIMIT_AS not applied ({type(e).__name__}: {e})")
 
 
 def _cap_list_rows(rows, max_rows=CACHE_LIST_MAX):
@@ -5260,15 +5246,13 @@ def main():
         sys.exit(0)
 
     httpd.strfry86_config = cfg
-    apply_memory_hard_limit()
     threading.Thread(target=_live_poll_loop, daemon=True).start()
     threading.Thread(target=_giftwrap_retention_loop, daemon=True).start()
     rss = _process_rss_bytes()
     rss_note = f", rss={rss // (1024 * 1024)}MB" if rss is not None else ""
     log(f"server86: listening on {cfg['bind']}:{cfg['port']}"
         f" (gift-wrap retention {get_giftwrap_retention_days()}d"
-        f", soft={MEMORY_SOFT_BYTES // (1024 * 1024)}MB"
-        f", hard={MEMORY_HARD_BYTES // (1024 * 1024)}MB{rss_note})")
+        f", soft={MEMORY_SOFT_BYTES // (1024 * 1024)}MB{rss_note})")
     httpd.serve_forever()
 
 

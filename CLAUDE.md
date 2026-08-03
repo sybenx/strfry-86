@@ -16,7 +16,8 @@ CONSOLE_VERBS          = ("scan", "info", "export")  # --count/read-only; all el
 CONSOLE_STDOUT_MAX     = 256KiB  # console capture hard cap; child killed past this
 CACHE_LIST_MAX         = 50000   # max author/recipient rows retained after a scan
 MEMORY_SOFT_BYTES      = 400MiB  # refuse new heavy jobs when RSS is already this high
-MEMORY_HARD_BYTES      = 2GiB    # RLIMIT_AS at process start (best-effort)
+                                 # (no RLIMIT_AS hard cap: it bounds address space,
+                                 #  is inherited by strfry, and kills every LMDB mmap)
 POST_BODY_MAX          = 2MiB    # NIP-98 POST body ceiling
 DECISION_LOG_MAX_LINES = 2000    # plugin86.py: decision records per segment before rotation
 DECISION_TAIL_MAX      = 500     # decision records server86 reads back per poll
