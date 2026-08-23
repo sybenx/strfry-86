@@ -731,8 +731,12 @@ function runProfilePage() {
         renderProfile();
         maybeResolveNameExternally();
       })
-      .catch(function () {
-        setStatus('failed to load profile');
+      .catch(function (err) {
+        // Surface the real reason (no NIP-07, network, non-JSON 500, …).
+        // A bare "failed to load profile" hid the secure-context signing
+        // failure for months on plain-http LAN hosts.
+        setStatus('failed to load profile'
+          + (err && err.message ? ': ' + err.message : ''));
       });
   }
 

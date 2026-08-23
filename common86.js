@@ -860,16 +860,98 @@ function s86CanonicalJson(value) {
   return '{' + parts.join(',') + '}';
 }
 
-function s86Sha256Hex(text) {
-  var bytes = new TextEncoder().encode(text);
-  return crypto.subtle.digest('SHA-256', bytes).then(function (buf) {
-    var arr = new Uint8Array(buf);
-    var hex = '';
-    for (var i = 0; i < arr.length; i++) {
-      hex += arr[i].toString(16).padStart(2, '0');
+// Pure-JS SHA-256. crypto.subtle is ONLY available in a secure context
+// (https://, or http://localhost / 127.0.0.1). Operators routinely open
+// this UI over plain http://hostname:port on a LAN, where subtle is
+// simply absent — and every NIP-98 POST (profile, ban, scan, settings…)
+// used to die before it left the browser with a silent "failed to load
+// profile". The payload hash is integrity of a few hundred bytes of
+// JSON, not a secret; a pure implementation is correct and lets the
+// page work wherever the NIP-07 extension already does.
+//
+// UTF-8 bytes of `text` are hashed (same as Python hashlib / WebCrypto).
+// The compression loop is the standard FIPS-180-4 one; constants are
+// derived from the first 64 primes so they cannot drift from a hand-typed
+// table. Verified against empty / "abc" / a typical profile payload.
+function s86Sha256HexSync(text) {
+  function rr(v, n) { return (v >>> n) | (v << (32 - n)); }
+
+  var maxWord = Math.pow(2, 32);
+  var hash = [];
+  var k = [];
+  var isComposite = {};
+  var primeCounter = 0;
+  for (var candidate = 2; primeCounter < 64; candidate++) {
+    if (!isComposite[candidate]) {
+      for (var i = 0; i < 313; i += candidate) {
+        isComposite[i] = candidate;
+      }
+      hash[primeCounter] = (Math.pow(candidate, 0.5) * maxWord) | 0;
+      k[primeCounter++] = (Math.pow(candidate, 1 / 3) * maxWord) | 0;
     }
-    return hex;
-  });
+  }
+
+  // UTF-8 encode, then treat each byte as a latin1 char so the proven
+  // charCodeAt path hashes the same bytes WebCrypto would.
+  var bytes = new TextEncoder().encode(text);
+  var ascii = '';
+  for (i = 0; i < bytes.length; i++) {
+    ascii += String.fromCharCode(bytes[i]);
+  }
+  var asciiBitLength = ascii.length * 8;
+
+  ascii += '\x80';
+  while (ascii.length % 64 - 56) {
+    ascii += '\x00';
+  }
+  var words = [];
+  for (i = 0; i < ascii.length; i++) {
+    words[i >> 2] |= ascii.charCodeAt(i) << ((3 - i) % 4) * 8;
+  }
+  words[words.length] = (asciiBitLength / maxWord) | 0;
+  words[words.length] = asciiBitLength;
+
+  for (var j = 0; j < words.length;) {
+    var w = words.slice(j, j += 16);
+    var oldHash = hash;
+    hash = hash.slice(0, 8);
+    for (i = 0; i < 64; i++) {
+      var w15 = w[i - 15], w2 = w[i - 2];
+      var a = hash[0], e = hash[4];
+      var temp1 = hash[7]
+        + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25))
+        + ((e & hash[5]) ^ ((~e) & hash[6]))
+        + k[i]
+        + (w[i] = (i < 16) ? w[i] : (
+            w[i - 16]
+            + (rr(w15, 7) ^ rr(w15, 18) ^ (w15 >>> 3))
+            + w[i - 7]
+            + (rr(w2, 17) ^ rr(w2, 19) ^ (w2 >>> 10))
+          ) | 0);
+      var temp2 = (rr(a, 2) ^ rr(a, 13) ^ rr(a, 22))
+        + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+      hash = [(temp1 + temp2) | 0].concat(hash);
+      hash[4] = (hash[4] + temp1) | 0;
+    }
+    for (i = 0; i < 8; i++) {
+      hash[i] = (hash[i] + oldHash[i]) | 0;
+    }
+  }
+
+  var result = '';
+  for (i = 0; i < 8; i++) {
+    for (j = 3; j + 1; j--) {
+      var b = (hash[i] >> (j * 8)) & 255;
+      result += (b < 16 ? '0' : '') + b.toString(16);
+    }
+  }
+  return result;
+}
+
+// Promise form kept so call sites can stay in a single .then chain; the
+// hash itself is synchronous.
+function s86Sha256Hex(text) {
+  return Promise.resolve(s86Sha256HexSync(text));
 }
 
 function s86SignAndPost(endpoint, extraBody) {
@@ -879,15 +961,11 @@ function s86SignAndPost(endpoint, extraBody) {
   delete data.auth;
   var url = window.location.origin + endpoint;
 
-  // Wrapped in Promise.resolve().then(...) so a synchronous throw here (no
-  // window.nostr, or no crypto.subtle because the page isn't in a secure
-  // context — plain http:// on anything but localhost) becomes a rejection
-  // instead of an exception that skips every caller's own .then/.catch.
+  // Wrapped in Promise.resolve().then(...) so a synchronous throw here
+  // (no window.nostr) becomes a rejection instead of an exception that
+  // skips every caller's own .then/.catch.
   return Promise.resolve()
     .then(function () {
-      if (!window.crypto || !window.crypto.subtle) {
-        throw new Error('signing needs a secure context (https:// or localhost)');
-      }
       if (!window.nostr) {
         throw new Error('a NIP-07 extension is required');
       }
