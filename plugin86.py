@@ -40,6 +40,16 @@ DECISION_LOG_PREV_PATH = DECISION_LOG_PATH + ".1"
 DECISION_LOG_MAX_LINES = 2000    # lines per segment before rotation; two segments are retained
 DECISION_CONTENT_PREVIEW = 160   # characters of content kept per record
 
+# How stale a kind-1984 admin report's created_at may be, relative to now,
+# and still apply its auto-ban side effect. A report event is signed,
+# stored, and publicly re-servable — without this bound, replaying an old
+# one (via writePolicy.lookbackSeconds after a restart, or a republish by
+# anyone who fetched it) could resurrect a ban the admin explicitly undid,
+# overwriting any curated reason/name with the stale report's content.
+# Gates ONLY the auto-ban side effect; the report event itself is still
+# accepted (or rejected on its own separate merits) either way.
+REPORT_FRESHNESS_WINDOW = 300
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -88,6 +98,12 @@ def record_decision(event, result):
         content = event.get("content")
         if not isinstance(content, str):
             content = ""
+        content = content[:DECISION_CONTENT_PREVIEW]
+        # An attacker-choosable byte (e.g. a lone UTF-16 surrogate) must
+        # not be able to raise a UnicodeEncodeError on write and trip the
+        # permanent-disable branch below — this is the only channel that
+        # ever records a REJECT. Sanitize before it can reach the write.
+        content = content.encode("utf-8", errors="replace").decode("utf-8")
         rec = {
             "at": int(time.time()),
             "id": result.get("id"),
@@ -96,7 +112,7 @@ def record_decision(event, result):
             "created_at": event.get("created_at"),
             "action": result.get("action"),
             "msg": result.get("msg") or "",
-            "content": content[:DECISION_CONTENT_PREVIEW],
+            "content": content,
         }
         _decision_fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
         _decision_fh.flush()
@@ -164,7 +180,7 @@ def spawn_server():
 # not a write-policy reject.
 
 
-def process_event(event, admin_pubkey):
+def process_event(event, admin_pubkey, msg_type=None, now=None):
     event_id = event.get("id")
     pubkey = event.get("pubkey")
     kind = event.get("kind")
@@ -177,7 +193,18 @@ def process_event(event, admin_pubkey):
         created_at = event.get("created_at")
         content = event.get("content", "")
         tags = event.get("tags", [])
-        if isinstance(tags, list):
+        # Only a genuinely NEW report — not a lookback replay of a
+        # historical one after a restart, and not a stale event whose
+        # created_at is outside the freshness window (someone republishing
+        # an old signed report) — may apply the auto-ban side effect. See
+        # REPORT_FRESHNESS_WINDOW's comment for why.
+        is_fresh = (
+            msg_type == "new"
+            and isinstance(created_at, (int, float))
+            and now is not None
+            and abs(now - created_at) <= REPORT_FRESHNESS_WINDOW
+        )
+        if isinstance(tags, list) and is_fresh:
             fallback_type = None
             for tag in tags:
                 if (
@@ -189,6 +216,13 @@ def process_event(event, admin_pubkey):
                     fallback_type = tag[2]
                     break
 
+            # name/nip05 start null: strfry blocks its whole write
+            # pipeline on this plugin's reply, so a name lookup in this
+            # hot path would stall the relay. Resolution happens later,
+            # from the admin's browser. blacklist.add_many lowercases the
+            # target; pass lower here so the key is unambiguous if it is
+            # ever bypassed.
+            entries = []
             for tag in tags:
                 if (
                     isinstance(tag, list)
@@ -200,20 +234,21 @@ def process_event(event, admin_pubkey):
                         report_type = tag[2]
                     else:
                         report_type = fallback_type
-                    # name/nip05 start null: strfry blocks its whole write
-                    # pipeline on this plugin's reply, so a name lookup in
-                    # this hot path would stall the relay. Resolution
-                    # happens later, from the admin's browser.
-                    # blacklist.add lowercases the target; pass lower here
-                    # so the key is unambiguous if add is ever bypassed.
-                    blacklist.add(
+                    entries.append((
                         tag[1].lower(),
-                        banned_at=created_at,
-                        report_event_id=event_id,
-                        reason=content if isinstance(content, str) else "",
-                        report_type=report_type,
-                        admin_pubkey_hex=admin_pubkey,
-                    )
+                        created_at,
+                        event_id,
+                        content if isinstance(content, str) else "",
+                        report_type,
+                    ))
+            # One flock + one read + one write for the whole report,
+            # regardless of p-tag count — batched here rather than one
+            # blacklist.add() call per tag, which used to do a full
+            # read/parse/rewrite/fsync of blacklist.json (plus a separate
+            # lock-and-rewrite of names.json) PER PUBKEY, serially, inside
+            # strfry's blocking write path.
+            if entries:
+                blacklist.add_many(entries, admin_pubkey_hex=admin_pubkey)
         return {"id": event_id, "action": "accept"}
 
     return {"id": event_id, "action": "accept"}
@@ -243,8 +278,9 @@ def main():
         event_id = None
         try:
             event = msg.get("event", {}) if isinstance(msg, dict) else {}
+            msg_type = msg.get("type") if isinstance(msg, dict) else None
             event_id = event.get("id") if isinstance(event, dict) else None
-            result = process_event(event, admin_pubkey)
+            result = process_event(event, admin_pubkey, msg_type=msg_type, now=time.time())
         except Exception as e:
             log(f"plugin86: error processing event {event_id}: {e}")
             result = {"id": event_id, "action": "accept"}

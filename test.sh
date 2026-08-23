@@ -111,6 +111,7 @@ import json
 import sys
 
 event_id, pubkey, kind, tags_json, content, created_at = sys.argv[1:7]
+msg_type = sys.argv[7] if len(sys.argv) > 7 else "new"
 event = {
     "id": event_id,
     "pubkey": pubkey,
@@ -119,7 +120,7 @@ event = {
     "content": content,
     "created_at": int(created_at),
 }
-print(json.dumps({"type": "new", "event": event}))
+print(json.dumps({"type": msg_type, "event": event}))
 PYEOF
 
 # Helper: assert the plugin's output line has the given action.
@@ -164,6 +165,13 @@ OTHER_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 BANNED_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 TARGET_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 THIRD_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+TARGET2_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+TARGET3_HEX="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+
+# Admin kind-1984 reports must be within REPORT_FRESHNESS_WINDOW of "now" to
+# apply their auto-ban side effect (plugin86.py), so these use a live
+# timestamp rather than the fixed 1700000000 the non-report events below use.
+NOW_TS="$(date +%s)"
 
 cat > "$TESTDIR/config.json" <<EOF
 {"admin_pubkey_hex": "$ADMIN_HEX", "port": 8686, "bind": "0.0.0.0"}
@@ -229,10 +237,22 @@ if check_action "$OUT" reject; then pass "banned author rejected"; else fail "ba
 
 # 3. admin 1984 bans its p-tags
 echo '{}' > "$TESTDIR/blacklist.json"
-LINE="$(mkevent e3 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported for spam" 1700000000)"
+LINE="$(mkevent e3 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported for spam" "$NOW_TS")"
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "admin 1984 report accepted"; else fail "admin 1984 report should be accepted, got: $OUT"; fi
 if is_banned_in_file "$TARGET_HEX"; then pass "admin 1984 bans its p-tags"; else fail "target pubkey should have been added to blacklist"; fi
+
+# 3b. admin 1984 with MANY p-tags bans every one of them in a single batched
+# write (blacklist.add_many) rather than one full read/write/fsync per tag.
+echo '{}' > "$TESTDIR/blacklist.json"
+LINE="$(mkevent e3b "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"],[\"p\",\"$TARGET2_HEX\"],[\"p\",\"$TARGET3_HEX\"]]" "batch spam report" "$NOW_TS")"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "admin 1984 multi-target report accepted"; else fail "admin 1984 multi-target report should be accepted, got: $OUT"; fi
+if is_banned_in_file "$TARGET_HEX" && is_banned_in_file "$TARGET2_HEX" && is_banned_in_file "$TARGET3_HEX"; then
+    pass "admin 1984 with multiple p-tags bans every target"
+else
+    fail "all three p-tagged targets should have been banned"
+fi
 
 # 4. non-admin 1984 does not ban
 echo '{}' > "$TESTDIR/blacklist.json"
@@ -243,29 +263,50 @@ if is_banned_in_file "$THIRD_HEX"; then fail "non-admin 1984 must NOT ban its p-
 
 # 5. admin pubkey cannot be banned
 echo '{}' > "$TESTDIR/blacklist.json"
-LINE="$(mkevent e5 "$ADMIN_HEX" 1984 "[[\"p\",\"$ADMIN_HEX\"]]" self 1700000000)"
+LINE="$(mkevent e5 "$ADMIN_HEX" 1984 "[[\"p\",\"$ADMIN_HEX\"]]" self "$NOW_TS")"
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "admin self-report event accepted"; else fail "admin self-report should still be accepted, got: $OUT"; fi
 if is_banned_in_file "$ADMIN_HEX"; then fail "admin pubkey must never be banned"; else pass "admin pubkey cannot be banned"; fi
 
 # 6. admin 1984 with a NIP-56 report type records report_type
 echo '{}' > "$TESTDIR/blacklist.json"
-LINE="$(mkevent e6 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\",\"spam\"]]" "reported for spam" 1700000000)"
+LINE="$(mkevent e6 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\",\"spam\"]]" "reported for spam" "$NOW_TS")"
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "admin 1984 report with type accepted"; else fail "admin 1984 report with type should be accepted, got: $OUT"; fi
 if check_report_type "$TARGET_HEX" "spam"; then pass "admin 1984 records report_type from p tag"; else fail "report_type should have been recorded as 'spam'"; fi
 
 # 7. admin 1984 without a report type records report_type as null
 echo '{}' > "$TESTDIR/blacklist.json"
-LINE="$(mkevent e7 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported" 1700000000)"
+LINE="$(mkevent e7 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported" "$NOW_TS")"
 OUT="$(run_plugin "$LINE")"
 if check_report_type "$TARGET_HEX" "__NONE__"; then pass "admin 1984 without type records report_type as null"; else fail "report_type should be null when p tag has no type"; fi
 
 # 8. admin 1984 note report (bare p tag, type on e tag) falls back to e tag's type
 echo '{}' > "$TESTDIR/blacklist.json"
-LINE="$(mkevent e8 "$ADMIN_HEX" 1984 "[[\"e\",\"someeventid\",\"malware\"],[\"p\",\"$TARGET_HEX\"]]" "" 1700000000)"
+LINE="$(mkevent e8 "$ADMIN_HEX" 1984 "[[\"e\",\"someeventid\",\"malware\"],[\"p\",\"$TARGET_HEX\"]]" "" "$NOW_TS")"
 OUT="$(run_plugin "$LINE")"
 if check_report_type "$TARGET_HEX" "malware"; then pass "admin 1984 note report falls back to e tag's report_type"; else fail "report_type should fall back to the e tag's type ('malware') for a bare p tag"; fi
+
+# 9. a LOOKBACK replay (strfry re-delivering a historical event through the
+# write policy, e.g. after a restart with writePolicy.lookbackSeconds) must
+# NOT apply the auto-ban side effect — only a genuinely new "type":"new"
+# report may. Guards against resurrecting a ban the admin already undid.
+echo '{}' > "$TESTDIR/blacklist.json"
+LINE="$(mkevent e9 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "reported for spam" "$NOW_TS" lookback)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "admin 1984 lookback replay still accepted as an event"; else fail "lookback replay should still be accepted, got: $OUT"; fi
+if is_banned_in_file "$TARGET_HEX"; then fail "a lookback replay of an admin report must NOT apply the auto-ban side effect"; else pass "lookback replay does not re-apply the auto-ban side effect"; fi
+
+# 10. a STALE report (type "new", but created_at far outside
+# REPORT_FRESHNESS_WINDOW) must NOT apply the auto-ban side effect — guards
+# against someone republishing an old signed report to resurrect a ban the
+# admin already undid.
+echo '{}' > "$TESTDIR/blacklist.json"
+STALE_TS=$((NOW_TS - 3600))
+LINE="$(mkevent e10 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "old report" "$STALE_TS")"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" accept; then pass "stale admin 1984 report still accepted as an event"; else fail "stale report should still be accepted, got: $OUT"; fi
+if is_banned_in_file "$TARGET_HEX"; then fail "a stale (outside REPORT_FRESHNESS_WINDOW) admin report must NOT resurrect a ban"; else pass "stale report replay does not apply the auto-ban side effect"; fi
 
 # --- crypto tests (non-negotiable — this is the whole authorization system) -
 #
@@ -1450,11 +1491,99 @@ check(server86.as_hex64(_upper_pk) == _lower_pk,
       "as_hex64 lowercases valid mixed-case hex")
 check(server86.as_hex64("not-a-key") is None,
       "as_hex64 returns None for non-hex")
+
+# A writer must never commit a cache it could not confirm against disk. A
+# corrupt blacklist.json PLUS a cache that has never been populated (e.g. a
+# freshly started plugin86 process) must abort the write entirely — the
+# corrupt file is left byte-for-byte untouched rather than silently
+# replaced with a truncated one-entry file.
+_corrupt_bytes = b"{not valid json, imagine this used to hold 5000 bans"
+with open(server86.blacklist.BLACKLIST_PATH, "wb") as f:
+    f.write(_corrupt_bytes)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._cache_size = None
+server86.blacklist._last_checked = None
+
+_raised_add = False
+try:
+    server86.blacklist.add(
+        "5" * 64, banned_at=1, report_event_id=None, reason="x",
+        report_type="manual", admin_pubkey_hex="00" * 32,
+    )
+except server86.blacklist.BlacklistCorruptError:
+    _raised_add = True
+check(_raised_add, "add() raises BlacklistCorruptError instead of writing when the pre-write reload finds blacklist.json corrupt")
+with open(server86.blacklist.BLACKLIST_PATH, "rb") as f:
+    check(f.read() == _corrupt_bytes,
+          "corrupt blacklist.json plus an empty in-memory cache is left untouched by a failed add() — this is the data-loss bug's exact repro")
+
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._cache_size = None
+server86.blacklist._last_checked = None
+_raised_remove = False
+try:
+    server86.blacklist.remove(["5" * 64])
+except server86.blacklist.BlacklistCorruptError:
+    _raised_remove = True
+check(_raised_remove, "remove() also raises BlacklistCorruptError on a corrupt pre-write reload")
+with open(server86.blacklist.BLACKLIST_PATH, "rb") as f:
+    check(f.read() == _corrupt_bytes, "corrupt blacklist.json is untouched by a failed remove() too")
+
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._cache_size = None
+server86.blacklist._last_checked = None
+_raised_reasons = False
+try:
+    server86.blacklist.set_reasons(["5" * 64], "x", "replace", now=1)
+except server86.blacklist.BlacklistCorruptError:
+    _raised_reasons = True
+check(_raised_reasons, "set_reasons() also raises BlacklistCorruptError on a corrupt pre-write reload")
+with open(server86.blacklist.BLACKLIST_PATH, "rb") as f:
+    check(f.read() == _corrupt_bytes, "corrupt blacklist.json is untouched by a failed set_reasons() too")
+
+# mtime-equality must not mask a real change forever. Two writes close
+# enough together can land on the SAME mtime (module docstring); pairing
+# mtime with size is what lets a same-mtime SECOND write still be picked up
+# by the enforcement read path (is_banned -> load -> unforced _refresh)
+# instead of being skipped indefinitely.
+_pk_x = "6" * 64
+_pk_y = "7" * 64
+_mtime_entry = lambda reason: {
+    "banned_at": 1, "report_event_id": None, "reason": reason,
+    "report_type": None, "name": None, "nip05": None, "name_checked_at": None,
+}
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({_pk_x: _mtime_entry("x")}, f)
+server86.blacklist._cache = {}
+server86.blacklist._cache_mtime = None
+server86.blacklist._cache_size = None
+server86.blacklist._last_checked = None
+server86.blacklist._refresh(force=True)
+check(server86.blacklist.is_banned(_pk_x) is True, "mtime-collision setup: X loaded via the initial read")
+
+with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
+    json.dump({_pk_x: _mtime_entry("x"), _pk_y: _mtime_entry("y")}, f)
+_collide_mtime = server86.blacklist._cache_mtime
+os.utime(server86.blacklist.BLACKLIST_PATH, (_collide_mtime, _collide_mtime))
+check(os.stat(server86.blacklist.BLACKLIST_PATH).st_mtime == _collide_mtime,
+      "mtime-collision setup: forced the second write's mtime to exactly match the cached one")
+
+# Simulate the once-per-second throttle window having elapsed (as it would
+# for a real hot-path recheck) — this is exactly is_banned()'s own path,
+# never forced.
+server86.blacklist._last_checked = None
+check(server86.blacklist.is_banned(_pk_y) is True,
+      "is_banned() still detects Y even though its write landed on the SAME mtime as the cached read, because the cached SIZE no longer matches")
+
 # Clean slate for subsequent tests that assume an empty/seeded banlist.
 with open(server86.blacklist.BLACKLIST_PATH, "w") as f:
     json.dump({}, f)
 server86.blacklist._cache = {}
 server86.blacklist._cache_mtime = None
+server86.blacklist._cache_size = None
 server86.blacklist._last_checked = None
 
 

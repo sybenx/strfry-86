@@ -257,3 +257,36 @@ def drop(pubkey_hex):
             _cache_mtime = os.stat(NAMES_PATH).st_mtime
         except OSError:
             _cache_mtime = None
+
+
+def drop_many(pubkeys):
+    """Batch version of drop() — remove many pubkeys' cached entries in a
+    single flock+read+write, instead of one lock-and-rewrite per pubkey.
+    Used by blacklist.add_many() when one report bans many pubkeys at
+    once."""
+    global _cache, _cache_mtime
+    keys = []
+    for pk in pubkeys:
+        key = _as_hex64(pk)
+        if key is not None:
+            keys.append(key)
+    if not keys:
+        return
+    with _FileLock():
+        _refresh(force=True)
+        if not any(key in _cache for key in keys):
+            return
+        data = dict(_cache)
+        changed = False
+        for key in keys:
+            if key in data:
+                del data[key]
+                changed = True
+        if not changed:
+            return
+        _write_atomic(data)
+        _cache = data
+        try:
+            _cache_mtime = os.stat(NAMES_PATH).st_mtime
+        except OSError:
+            _cache_mtime = None
