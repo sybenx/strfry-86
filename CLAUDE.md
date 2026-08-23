@@ -21,6 +21,8 @@ MEMORY_SOFT_BYTES      = 400MiB  # refuse new heavy jobs when RSS is already thi
 POST_BODY_MAX          = 2MiB    # NIP-98 POST body ceiling
 DECISION_LOG_MAX_LINES = 2000    # plugin86.py: decision records per segment before rotation
 DECISION_TAIL_MAX      = 500     # decision records server86 reads back per poll
+LIVE_FEED_SEED         = 50      # newest durable events loaded at startup so / is never blank
+LIVE_EPHEMERAL_MAX     = 100     # kinds 20000–29999 ring cap (separate from durable)
 ```
 
 ## Rendering results — project-wide; every page and future page inherits this
@@ -114,7 +116,12 @@ Content · Result. Author and content are public — the earlier no-leak rule is
 **withdrawn**, deliberately; a relay's accepted events are already readable by any client
 that connects to it, and a landing page that hid them was hiding nothing. Filter by
 pubkey and by kind are client-side over the whole buffer. Fed by the live layer, newest
-first, capped at `RENDER_MAX`, no history fetch.
+first. The live layer keeps **two rings with separate caps**: durable kinds
+(`LIVE_RECENT_MAX`) and NIP-16 ephemeral kinds 20000–29999 (`LIVE_EPHEMERAL_MAX`), so
+auth/presence spam cannot shove notes out of the buffer the default "kinds with content"
+filter reads. Startup seeds the durable ring with the newest `LIVE_FEED_SEED` durable
+events (overfetching under ephemeral head); the poll then appends only deltas into the
+matching ring.
 
 `Result` comes from the decision log, never from a scan — see "Write policy decisions"
 below. With no decision log the column renders `—` for every row and the age line says
@@ -257,10 +264,12 @@ older than itself. `test.sh` fails only on the single-kind alarm.
 - `POST /api/settings` (read) and `POST /api/settings/save` (write) — POST for both,
   because every admin-only read in this project carries its NIP-98 auth in the body.
   `save` takes `target:"relay"|"app"` and either `edits` (per-path) or `raw`.
-- Live layer: one server-side strfry poll fanned out over SSE to `/` and `/stats`;
-  deltas only, no history replay, reconnect resets deltas and re-reads baseline. Its
-  `events` are decision-log rows when one exists (carrying `pubkey`, `npub`, `content`,
-  `result`, `msg`) and scan-ring rows otherwise (with `result` null, never "accepted").
+- Live layer: one server-side strfry poll fanned out over SSE to `/` and `/stats`.
+  Two rings (durable vs kinds 20000–29999) with separate caps; startup seeds durable
+  with `LIVE_FEED_SEED` durable events (public author + content; `result` null). Poll
+  appends deltas into the matching ring. Reconnect re-reads both rings + baseline.
+  `events` merge both pools (and dual-cap the decision log the same way when one
+  exists); scan-fed rows always have `result` null, never "accepted".
 
 ## test.sh — every assertion covers a silent failure
 

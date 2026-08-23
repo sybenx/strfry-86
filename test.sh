@@ -820,31 +820,127 @@ server86.run_strfry_count = _orig_run_strfry_count
 server86.resolve_profiles = _orig_resolve_profiles
 
 
-# --- Live layer: one shared poll tick, kind/ts/id only, deltas reset -----
+# --- Live layer: dual durable/ephemeral pools, seed, public fields ----------
 _orig_scan = server86.run_strfry_scan
 server86._live_since = 100
 server86._live_seen_at_since = set()
-server86._live_recent = []
+server86._live_recent_durable[:] = []
+server86._live_recent_ephemeral[:] = []
 server86._live_new_events = 0
 server86._live_deletes = 0
 server86._live_delta_baseline_at = None
+_pk_b = "b" * 64
 server86.run_strfry_scan = lambda filter_obj, timeout=10: [
-    {"id": "a" * 64, "kind": 1, "created_at": 100, "pubkey": "b" * 64, "content": "secret", "tags": [["p", "z"]]},
-    {"id": "c" * 64, "kind": 5, "created_at": 101, "content": "x"},
+    {"id": "a" * 64, "kind": 1, "created_at": 100, "pubkey": _pk_b, "content": "hello note", "tags": [["p", "z"]]},
+    {"id": "c" * 64, "kind": 5, "created_at": 101, "pubkey": _pk_b, "content": "x"},
 ]
 server86._live_poll_tick()
-check(server86._live_error is None and len(server86._live_recent) == 2,
-      "_live_poll_tick folds new events into the shared ring buffer on a successful poll")
-check(all(set(e.keys()) == {"id", "kind", "created_at"} for e in server86._live_recent),
-      "_live_poll_tick strips every field except id/kind/created_at (no pubkey/content/tags)")
-check("secret" not in json.dumps(server86._live_recent) and ("b" * 64) not in json.dumps(server86._live_recent),
-      "the live ring buffer never leaks content or pubkey")
+check(server86._live_error is None and len(server86._live_recent_durable) == 2,
+      "_live_poll_tick folds durable events into the durable ring")
+_ring_keys = set(server86._live_recent_durable[0].keys())
+check(_ring_keys == {"id", "kind", "created_at", "pubkey", "npub", "content", "result", "msg"},
+      "_live_poll_tick keeps the public feed fields (author + content; CLAUDE.md `/`)")
+check(server86._live_recent_durable[0]["pubkey"] == _pk_b
+      and server86._live_recent_durable[0]["content"] == "hello note",
+      "the durable ring carries author and content for the landing-page feed")
+check(all(e.get("result") is None for e in server86._live_recent_durable),
+      "scan-fed ring rows never claim result=accepted — only the decision log judges")
+check("tags" not in json.dumps(server86._live_recent_durable),
+      "the live ring buffer still drops tags (not shown on the feed)")
 check(server86._live_new_events == 2 and server86._live_deletes == 1,
       "_live_poll_tick counts new_events and, separately, kind-5 deletes")
 server86.run_strfry_scan = lambda filter_obj, timeout=10: (_ for _ in ()).throw(RuntimeError("no strfry"))
 server86._live_poll_tick()
-check(server86._live_error is not None and len(server86._live_recent) == 2,
-      "_live_poll_tick on failure leaves the prior ring buffer untouched and just sets _live_error (failed poll ≠ empty result)")
+check(server86._live_error is not None and len(server86._live_recent_durable) == 2,
+      "_live_poll_tick on failure leaves the prior rings untouched and just sets _live_error")
+
+# Dual pools: ephemeral flood must not shove durable content out of its ring.
+server86._live_error = None
+server86._live_since = 200
+server86._live_seen_at_since = set()
+server86._live_recent_durable[:] = [
+    {"id": "d" * 64, "kind": 1, "created_at": 50, "pubkey": _pk_b,
+     "npub": None, "content": "keep me", "result": None, "msg": ""},
+]
+server86._live_recent_ephemeral[:] = []
+_eph_flood = [
+    {"id": f"{i:064x}", "kind": 22242, "created_at": 200 + i,
+     "pubkey": _pk_b, "content": ""}
+    for i in range(server86.LIVE_EPHEMERAL_MAX + 50)
+]
+server86.run_strfry_scan = lambda filter_obj, timeout=10: list(_eph_flood)
+server86._live_poll_tick()
+check(len(server86._live_recent_durable) == 1
+      and server86._live_recent_durable[0]["content"] == "keep me",
+      "ephemeral flood never shortens the durable ring — content notes stay")
+check(len(server86._live_recent_ephemeral) == server86.LIVE_EPHEMERAL_MAX,
+      f"ephemeral ring caps at LIVE_EPHEMERAL_MAX ({server86.LIVE_EPHEMERAL_MAX})")
+check(all(e["kind"] == 22242 for e in server86._live_recent_ephemeral),
+      "ephemeral ring only holds kinds 20000–29999")
+
+# Durable flood must not grow the ephemeral pool.
+server86._live_since = 400
+server86._live_seen_at_since = set()
+server86._live_recent_ephemeral[:] = [
+    {"id": "e" * 64, "kind": 22242, "created_at": 10, "pubkey": _pk_b,
+     "npub": None, "content": "", "result": None, "msg": ""},
+]
+_dur_flood = [
+    {"id": f"{i+1000:064x}", "kind": 1, "created_at": 400 + i,
+     "pubkey": _pk_b, "content": f"n{i}"}
+    for i in range(30)
+]
+server86.run_strfry_scan = lambda filter_obj, timeout=10: list(_dur_flood)
+server86._live_poll_tick()
+check(len(server86._live_recent_ephemeral) == 1,
+      "durable traffic does not grow or trim the ephemeral ring")
+check(len(server86._live_recent_durable) == 1 + 30,
+      "durable flood lands only in the durable ring")
+
+# Startup seed: durable-first under ephemeral head; delta counters untouched.
+server86._live_recent_durable[:] = []
+server86._live_recent_ephemeral[:] = []
+server86._live_since = 1
+server86._live_seen_at_since = set()
+server86._live_error = None
+server86._live_new_events = 99
+server86._live_deletes = 7
+# Newest raw head is all ephemeral; durable notes sit behind them.
+_seed_mixed = (
+    [{"id": f"{i:064x}", "kind": 1, "created_at": 1000 + i,
+      "pubkey": _pk_b, "content": f"note {i}"}
+     for i in range(server86.LIVE_FEED_SEED)]
+    + [{"id": f"{i+5000:064x}", "kind": 22242, "created_at": 2000 + i,
+        "pubkey": _pk_b, "content": ""}
+       for i in range(server86.LIVE_EPHEMERAL_MAX + 20)]
+)
+server86.run_strfry_scan = lambda filter_obj, timeout=10: list(_seed_mixed)
+server86._live_seed_recent()
+check(len(server86._live_recent_durable) == server86.LIVE_FEED_SEED,
+      f"_live_seed_recent fills the durable ring with LIVE_FEED_SEED ({server86.LIVE_FEED_SEED}) notes")
+check(all(r["kind"] == 1 for r in server86._live_recent_durable),
+      "_live_seed_recent durable pool excludes ephemeral kinds")
+check(len(server86._live_recent_ephemeral) == server86.LIVE_EPHEMERAL_MAX,
+      "_live_seed_recent fills the ephemeral ring up to LIVE_EPHEMERAL_MAX")
+check(server86._live_new_events == 99 and server86._live_deletes == 7,
+      "_live_seed_recent does not count history into the session delta counters")
+check(server86._live_since == _seed_mixed[-1]["created_at"],
+      "_live_seed_recent advances the poll cursor past the seed so it is not re-counted")
+check(server86._live_recent_durable[0].get("content") == "note 0"
+      and server86._live_recent_durable[-1].get("content") == f"note {server86.LIVE_FEED_SEED - 1}",
+      "_live_seed_recent keeps durable content previews on seeded rows")
+_seed_filters = []
+def _capture_seed(filter_obj, timeout=10):
+    _seed_filters.append(filter_obj)
+    return list(_seed_mixed)
+server86._live_recent_durable[:] = []
+server86._live_recent_ephemeral[:] = []
+server86.run_strfry_scan = _capture_seed
+server86._live_seed_recent()
+check(_seed_filters == [{"limit": server86._live_seed_scan_limit()}],
+      "_live_seed_recent overfetches with the seed scan limit (not a bare LIVE_FEED_SEED)")
+check(server86._live_seed_scan_limit() <= server86.LIVE_FEED_SEED_SCAN_MAX,
+      "seed scan limit is hard-capped at LIVE_FEED_SEED_SCAN_MAX")
 server86.run_strfry_scan = _orig_scan
 
 _orig_baseline_at = server86._live_current_baseline_at
@@ -852,15 +948,18 @@ server86._live_current_baseline_at = lambda: 12345
 server86._live_new_events = 7
 server86._live_deletes = 3
 server86._live_since = 1
+server86.run_strfry_scan = lambda filter_obj, timeout=10: []
 server86._live_poll_tick()
 check(server86._live_delta_baseline_at == 12345 and server86._live_since == 12345,
       "a moved report baseline re-anchors the live poll cursor forward")
 server86._live_current_baseline_at = _orig_baseline_at
 server86._live_since = int(__import__("time").time())
-server86._live_recent = []
+server86._live_recent_durable[:] = []
+server86._live_recent_ephemeral[:] = []
 server86._live_new_events = 0
 server86._live_deletes = 0
 server86._live_delta_baseline_at = None
+server86.run_strfry_scan = _orig_scan
 
 # --- Console allowlist: CONSOLE_VERBS only, no per-verb flag table --------
 _argv, _err = server86.validate_console_command("delete --filter '{}'")
@@ -1026,14 +1125,19 @@ try:
     os.remove(server86.DECISION_LOG_PATH)
     os.remove(server86.DECISION_LOG_PREV_PATH)
     with server86._live_lock:
-        server86._live_recent.append({"id": "c" * 64, "kind": 1, "created_at": 3})
+        server86._live_recent_durable[:] = [
+            {"id": "c" * 64, "kind": 1, "created_at": 3, "pubkey": None,
+             "npub": None, "content": "", "result": None, "msg": ""},
+        ]
+        server86._live_recent_ephemeral[:] = []
     _rows, _accepted, _blocked, _judged = server86._live_feed_state()
     check(_judged is False and _accepted is None and _blocked is None,
           "with no decision log the feed reports nothing judged, rather than a made-up rate")
     check(all(r["result"] is None for r in _rows),
           "scan-fed rows render Result unknown — never 'accepted' for an event nothing judged")
     with server86._live_lock:
-        server86._live_recent.clear()
+        server86._live_recent_durable[:] = []
+        server86._live_recent_ephemeral[:] = []
 finally:
     server86.DECISION_LOG_PATH, server86.DECISION_LOG_PREV_PATH = _orig_dec, _orig_dec_prev
     shutil.rmtree(_dec_dir, ignore_errors=True)

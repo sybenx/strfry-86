@@ -195,7 +195,17 @@ POST_BODY_MAX = 2 * 1024 * 1024 # NIP-98 POST bodies (settings raw is the larges
 # --- live layer: one shared strfry poll fanned out over SSE ----------------
 LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
 LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
-LIVE_RECENT_MAX = RENDER_MAX    # events kept in the shared ring buffer for new SSE clients
+# Two rings, two caps: NIP-16 ephemeral kinds (20000–29999) must not share a
+# slot budget with durable notes. The default / filter is "kinds with content";
+# ephemeral auth/presence usually has none, so a single shared ring looked
+# like content "disappearing" while it was only being shoved out by spam.
+LIVE_RECENT_MAX = RENDER_MAX    # durable kinds (everything outside 20000–29999)
+LIVE_EPHEMERAL_MAX = 100        # kinds 20000–29999 only; inspectable, not starvation
+LIVE_FEED_SEED = 50             # newest durable events loaded at startup so / is never blank
+# Overfetch ceiling when seeding: newest-N of ALL kinds can be almost all
+# ephemeral under auth spam; scan farther, then partition into the two pools.
+LIVE_FEED_SEED_SCAN_MAX = 2000  # hard cap on the seed scan's limit=
+LIVE_CONTENT_MAX = 280          # content bytes retained per ring row (preview, not full body)
 # --- decision log: the only channel that can see a REJECT ------------------
 DECISION_TAIL_MAX = RENDER_MAX  # newest decision records read back per poll
 DECISION_READ_BYTES = 1 << 20   # bytes read from the tail of each log segment
@@ -610,7 +620,8 @@ _live_seen_at_since = set()         # ids already counted AT exactly _live_since
 _live_delta_baseline_at = None      # scanned_at this delta count is relative to
 _live_new_events = 0
 _live_deletes = 0
-_live_recent = []                   # ring buffer for the live feed, capped at LIVE_RECENT_MAX
+_live_recent_durable = []           # non-ephemeral kinds; cap LIVE_RECENT_MAX
+_live_recent_ephemeral = []         # kinds 20000–29999; cap LIVE_EPHEMERAL_MAX
 _live_error = None
 _live_subscribers = []              # list of queue.Queue, one per open SSE connection
 
@@ -791,41 +802,164 @@ def _feed_row_from_decision(rec):
         except (ValueError, TypeError):
             npub = None
     content = rec.get("content")
+    if isinstance(content, str):
+        content = content[:LIVE_CONTENT_MAX]
+    else:
+        content = ""
     return {
         "id": rec.get("id"),
         "kind": rec.get("kind"),
         "created_at": rec.get("created_at") or rec.get("at"),
         "pubkey": pubkey if is_hex64(pubkey) else None,
         "npub": npub,
-        "content": content if isinstance(content, str) else "",
+        "content": content,
         "result": "blocked" if rec.get("action") == "reject" else "accepted",
         "msg": rec.get("msg") or "",
     }
+
+
+def _feed_row_from_scan_event(ev):
+    """One strfry-scan event as a public feed row. Author and content are
+    intentional (CLAUDE.md `/` — a relay's accepted events are already
+    public); `result` is always null because a scan cannot see a REJECT
+    and must never claim "accepted" for an event nothing judged (rule 9)."""
+    if not isinstance(ev, dict):
+        return None
+    eid, kind, created_at = ev.get("id"), ev.get("kind"), ev.get("created_at")
+    if not isinstance(eid, str) or not isinstance(kind, int) or not isinstance(created_at, int):
+        return None
+    pubkey = ev.get("pubkey")
+    if not is_hex64(pubkey):
+        pubkey = None
+    npub = None
+    if pubkey:
+        try:
+            npub = bech32.npub_encode(pubkey)
+        except (ValueError, TypeError):
+            npub = None
+    content = ev.get("content")
+    if isinstance(content, str):
+        content = content[:LIVE_CONTENT_MAX]
+    else:
+        content = ""
+    return {
+        "id": eid,
+        "kind": kind,
+        "created_at": created_at,
+        "pubkey": pubkey,
+        "npub": npub,
+        "content": content,
+        "result": None,
+        "msg": "",
+    }
+
+
+def _live_rings_snapshot():
+    """Copy both rings under the lock. Callers merge / pad outside the lock."""
+    with _live_lock:
+        return list(_live_recent_durable), list(_live_recent_ephemeral)
+
+
+def _merge_live_rings(durable, ephemeral):
+    """Oldest-first merge of the two pools for the SSE `events` list."""
+    rows = [_ring_row_as_feed(ev) for ev in durable]
+    rows.extend(_ring_row_as_feed(ev) for ev in ephemeral)
+    rows.sort(key=lambda r: r.get("created_at") or 0)
+    return rows
+
+
+def _dual_cap_feed_rows(rows):
+    """Keep durable and ephemeral tails under separate caps, then re-merge.
+
+    Applied to decision-log rows so auth spam in kinds 20000–29999 cannot
+    shove durable judged events out of the visible feed either."""
+    durable, ephemeral = [], []
+    for r in rows:
+        if is_ephemeral_kind(r.get("kind")):
+            ephemeral.append(r)
+        else:
+            durable.append(r)
+    durable = durable[-LIVE_RECENT_MAX:]
+    ephemeral = ephemeral[-LIVE_EPHEMERAL_MAX:]
+    merged = durable + ephemeral
+    merged.sort(key=lambda r: r.get("created_at") or 0)
+    return merged
+
+
+def _live_append_row_unlocked(row):
+    """Route one row into the durable or ephemeral ring and trim that ring.
+    Caller holds `_live_lock`."""
+    if is_ephemeral_kind(row.get("kind")):
+        _live_recent_ephemeral.append(row)
+        del _live_recent_ephemeral[:-LIVE_EPHEMERAL_MAX]
+    else:
+        _live_recent_durable.append(row)
+        del _live_recent_durable[:-LIVE_RECENT_MAX]
 
 
 def _live_feed_state():
     """Feed rows plus the accept/blocked tally they were counted from.
 
     Prefers the decision log, because it is the only source that contains
-    blocked events at all. Falls back to the scan-fed ring buffer — which
-    by construction holds accepted events only — when no decision log
-    exists yet, so a relay whose plugin86 has not restarted still shows a
-    feed rather than an empty page. In that fallback every `result` is
-    null, never "accepted": the ring cannot distinguish an event that was
-    accepted from one that was never judged, and rule 9 says an unknown
-    renders as unknown."""
+    blocked events at all. Falls back to the scan-fed rings — durable and
+    ephemeral pools with separate caps, seeded at startup — when no
+    decision log exists yet. In that fallback every `result` is null, never
+    "accepted": a scan cannot distinguish an accept from an unjudged event,
+    and rule 9 says an unknown renders as unknown.
+
+    Both paths dual-cap so NIP-16 ephemeral traffic cannot starve durable
+    content out of the buffer the default "kinds with content" filter reads."""
     decisions = read_decisions()
+    durable_ring, ephemeral_ring = _live_rings_snapshot()
+    ring_merged = _merge_live_rings(durable_ring, ephemeral_ring)
+
     if decisions:
-        rows = [_feed_row_from_decision(r) for r in decisions]
+        rows = _dual_cap_feed_rows(
+            [_feed_row_from_decision(r) for r in decisions]
+        )
+        # Pad a short decision log from the durable seed first (what the
+        # content filter will actually show), then ephemeral.
+        durable_count = sum(1 for r in rows if not is_ephemeral_kind(r.get("kind")))
+        if durable_count < LIVE_FEED_SEED:
+            seen = {r.get("id") for r in rows if r.get("id")}
+            for ev in durable_ring:
+                eid = ev.get("id")
+                if not eid or eid in seen:
+                    continue
+                rows.append(_ring_row_as_feed(ev))
+                seen.add(eid)
+                durable_count += 1
+                if durable_count >= LIVE_FEED_SEED:
+                    break
+            rows.sort(key=lambda r: r.get("created_at") or 0)
         accepted = sum(1 for r in rows if r["result"] == "accepted")
-        return rows, accepted, len(rows) - accepted, True
-    with _live_lock:
-        ring = list(_live_recent)
-    rows = [{
-        "id": ev.get("id"), "kind": ev.get("kind"), "created_at": ev.get("created_at"),
-        "pubkey": None, "npub": None, "content": "", "result": None, "msg": "",
-    } for ev in ring]
-    return rows, None, None, False
+        blocked = sum(1 for r in rows if r["result"] == "blocked")
+        return rows, accepted, blocked, True
+
+    return ring_merged, None, None, False
+
+
+def _ring_row_as_feed(ev):
+    """Normalise a ring-buffer entry to the feed row shape. Seed/poll rows
+    already carry the full public fields; a minimal legacy row (id/kind/
+    created_at only) is tolerated so mid-test reloads cannot throw."""
+    if not isinstance(ev, dict):
+        return {
+            "id": None, "kind": None, "created_at": None,
+            "pubkey": None, "npub": None, "content": "", "result": None, "msg": "",
+        }
+    content = ev.get("content")
+    return {
+        "id": ev.get("id"),
+        "kind": ev.get("kind"),
+        "created_at": ev.get("created_at"),
+        "pubkey": ev.get("pubkey") if is_hex64(ev.get("pubkey")) else None,
+        "npub": ev.get("npub") if isinstance(ev.get("npub"), str) else None,
+        "content": content if isinstance(content, str) else "",
+        # Never invent "accepted" — only the decision log sets result.
+        "result": ev.get("result") if ev.get("result") in ("accepted", "blocked") else None,
+        "msg": ev.get("msg") or "",
+    }
 
 
 def _live_state_snapshot():
@@ -839,11 +973,71 @@ def _live_state_snapshot():
         }
 
 
+def _live_seed_scan_limit():
+    """How far the startup seed scan reaches when hunting durable events
+    under an ephemeral-heavy head. Bounded so a pathological DB cannot
+    stream unbounded bodies into server86 at boot."""
+    return min(LIVE_FEED_SEED_SCAN_MAX, max(LIVE_FEED_SEED * 40, LIVE_FEED_SEED))
+
+
+def _live_seed_recent():
+    """Load recent events into the durable and ephemeral rings at startup.
+
+    Durable gets the newest LIVE_FEED_SEED non-ephemeral events so the
+    default content filter has something to show immediately. Ephemeral
+    gets its own tail (LIVE_EPHEMERAL_MAX) from the same scan. Overfetches
+    under LIVE_FEED_SEED_SCAN_MAX because a plain limit=50 under auth spam
+    is often fifty ephemeral rows and zero notes.
+
+    History, not a delta: advances the poll cursor so seed rows are not
+    re-counted into new_events / deletes."""
+    global _live_since, _live_seen_at_since, _live_error
+    scan_limit = _live_seed_scan_limit()
+    try:
+        events = run_strfry_scan({"limit": scan_limit}, timeout=SCAN_TIMEOUT)
+    except Exception as e:
+        log(f"server86: live feed seed failed: {type(e).__name__}: {e}")
+        with _live_lock:
+            if _live_error is None:
+                _live_error = f"seed: {type(e).__name__}: {e}"[:300]
+        return
+
+    durable, ephemeral = [], []
+    for ev in events:
+        row = _feed_row_from_scan_event(ev)
+        if row is None:
+            continue
+        if is_ephemeral_kind(row["kind"]):
+            ephemeral.append(row)
+        else:
+            durable.append(row)
+    durable.sort(key=lambda r: r.get("created_at") or 0)
+    ephemeral.sort(key=lambda r: r.get("created_at") or 0)
+    durable = durable[-LIVE_FEED_SEED:]
+    ephemeral = ephemeral[-LIVE_EPHEMERAL_MAX:]
+    if not durable and not ephemeral:
+        return
+
+    all_seeded = durable + ephemeral
+    newest = max(r["created_at"] for r in all_seeded)
+    with _live_lock:
+        # Mutate in place (not rebind) so we don't need a global declaration
+        # for the ring lists — only the cursor scalars are reassigned.
+        _live_recent_durable[:] = durable
+        _live_recent_ephemeral[:] = ephemeral
+        if newest >= _live_since:
+            _live_since = newest
+            _live_seen_at_since = {
+                r["id"] for r in all_seeded
+                if r.get("created_at") == newest and isinstance(r.get("id"), str)
+            }
+
+
 def _live_poll_tick():
     """One poll cycle: re-anchor the delta baseline if a report scan just
     completed, then read events newer than the cursor and fold them into
-    the shared ring buffer and counters. Always broadcasts, even with zero
-    new events, so the SSE stream itself is the heartbeat."""
+    the durable / ephemeral rings and the session counters. Always
+    broadcasts, even with zero new events, so the SSE stream is the heartbeat."""
     global _live_since, _live_seen_at_since, _live_delta_baseline_at
     global _live_new_events, _live_deletes, _live_error
 
@@ -871,17 +1065,15 @@ def _live_poll_tick():
         _live_error = None
         new_high_water = _live_since
         for ev in events:
-            if not isinstance(ev, dict):
+            row = _feed_row_from_scan_event(ev)
+            if row is None:
                 continue
-            eid, kind, created_at = ev.get("id"), ev.get("kind"), ev.get("created_at")
-            if not isinstance(eid, str) or not isinstance(kind, int) or not isinstance(created_at, int):
-                continue
+            eid, kind, created_at = row["id"], row["kind"], row["created_at"]
             if created_at < _live_since:
                 continue
             if created_at == _live_since and eid in _live_seen_at_since:
                 continue
-            row = {"id": eid, "kind": kind, "created_at": created_at}
-            _live_recent.append(row)
+            _live_append_row_unlocked(row)
             _live_new_events += 1
             folded += 1
             if kind == 5:
@@ -892,7 +1084,6 @@ def _live_poll_tick():
             elif created_at == new_high_water:
                 _live_seen_at_since.add(eid)
         _live_since = new_high_water
-        del _live_recent[:-LIVE_RECENT_MAX]
 
     _record_rate_sample(folded)
     _live_broadcast(_live_state_snapshot())
@@ -1481,8 +1672,10 @@ def start_db_compact(on_started=None):
 
 def live_subscribe():
     """Register one SSE connection's queue and return (queue, initial_state).
-    The initial state carries the WHOLE ring buffer so a freshly opened tab
-    renders immediately rather than waiting out LIVE_POLL_INTERVAL."""
+    The initial state carries the WHOLE ring buffer (startup seed of the
+    newest LIVE_FEED_SEED events, plus whatever the poll has folded in
+    since) so a freshly opened tab renders immediately rather than waiting
+    out LIVE_POLL_INTERVAL — or forever, on a quiet relay."""
     q = queue.Queue(maxsize=64)
     with _live_lock:
         _live_subscribers.append(q)
@@ -5257,6 +5450,14 @@ def main():
         sys.exit(0)
 
     httpd.strfry86_config = cfg
+    # Seed the live feed BEFORE accepting connections so a tab opened the
+    # moment the port is up already has the newest LIVE_FEED_SEED rows
+    # instead of waiting out the first poll interval (or forever, if the
+    # relay is quiet). Failure is non-fatal — the poll loop still starts.
+    try:
+        _live_seed_recent()
+    except Exception as e:
+        log(f"server86: live feed seed crashed: {type(e).__name__}: {e}")
     threading.Thread(target=_live_poll_loop, daemon=True).start()
     threading.Thread(target=_giftwrap_retention_loop, daemon=True).start()
     rss = _process_rss_bytes()

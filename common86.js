@@ -735,10 +735,11 @@ function s86BuildPageChrome(statusEl) {
 // GET /api/live is ONE server-side strfry poll loop fanned out to every
 // connected / and /stats tab (CLAUDE.md "Endpoints"). onMessage(data)
 // fires for every `event: live` frame, including the very first one, which
-// carries the server's current state (ring buffer + delta counters) — never
-// this browser's own history, per the "no history fetch" rule. EventSource
-// reconnects on its own after a drop; onDisconnected fires once per drop so
-// the page can say so, and the next onMessage clears it back out.
+// carries the server's current state: a startup seed of the newest
+// LIVE_FEED_SEED events, plus whatever the poll has folded in since, and
+// the session delta counters. EventSource reconnects on its own after a
+// drop; onDisconnected fires once per drop so the page can say so, and
+// the next onMessage clears it back out.
 function s86ConnectLive(onMessage, onDisconnected) {
   if (typeof EventSource === 'undefined') {
     if (onDisconnected) {
