@@ -1,8 +1,8 @@
-# strfry-86
+# Eighty-Six (repo: `strfry-86`)
 
 A pure-Python moderation sidecar for a [strfry](https://github.com/hoytech/strfry) Nostr relay. Deployed *inside* your existing strfry Docker container — zero image changes, zero pip installs, zero new compose services. ("86" is restaurant slang for banning someone from the establishment — fitting for a relay literally named stir fry.)
 
-Report a user from any normal Nostr client (e.g. [jumble.social](https://jumble.social)) and strfry-86 blacklists them at the relay's write policy. Unban them again from a bare admin web page, logged in with your NIP-07 browser extension.
+Report a user from any normal Nostr client (e.g. [jumble.social](https://jumble.social)) and Eighty-Six blacklists them at the relay's write policy. Unban them again from a bare admin web page, logged in with your NIP-07 browser extension.
 
 ## Install
 
@@ -24,7 +24,7 @@ If your strfry container isn't named `strfry`, substitute your actual container 
 
 ## Container has no network?
 
-strfry-86 is offline-first: if `strfry86-bundle.tar.gz` sits next to the updater script, the updater installs from it directly and never touches the network. Get both files onto the host by any means (the `curl` lines below are just one option — dragging the files over or `scp` work identically), then `docker cp` them in and run the updater exactly as before.
+Eighty-Six is offline-first: if `strfry86-bundle.tar.gz` sits next to the updater script, the updater installs from it directly and never touches the network. Get both files onto the host by any means (the `curl` lines below are just one option — dragging the files over or `scp` work identically), then `docker cp` them in and run the updater exactly as before.
 
 Offline install (two files):
 
@@ -67,7 +67,7 @@ services:
 
 ## Add the relay as a write relay
 
-For reports to actually reach strfry-86, add this relay to your write relays in jumble.social (or whatever client you report from) — otherwise your NIP-56 reports go somewhere else and nothing gets banned.
+For reports to actually reach Eighty-Six, add this relay to your write relays in jumble.social (or whatever client you report from) — otherwise your NIP-56 reports go somewhere else and nothing gets banned.
 
 ## How bans work
 
@@ -121,7 +121,7 @@ The **Stats & Console** page's whole-database walk (the same scan that audits th
 
 ## No charts or statistics
 
-strfry-86 deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead through the "terminal commands" generator on every admin page: pick an intent from the dropdown, fill in whatever it asks for (a pubkey, a domain, a day count), and copy the rendered `strfry` command. Nothing in that block is ever run by the page itself — destructive intents (like deleting a pubkey's events) always render the equivalent `scan --count` line first, so you see how much a command destroys before you copy the command that destroys it.
+Eighty-Six deliberately shows no charts or computed statistics — every `strfry scan` it runs is the direct, bounded result of a button press that says what it's about to do. Anything that needs a database sweep (event counts, per-pubkey counts, purges) is offered instead through the "terminal commands" generator on every admin page: pick an intent from the dropdown, fill in whatever it asks for (a pubkey, a domain, a day count), and copy the rendered `strfry` command. Nothing in that block is ever run by the page itself — destructive intents (like deleting a pubkey's events) always render the equivalent `scan --count` line first, so you see how much a command destroys before you copy the command that destroys it.
 
 ## strfry.conf location and backups
 

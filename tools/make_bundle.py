@@ -39,6 +39,7 @@ DEPLOYABLE_FILES = [
     "domain.html",
     "common86.js",
     "favicon.ico",
+    "apple-touch-icon.png",
     "lib86/__init__.py",
     "lib86/bip340.py",
     "lib86/bech32.py",

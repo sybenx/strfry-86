@@ -658,10 +658,11 @@ function s86BuildPageChrome(statusEl) {
   var logo = document.createElement('a');
   logo.className = 'logo';
   logo.href = '/';
-  logo.textContent = 'strfry-86';
+  logo.appendChild(s86El('span', 'Eighty-', 'logo-ink'));
+  logo.appendChild(s86El('span', 'Six', 'logo-accent'));
   brand.appendChild(logo);
 
-  brand.appendChild(s86El('span', 'Relay sidecar — admin console', 'tagline'));
+  brand.appendChild(s86El('span', 'RELAY MODERATION FOR STRFRY', 'tagline'));
   brand.appendChild(s86El('span', null, 'spacer'));
 
   var loginBtn = document.createElement('button');

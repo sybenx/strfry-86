@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <script>try{var s86t=localStorage.getItem('strfry86_theme');if(s86t==='light'||s86t==='dark'){document.documentElement.style.colorScheme=s86t;}}catch(e){}</script>
-<title>Settings — strfry-86</title>
+<title>Settings — Eighty-Six</title>
 <style>
 /* strfry-86 style block — canonical source. tools/stamp_style.py copies this
    file verbatim into every page's <style>, so "identical character-for-character
@@ -32,7 +33,7 @@
   --term-bg: oklch(.14 .005 60);
   --term-fg: oklch(.9 .01 145);
   --term-edge: oklch(.3 .01 60);
-  --serif: Georgia, "PT Serif", "Iowan Old Style", "Times New Roman", serif;
+  --serif: Caladea, Georgia, "PT Serif", "Iowan Old Style", "Times New Roman", serif;
   --sans: "Helvetica Neue", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, "IBM Plex Mono", monospace;
 }
@@ -244,6 +245,8 @@ header#s86 .brand { display:flex; align-items:baseline; gap:.8em; padding:.9rem 
 header#s86 a.logo { font-family:var(--serif); font-weight:bold; font-size:1.5rem;
                     letter-spacing:-.02em; white-space:nowrap;
                     text-decoration:none; color:inherit; }
+header#s86 a.logo .logo-ink { color:var(--ink); }
+header#s86 a.logo .logo-accent { color:var(--accent); }
 header#s86 .tagline { font-size:.65rem; font-weight:600; letter-spacing:.14em;
                       text-transform:uppercase; color:var(--muted); }
 header#s86 .spacer { flex:1; }

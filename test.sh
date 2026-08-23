@@ -2518,8 +2518,8 @@ try:
         https_response = http_response
     _opener = _urllib_request.build_opener(_NoRedirect)
     _resp = _opener.open(_urllib_request.Request(_base_url + "/", method="GET"), timeout=5)
-    check(_resp.status == 200 and b"<title>strfry-86</title>" in _resp.read(),
-          "GET / serves the live feed (home.html) with title strfry-86")
+    check(_resp.status == 200 and b"<title>Live feed \xe2\x80\x94 Eighty-Six</title>" in _resp.read(),
+          "GET / serves the live feed (home.html) with title Live feed \xe2\x80\x94 Eighty-Six")
     _resp = _opener.open(_urllib_request.Request(_base_url + "/home", method="GET"), timeout=5)
     check(_resp.status == 302 and _resp.headers.get("Location") == "/",
           "GET /home redirects (302) to /")
