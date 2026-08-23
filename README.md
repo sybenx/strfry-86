@@ -81,7 +81,7 @@ strfry delete --filter '{"authors":["<hex-pubkey>"]}'
 
 Open the ban list page (`/bans`), click "Login with extension" (NIP-07), check the pubkeys you want to unban (a live "n selected" count sits next to the button), click "Unban selected". Each unban is authorized per-request with a freshly signed NIP-98 event — there are no sessions or cookies. Logging in is remembered in this browser (localStorage) so you aren't re-prompted by your extension moving between pages — that changes nothing about the security model, every write is still individually NIP-98 signed and checked server-side; hand-editing that stored value just gets you a page full of buttons that fail.
 
-The public landing page is **Activity** (`/home`) — a live feed of recent events showing only kind, timestamp, and event id (no pubkeys or content). Nav is consistent across pages: home, stats, userlist, report, authors, bans, audit. Search (Ctrl-K / Cmd-K) accepts npub, hex, or domain.
+The public landing page is the **Live Event Feed** (`/`) — recent events showing kind, timestamp, author, content, and result. Nav is consistent across pages: home, stats, users, bans, audit, settings. Search (Ctrl-K / Cmd-K) accepts npub, hex, or domain.
 
 Every admin action leaves a record line in the browser and is also written to the server **Audit** log (`/audit`) — the durable undo list. Browser record lines still offer Undo/↩ on each admin page; Audit survives a new browser and is bounded by retention and auth.
 
