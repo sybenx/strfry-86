@@ -47,6 +47,7 @@ Routes:
 
 import calendar
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -192,6 +193,8 @@ MEMORY_SOFT_BYTES = 400 * 1024 * 1024   # refuse new scan jobs above this RSS
 CACHE_LIST_MAX = 50000          # max author/recipient rows retained after a scan
 STREAM_STDERR_MAX = 64 * 1024   # stderr retained from a streaming scan
 POST_BODY_MAX = 2 * 1024 * 1024 # NIP-98 POST bodies (settings raw is the largest)
+GZIP_MIN_BYTES = 1024           # below this, gzip's own framing overhead isn't worth it
+GZIP_LEVEL = 6                  # zlib level 6: ~9% smaller than level 1 for ~2x the CPU
 # --- live layer: one shared strfry poll fanned out over SSE ----------------
 LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
 LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
@@ -1749,7 +1752,6 @@ def get_userlist_snapshot():
         event_count = a.get("count") if a.get("count") is not None else a.get("event_count")
         rows.append({
             "pubkey": pk,
-            "npub": a.get("npub"),
             "name": a.get("name"),
             "nip05": a.get("nip05"),
             "event_count": event_count,
@@ -3378,6 +3380,18 @@ def authors_scan_pubkeys():
     return {a["pubkey"] for a in cached.get("authors", [])}
 
 
+def _authors_status_for_http(status):
+    """GET /api/authors is scan-status only — the Users table gets its rows
+    from GET /api/userlist, which reads this same cache in-process via
+    get_userlist_snapshot()/authors_scan_pubkeys(). The full `authors` array
+    (up to CACHE_LIST_MAX entries) duplicates that response wholesale, so
+    drop it from the HTTP view only; `partial_authors` stays — it's
+    RENDER_MAX-bounded and users.html renders it directly mid-scan."""
+    view = dict(status)
+    view.pop("authors", None)
+    return view
+
+
 # --- gift-wrap recipient tally ---------------------------------------------
 # Storage accounting, not moderation: kind 1059 (gift wraps) is the bulk of
 # a DM-carrying relay's disk, and the unencrypted `p` tag says who each one
@@ -4811,8 +4825,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
+        encoding = None
+        if len(body) >= GZIP_MIN_BYTES:
+            accept = self.headers.get("Accept-Encoding", "")
+            if "gzip" in [e.strip() for e in accept.split(",")]:
+                body = gzip.compress(body, compresslevel=GZIP_LEVEL)
+                encoding = "gzip"
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -4965,7 +4987,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/authors":
-            self._send_json(200, get_authors_status())
+            self._send_json(200, _authors_status_for_http(get_authors_status()))
             return
 
         if path == "/api/recipients":

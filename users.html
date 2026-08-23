@@ -764,6 +764,9 @@ function cmpStrEmptyLast(a, b) {
 }
 
 var SORT_COMPARATORS = {
+  // a.npub/b.npub are only populated for rows already rendered once (lazy
+  // encode, see renderUsers) — this fallback still works, it just falls
+  // through to pubkey for never-rendered rows.
   user: function (a, b) {
     return cmpStrEmptyLast(
       (a.name || a.nip05 || a.npub || a.pubkey || '').toLowerCase(),
@@ -803,22 +806,42 @@ function giftwrapLabel(count, saturated) {
   return (saturated ? '≥ ' : '') + Number(count).toLocaleString();
 }
 
-// Search matches every visible column plus the raw keys behind them
-// (npub/hex, domain half of NIP-05, absolute UTC of last active).
-function matchesQuery(row, q) {
-  if (!q) {
-    return true;
-  }
-  var hay = [
+// Search matches every visible column plus the raw keys behind them (hex
+// pubkey, domain half of NIP-05, absolute UTC of last active). Rows never
+// carry npub from the server (see server86.py's get_userlist_snapshot) and
+// it is never encoded just to search — an npub1... query is decoded once
+// (below, outside the per-row loop) and matched against row.pubkey instead.
+function buildHaystack(row) {
+  return [
     row.name, row.nip05, s86Nip05Domain(row.nip05),
-    row.npub, row.pubkey,
+    row.pubkey,
     row.event_count != null ? String(row.event_count) : '',
     row.reporters != null ? String(row.reporters) : '',
     row.giftwrap_count != null ? String(row.giftwrap_count) : '',
     row.last_seen ? s86FormatDate(row.last_seen) : '',
     row.last_seen ? s86FormatRelativeAge(row.last_seen) : ''
   ].join(' ').toLowerCase();
-  return hay.indexOf(q) !== -1;
+}
+
+// Haystacks are precomputed once per row when the userlist loads (see
+// attachHaystacks), not rebuilt on every keystroke — matching 50,000 rows
+// on each keypress must stay cheap without a debounce.
+function matchesQuery(row, q, queryNpubHex) {
+  if (!q) {
+    return true;
+  }
+  if (queryNpubHex) {
+    return row.pubkey === queryNpubHex;
+  }
+  if (row._hay === undefined) {
+    row._hay = buildHaystack(row);
+  }
+  return row._hay.indexOf(q) !== -1;
+}
+
+function attachHaystacks(rows) {
+  (rows || []).forEach(function (r) { r._hay = buildHaystack(r); });
+  return rows;
 }
 
 function renderUsers() {
@@ -841,7 +864,8 @@ function renderUsers() {
     : '';
 
   var q = filterInput.value.trim().toLowerCase();
-  var filtered = visible.filter(function (r) { return matchesQuery(r, q); });
+  var queryNpubHex = q.indexOf('npub1') === 0 ? s86NpubToHex(q) : null;
+  var filtered = visible.filter(function (r) { return matchesQuery(r, q, queryNpubHex); });
   var truncation = s86TruncateForRender(filtered, S86_RENDER_MAX);
   currentRenderedRows = truncation.shown;
   selectAll.checked = false;
@@ -873,6 +897,11 @@ function renderUsers() {
   ], { field: sortField, dir: sortDir }, setSort));
   var tbody = document.createElement('tbody');
   currentRenderedRows.forEach(function (r) {
+    // Only rendered rows (RENDER_MAX-bounded) ever pay the encode cost —
+    // never all 50,000 rows on load.
+    if (!r.npub) {
+      r.npub = s86HexToNpub(r.pubkey);
+    }
     var tr = document.createElement('tr');
     tr.setAttribute('data-pubkey', r.pubkey);
 
@@ -1086,7 +1115,7 @@ function applyPartialAuthors(data) {
   }
   var prev = lastUserlist || {};
   lastUserlist = {
-    rows: partialAuthorsToRows(data.partial_authors),
+    rows: attachHaystacks(partialAuthorsToRows(data.partial_authors)),
     authors_partial: true,
     authors_scanned_at: prev.authors_scanned_at,
     authors_error: prev.authors_error,
@@ -1169,6 +1198,7 @@ function loadUserlist() {
   return fetch('/api/userlist')
     .then(function (res) { return res.json(); })
     .then(function (data) {
+      attachHaystacks(data.rows);
       lastUserlist = data;
       renderUsers();
       if (lastAuthorsStatus && lastAuthorsStatus.status !== 'running') {

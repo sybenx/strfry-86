@@ -501,7 +501,7 @@ function s86Bech32Decode(bech) {
   return { hrp: hrp, data: data.slice(0, -6) };
 }
 
-function s86ConvertBits(data, frombits, tobits) {
+function s86ConvertBits(data, frombits, tobits, pad) {
   var acc = 0, bits = 0, ret = [];
   var maxv = (1 << tobits) - 1;
   for (var i = 0; i < data.length; i++) {
@@ -516,7 +516,11 @@ function s86ConvertBits(data, frombits, tobits) {
       ret.push((acc >>> bits) & maxv);
     }
   }
-  if (bits >= frombits || ((acc << (tobits - bits)) & maxv)) {
+  if (pad) {
+    if (bits > 0) {
+      ret.push((acc << (tobits - bits)) & maxv);
+    }
+  } else if (bits >= frombits || ((acc << (tobits - bits)) & maxv)) {
     return null;
   }
   return ret;
@@ -536,6 +540,40 @@ function s86NpubToHex(npub) {
     hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
   }
   return hex;
+}
+
+function s86Bech32CreateChecksum(hrp, data) {
+  var values = s86Bech32HrpExpand(hrp).concat(data).concat([0, 0, 0, 0, 0, 0]);
+  var mod = s86Bech32Polymod(values) ^ 1;
+  var ret = [];
+  for (var p = 0; p < 6; p++) {
+    ret.push((mod >>> (5 * (5 - p))) & 31);
+  }
+  return ret;
+}
+
+function s86Bech32Encode(hrp, data) {
+  var combined = data.concat(s86Bech32CreateChecksum(hrp, data));
+  var out = hrp + '1';
+  for (var i = 0; i < combined.length; i++) {
+    out += S86_BECH32_CHARSET.charAt(combined[i]);
+  }
+  return out;
+}
+
+function s86HexToNpub(hex) {
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    return null;
+  }
+  var bytes = [];
+  for (var i = 0; i < 64; i += 2) {
+    bytes.push(parseInt(hex.substr(i, 2), 16));
+  }
+  var data = s86ConvertBits(bytes, 8, 5, true);
+  if (!data) {
+    return null;
+  }
+  return s86Bech32Encode('npub', data);
 }
 
 function s86PubkeyInputToHex(raw) {
