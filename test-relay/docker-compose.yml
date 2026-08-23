@@ -1,0 +1,21 @@
+# Throwaway local relay for measurement / delete-purge testing. Never the
+# production relay — see CLAUDE.md's "Test relay only" rule. Destroy and
+# recreate freely: `bin/down.sh` removes the volume along with the container.
+services:
+  strfry:
+    image: dockurr/strfry:latest
+    container_name: strfry86-test
+    ports:
+      - "127.0.0.1:17777:7777"   # nostr websocket
+      - "127.0.0.1:18686:8686"   # eighty-six admin page
+    volumes:
+      - strfry-db:/app/strfry-db
+      - ./.runtime/strfry.conf:/etc/strfry.conf
+    healthcheck:
+      test: ["CMD", "/app/strfry", "--config=/etc/strfry.conf", "scan", "--count", "{}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  strfry-db:

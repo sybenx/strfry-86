@@ -17,6 +17,15 @@ control.
 - `tools/make_bundle.py`'s `DEPLOYABLE_FILES` list is what actually ships; `tests/` is
   excluded from it and from `manifest.json`.
 
+## Test relay only — never production
+
+- Anything that runs `strfry delete`, `strfry compact`, or a purge runs against
+  `test-relay/` (`bin/up.sh && bin/seed.sh`). Never against a relay you did not spin up
+  yourself.
+- Production is read-only, and only for observing real data shape — author
+  cardinality, saturation, kind distribution. Never a write, and never a measurement
+  that requires deploying uncommitted code.
+
 ## Architecture
 
 Three processes live in this repo; strfry itself does not.
@@ -75,6 +84,8 @@ Three processes live in this repo; strfry itself does not.
 - `tools/stamp_style.py`, `tools/make_bundle.py` — style stamping and deploy bundling.
 - `tests/` — fixtures for `test.sh`; see `tests/README.md` for provenance.
 - `manifest.json` — deploy manifest the updater diffs against.
+- `test-relay/` — disposable local strfry + Eighty-Six for measurement/delete testing;
+  see `test-relay/README.md`.
 
 ## Conventions
 
