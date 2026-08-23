@@ -256,6 +256,22 @@ function s86DataLabel(td, label) {
   return td;
 }
 
+// Only /profile still sends npub from the server — every list endpoint
+// (userlist, live feed, banlist) sends pubkey only, since bech32-encoding
+// every row up front cost real cache size and startup time for a value
+// almost nothing renders (name/nip05 win first in the label almost every
+// time). This is the one place that value gets encoded, lazily, and only
+// for a row actually being rendered. It mutates `row` so a row rendered
+// once keeps its npub for any sort/search/aria-label code that reads
+// row.npub directly around the identity cell — see users.html/bans.html/
+// home.html, which all call this before using row.npub themselves.
+function s86EnsureNpub(row) {
+  if (!row.npub && row.pubkey) {
+    row.npub = s86HexToNpub(row.pubkey);
+  }
+  return row.npub;
+}
+
 // Identity cell for a list row. Optional dataLabel (default "User") is the
 // phone-card column name; pass false to suppress it.
 function s86BuildIdentityCell(row, linkIt, dataLabel) {
@@ -264,16 +280,17 @@ function s86BuildIdentityCell(row, linkIt, dataLabel) {
   // table-cell breaks border alignment with the rest of the row.
   var idrow = s86El('span', null, 'idrow');
   idrow.appendChild(s86BuildIdentityDot(row.pubkey));
-  var label = row.name || row.nip05 || (row.npub ? s86ShortKey(row.npub) : '—');
-  if (linkIt && row.npub && row.pubkey) {
-    var a = s86NpubLink(row.npub, row.pubkey, true);
+  var npub = s86EnsureNpub(row);
+  var label = row.name || row.nip05 || (npub ? s86ShortKey(npub) : '—');
+  if (linkIt && npub && row.pubkey) {
+    var a = s86NpubLink(npub, row.pubkey, true);
     a.textContent = label;
-    a.title = row.npub;
+    a.title = npub;
     idrow.appendChild(a);
   } else {
     var span = s86El('span', label);
-    if (row.npub) {
-      var idleTitle = row.npub + ' — click to copy';
+    if (npub) {
+      var idleTitle = npub + ' — click to copy';
       span.title = idleTitle;
       span.style.cursor = 'pointer';
       span.setAttribute('role', 'button');
@@ -295,7 +312,7 @@ function s86BuildIdentityCell(row, linkIt, dataLabel) {
         // Secure-context path is async; flash "copied" optimistically — the
         // fallback inside s86CopyText recovers if writeText rejects.
         // Non-secure path is sync and reports real success/failure.
-        var ok = s86CopyText(row.npub);
+        var ok = s86CopyText(npub);
         flashTitle(ok);
       };
       // Whole cell is the hit target — the truncated label is easy to miss

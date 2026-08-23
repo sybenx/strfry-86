@@ -158,6 +158,13 @@ SUBSCRIBER_SCAN_LIMIT = 50000   # kind-10050/10002 events searched for this rela
 SCAN_TIMEOUT = 10               # seconds; every other scan subprocess
 REPORT_SCAN_LIMIT = 5000        # kind-1984 events read to build the reports-against tally
 NAME_RESOLVE_MAX = 500          # pubkeys per batched kind-0 lookup
+# An `authors: [...]` filter with up to NAME_RESOLVE_MAX entries is a
+# different shape of work than the other bounded scans above — strfry has
+# to check each listed author, not just stream and stop at a row limit —
+# and on a large database SCAN_TIMEOUT's 10s can be too tight for that,
+# silently: the whole batch gets cached as "no name found" for
+# NAME_CACHE_TTL, indistinguishable from an actual absent profile.
+NAME_RESOLVE_SCAN_TIMEOUT = 60  # seconds; see _resolve_profiles_locally
 NAME_CACHE_MAX = 20000          # entries retained in names.json
 PROFILE_EVENT_LIMIT = 500       # events read for one pubkey's kind tally
 PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
@@ -804,12 +811,6 @@ def blocked_window_meta(tally):
 
 def _feed_row_from_decision(rec):
     pubkey = rec.get("pubkey")
-    npub = None
-    if is_hex64(pubkey):
-        try:
-            npub = bech32.npub_encode(pubkey)
-        except (ValueError, TypeError):
-            npub = None
     content = rec.get("content")
     if isinstance(content, str):
         content = content[:LIVE_CONTENT_MAX]
@@ -820,7 +821,8 @@ def _feed_row_from_decision(rec):
         "kind": rec.get("kind"),
         "created_at": rec.get("created_at") or rec.get("at"),
         "pubkey": pubkey if is_hex64(pubkey) else None,
-        "npub": npub,
+        "name": None,
+        "nip05": None,
         "content": content,
         "result": "blocked" if rec.get("action") == "reject" else "accepted",
         "msg": rec.get("msg") or "",
@@ -840,12 +842,6 @@ def _feed_row_from_scan_event(ev):
     pubkey = ev.get("pubkey")
     if not is_hex64(pubkey):
         pubkey = None
-    npub = None
-    if pubkey:
-        try:
-            npub = bech32.npub_encode(pubkey)
-        except (ValueError, TypeError):
-            npub = None
     content = ev.get("content")
     if isinstance(content, str):
         content = content[:LIVE_CONTENT_MAX]
@@ -856,7 +852,8 @@ def _feed_row_from_scan_event(ev):
         "kind": kind,
         "created_at": created_at,
         "pubkey": pubkey,
-        "npub": npub,
+        "name": None,
+        "nip05": None,
         "content": content,
         "result": None,
         "msg": "",
@@ -943,9 +940,26 @@ def _live_feed_state():
             rows.sort(key=lambda r: r.get("created_at") or 0)
         accepted = sum(1 for r in rows if r["result"] == "accepted")
         blocked = sum(1 for r in rows if r["result"] == "blocked")
+        _join_feed_row_names(rows)
         return rows, accepted, blocked, True
 
+    _join_feed_row_names(ring_merged)
     return ring_merged, None, None, False
+
+
+def _join_feed_row_names(rows):
+    """Fill in name/nip05 on feed rows from names.json, one batched
+    namecache lookup per poll tick rather than one per row — this runs
+    every LIVE_POLL_INTERVAL (3s) over up to ~600 rows, so per-row lookups
+    would add up fast even though each one is cheap on its own."""
+    pubkeys = [r["pubkey"] for r in rows if r.get("pubkey")]
+    cached = _cached_names_only(pubkeys)
+    for r in rows:
+        hit = cached.get(r.get("pubkey"))
+        if hit:
+            r["name"] = hit.get("name")
+            r["nip05"] = hit.get("nip05")
+    return rows
 
 
 def _ring_row_as_feed(ev):
@@ -955,7 +969,8 @@ def _ring_row_as_feed(ev):
     if not isinstance(ev, dict):
         return {
             "id": None, "kind": None, "created_at": None,
-            "pubkey": None, "npub": None, "content": "", "result": None, "msg": "",
+            "pubkey": None, "name": None, "nip05": None,
+            "content": "", "result": None, "msg": "",
         }
     content = ev.get("content")
     return {
@@ -963,7 +978,8 @@ def _ring_row_as_feed(ev):
         "kind": ev.get("kind"),
         "created_at": ev.get("created_at"),
         "pubkey": ev.get("pubkey") if is_hex64(ev.get("pubkey")) else None,
-        "npub": ev.get("npub") if isinstance(ev.get("npub"), str) else None,
+        "name": None,
+        "nip05": None,
         "content": content if isinstance(content, str) else "",
         # Never invent "accepted" — only the decision log sets result.
         "result": ev.get("result") if ev.get("result") in ("accepted", "blocked") else None,
@@ -1742,18 +1758,26 @@ def get_userlist_snapshot():
     recipients_saturated = bool(recipients_status.get("saturated"))
     recipients_scanned_at = recipients_status.get("scanned_at")
     report_counts = reports_status.get("counts") or {}
+    # The authors cache is a snapshot from whenever compute_authors() last
+    # ran — potentially hours old. names.json keeps gaining entries between
+    # scans (a resolution from any other page/action, or from a rescan that
+    # skipped this pubkey as single-event). Re-join it at read time, cheap
+    # and scan-free, so a name resolved after the last scan still shows up
+    # here without the operator having to know to rescan.
+    fresh_names = _cached_names_only([a["pubkey"] for a in authors if isinstance(a, dict) and a.get("pubkey")])
     rows = []
     for a in authors:
         if not isinstance(a, dict) or not a.get("pubkey"):
             continue
         pk = a["pubkey"]
+        fresh = fresh_names.get(pk)
         # Partial rows use "count"; the finished cache uses "count" too on
         # the authors cache, mapped to event_count for the table.
         event_count = a.get("count") if a.get("count") is not None else a.get("event_count")
         rows.append({
             "pubkey": pk,
-            "name": a.get("name"),
-            "nip05": a.get("nip05"),
+            "name": (fresh or {}).get("name") or a.get("name"),
+            "nip05": (fresh or {}).get("nip05") or a.get("nip05"),
             "event_count": event_count,
             "last_seen": a.get("last_seen"),
             "giftwrap_count": None if partial else recipient_counts.get(pk),
@@ -2158,13 +2182,15 @@ def _clean_profile_field(value):
 
 
 def resolve_profiles(pubkeys):
-    """Return {pubkey: {"name": ..., "nip05": ...}} for the given pubkeys.
+    """Return ({pubkey: {"name": ..., "nip05": ...}}, error_or_None) for the
+    given pubkeys.
 
     Two layers: a pubkey that already has a name/nip05 persisted in
     blacklist.json (written by POST /api/names — only possible for a
     currently-banned pubkey) is served from there directly, with no scan.
-    Everything else falls through to _resolve_profiles_locally, unchanged
-    from before this existed."""
+    Everything else falls through to _resolve_profiles_locally. `error` is
+    non-None only when that scan itself failed (e.g. timed out) — never set
+    just because some pubkeys had no profile to find."""
     blacklist_data = blacklist.load()
     stored = {}
     to_resolve_locally = []
@@ -2175,27 +2201,55 @@ def resolve_profiles(pubkeys):
         else:
             to_resolve_locally.append(pk)
 
-    result = _resolve_profiles_locally(to_resolve_locally)
+    result, error = _resolve_profiles_locally(to_resolve_locally)
     result.update(stored)
-    return result
+    return result, error
+
+
+def _cached_names_only(pubkeys):
+    """{pubkey: {"name":, "nip05":}} for whichever of `pubkeys` some path
+    has already resolved a name/nip05 for — straight from names.json
+    (lib86/namecache), no scan and no network. Safe to call on every row of
+    every list render: a miss (or an unresolved pubkey) is simply absent
+    from the result rather than a null entry, so a caller can
+    `dict.get(pk)` and only use it when there's actually something to show,
+    without clobbering a value it already had from elsewhere."""
+    if not pubkeys:
+        return {}
+    cached = namecache.get_many(pubkeys)
+    return {
+        pk: {"name": entry.get("name"), "nip05": entry.get("nip05")}
+        for pk, entry in cached.items()
+        if entry.get("name") or entry.get("nip05")
+    }
 
 
 def _resolve_profiles_locally(pubkeys):
     """Resolve names/nip05 from the LOCAL strfry database only, querying
     uncached (or stale local-miss) pubkeys in one batched scan bounded by
-    an explicit `authors` list. Both fields come from the same kind-0
-    event; the nip05 string is displayed as-is, never verified
-    (verification would need outbound HTTP to arbitrary domains). Results
-    persist in names.json (lib86/namecache.py) rather than in memory only,
-    so they survive server86 restarts — never written to blacklist.json,
-    since these pubkeys aren't (necessarily) banned.
+    an explicit `authors` list, given NAME_RESOLVE_SCAN_TIMEOUT rather than
+    the default SCAN_TIMEOUT — an `authors: [...]` filter with up to
+    NAME_RESOLVE_MAX entries is a heavier lookup than the other bounded
+    scans and 10s can be too tight for it on a large database. Both fields
+    come from the same kind-0 event; the nip05 string is displayed as-is,
+    never verified (verification would need outbound HTTP to arbitrary
+    domains). Results persist in names.json (lib86/namecache.py) rather
+    than in memory only, so they survive server86 restarts — never written
+    to blacklist.json, since these pubkeys aren't (necessarily) banned.
 
     A cached `source: "external"` entry (hit or miss) is treated as final
     and never re-attempted locally: if a purplepag.es-backed lookup found
     nothing, the profile is presumed absent everywhere, not just here.
     Only `source: "local"` full misses older than NAME_CACHE_TTL are
     eligible for another local scan attempt — the local database keeps
-    changing in a way an external miss never un-misses."""
+    changing in a way an external miss never un-misses.
+
+    Returns ({pubkey: {"name":, "nip05":}}, error_or_None). On a scan
+    failure (including a timeout), nothing for the failed batch is cached
+    as a miss — caching "checked, found nothing" for pubkeys that were
+    never actually checked would look identical to an absent profile for
+    the next NAME_CACHE_TTL, hiding the failure instead of just delaying
+    the next attempt. The caller gets `error` back to surface instead."""
     now = time.time()
     cached = namecache.get_many(pubkeys)
     to_query = {
@@ -2207,10 +2261,13 @@ def _resolve_profiles_locally(pubkeys):
         )
     }
 
+    error = None
     if to_query:
         results = {}
         try:
-            events = run_strfry_scan({"kinds": [0], "authors": list(to_query)})
+            events = run_strfry_scan(
+                {"kinds": [0], "authors": list(to_query)}, timeout=NAME_RESOLVE_SCAN_TIMEOUT,
+            )
             found = set()
             for ev in events:
                 try:
@@ -2227,15 +2284,17 @@ def _resolve_profiles_locally(pubkeys):
                 if pk not in found:
                     results[pk] = {"name": None, "nip05": None}
         except Exception as e:
-            log(f"server86: strfry scan failed: {e}")
-            for pk in to_query:
-                results[pk] = {"name": None, "nip05": None}
-        namecache.set_local(results, now, max_entries=NAME_CACHE_MAX)
-        for pk, hit in results.items():
-            cached[pk] = {"name": hit["name"], "nip05": hit["nip05"], "checked_at": now, "source": "local"}
+            log(f"server86: name-resolution scan failed: {e}")
+            error = f"name resolution failed: {e}"
+            results = {}
+        if results:
+            namecache.set_local(results, now, max_entries=NAME_CACHE_MAX)
+            for pk, hit in results.items():
+                cached[pk] = {"name": hit["name"], "nip05": hit["nip05"], "checked_at": now, "source": "local"}
 
     miss = {"name": None, "nip05": None}
-    return {pk: ({"name": cached[pk]["name"], "nip05": cached[pk]["nip05"]} if pk in cached else miss) for pk in pubkeys}
+    resolved = {pk: ({"name": cached[pk]["name"], "nip05": cached[pk]["nip05"]} if pk in cached else miss) for pk in pubkeys}
+    return resolved, error
 
 
 # --- generic async scan job machinery -------------------------------------
@@ -3123,13 +3182,8 @@ def _publish_authors_partial(tally, force=False, _state=None):
     )[:RENDER_MAX]
     partial = []
     for pk, entry in ranked:
-        try:
-            npub = bech32.npub_encode(pk)
-        except (ValueError, TypeError):
-            continue
         partial.append({
             "pubkey": pk,
-            "npub": npub,
             "name": None,
             "nip05": None,
             "count": entry["count"],
@@ -3234,9 +3288,12 @@ def compute_authors(mode, progress_cb=None):
     if reports_ok:
         all_pubkeys |= set(reporters_by_pubkey.keys())
 
-    # Rank first WITHOUT bech32/npub — encoding every pubkey on a large full
-    # scan is pure waste once CACHE_LIST_MAX will drop the tail. Free the
-    # streaming tally as soon as the compact rank rows exist.
+    # No bech32/npub here at all — the client encodes it lazily, only for
+    # the handful of rows it actually renders (see s86BuildIdentityCell).
+    # Encoding all of these up front was pure waste once CACHE_LIST_MAX
+    # will drop the tail anyway, and it bloated authors-cache.json for
+    # every row that survives. Free the streaming tally as soon as the
+    # compact rank rows exist.
     rows = []
     for pk in all_pubkeys:
         if not is_hex64(pk):
@@ -3264,21 +3321,26 @@ def compute_authors(mode, progress_cb=None):
     # keys with no kind-0 to find, and resolving them would spend the
     # whole cap on the least useful rows.
     to_resolve = [r["pubkey"] for r in rows if r["count"] != 1][:NAME_RESOLVE_MAX]
+    name_resolution_error = None
     try:
-        profiles = resolve_profiles(to_resolve)
+        profiles, name_resolution_error = resolve_profiles(to_resolve)
     except Exception as e:
         log(f"server86: author name resolution failed: {e}")
         profiles = {}
+        name_resolution_error = str(e)
+
+    # A single-event author skipped above may still already have a name
+    # resolved via some OTHER path (a previous scan, the banlist's own
+    # resolution) sitting in names.json — join it in here too, cache-only,
+    # no scan, so it isn't shown as unknown just because this scan didn't
+    # look it up again.
+    already_cached = _cached_names_only([r["pubkey"] for r in rows if r["count"] == 1])
 
     authors = []
     for r in rows:
-        try:
-            npub = bech32.npub_encode(r["pubkey"])
-        except (ValueError, TypeError):
-            continue
-        profile = profiles.get(r["pubkey"]) or {}
+        profile = profiles.get(r["pubkey"]) or already_cached.get(r["pubkey"]) or {}
         authors.append({
-            "pubkey": r["pubkey"], "npub": npub,
+            "pubkey": r["pubkey"],
             "name": profile.get("name"), "nip05": profile.get("nip05"),
             "count": r["count"], "last_seen": r["last_seen"],
             "reporters": r["reporters"],
@@ -3292,6 +3354,8 @@ def compute_authors(mode, progress_cb=None):
             f"{list_total:,} (lowest-activity tail dropped to protect memory)"
         )
         warning = (warning + " — " + trunc_note) if warning else trunc_note
+    if name_resolution_error:
+        warning = (warning + " — " + name_resolution_error) if warning else name_resolution_error
 
     return {
         "scanned_at": int(time.time()),
@@ -3450,21 +3514,19 @@ def compute_recipients(progress_cb=None):
     rows = rows[:CACHE_LIST_MAX]
     tally.clear()
     to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
+    name_resolution_error = None
     try:
-        profiles = resolve_profiles(to_resolve)
+        profiles, name_resolution_error = resolve_profiles(to_resolve)
     except Exception as e:
         log(f"server86: recipient name resolution failed: {e}")
         profiles = {}
+        name_resolution_error = str(e)
 
     recipients = []
     for pk, count in rows:
-        try:
-            npub = bech32.npub_encode(pk)
-        except (ValueError, TypeError):
-            continue
         profile = profiles.get(pk) or {}
         recipients.append({
-            "pubkey": pk, "npub": npub,
+            "pubkey": pk,
             "name": profile.get("name"), "nip05": profile.get("nip05"),
             "count": count,
         })
@@ -3476,6 +3538,8 @@ def compute_recipients(progress_cb=None):
             f"recipient list truncated to top {CACHE_LIST_MAX:,} of "
             f"{list_total:,} (lowest-count tail dropped to protect memory)"
         )
+    if name_resolution_error:
+        warning = (warning + " — " + name_resolution_error) if warning else name_resolution_error
 
     return {
         "scanned_at": int(time.time()),
@@ -3726,7 +3790,7 @@ def compute_subscribers(progress_cb=None):
         rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
         to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
         try:
-            profiles = resolve_profiles(to_resolve)
+            profiles, _ = resolve_profiles(to_resolve)
         except Exception as e:
             log(f"server86: subscriber name resolution failed: {e}")
             profiles = {}
@@ -4334,7 +4398,7 @@ def compute_profile(pubkey_hex):
     distinct_reporters = list(dict.fromkeys(r["reporter"] for r in reports))
     if distinct_reporters:
         try:
-            resolved_reporters = resolve_profiles(distinct_reporters)
+            resolved_reporters, _ = resolve_profiles(distinct_reporters)
         except Exception as e:
             log(f"server86: reporter name resolution failed for {pubkey_hex}: {e}")
             resolved_reporters = {}
@@ -4387,7 +4451,8 @@ def build_profile_response(pubkey_hex):
         npub = None
 
     try:
-        resolved = resolve_profiles([pubkey_hex]).get(pubkey_hex) or {}
+        resolved_profiles, _ = resolve_profiles([pubkey_hex])
+        resolved = resolved_profiles.get(pubkey_hex) or {}
     except Exception as e:
         log(f"server86: profile name resolution failed for {pubkey_hex}: {e}")
         resolved = {}
@@ -4541,7 +4606,7 @@ def compute_pubkeys_lookup(pubkeys, domain):
         scan_counts = {a["pubkey"]: a.get("count") for a in _authors_cache.get("authors", [])}
 
     try:
-        profiles = resolve_profiles(pubkeys[:NAME_RESOLVE_MAX])
+        profiles, _ = resolve_profiles(pubkeys[:NAME_RESOLVE_MAX])
     except Exception as e:
         log(f"server86: pubkeys/lookup name resolution failed: {e}")
         profiles = {}
@@ -4945,11 +5010,13 @@ class Handler(BaseHTTPRequestHandler):
             cfg = self.server.strfry86_config
             data = blacklist.load()
             pubkeys = list(data.keys())
+            name_resolution_error = None
             try:
-                profiles = resolve_profiles(pubkeys)
+                profiles, name_resolution_error = resolve_profiles(pubkeys)
             except Exception as e:
                 log(f"server86: name resolution failed: {e}")
                 profiles = {}
+                name_resolution_error = str(e)
             # A ban is a rule; the blocked count is that rule being enforced.
             # It is the only figure on the page that says the ban is doing
             # anything, so it travels with the row rather than living behind
@@ -4957,15 +5024,10 @@ class Handler(BaseHTTPRequestHandler):
             tally = get_blocked_tally()
             banned = []
             for pubkey, info in data.items():
-                try:
-                    npub = bech32.npub_encode(pubkey)
-                except (ValueError, TypeError):
-                    continue
                 profile = profiles.get(pubkey) or {}
                 banned.append(
                     {
                         "pubkey": pubkey,
-                        "npub": npub,
                         "banned_at": info.get("banned_at"),
                         "reason": info.get("reason", ""),
                         "report_type": info.get("report_type"),
@@ -4983,6 +5045,7 @@ class Handler(BaseHTTPRequestHandler):
                 "contact_appeal": get_contact_appeal(),
                 "banned": banned,
                 "blocked_window": blocked_window_meta(tally),
+                "name_resolution_error": name_resolution_error,
             })
             return
 

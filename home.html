@@ -715,6 +715,11 @@ function renderFeed(data) {
   // Buffer is oldest-first from the server; reverse for newest-first default
   // then apply the active column sort (default time desc matches that).
   var all = (data.events || []).slice().reverse();
+  // The feed buffer is small (a few hundred rows, LIVE_RECENT_MAX/
+  // LIVE_EPHEMERAL_MAX-bounded) — unlike users.html's 50,000-row table,
+  // ensuring npub for every row here up front (not just the RENDER_MAX
+  // shown) is cheap, and lets search/sort below read ev.npub directly.
+  all.forEach(s86EnsureNpub);
   syncKindOptions(all);
   var filtered = all.filter(matchesFilters);
   var sorted = s86SortRows(filtered, FEED_SORT[sortField] || FEED_SORT.time, sortDir);
@@ -755,9 +760,7 @@ function renderFeed(data) {
     s86DataLabel(kindTd, 'Kind');
     tr.appendChild(kindTd);
 
-    tr.appendChild(s86BuildIdentityCell({
-      pubkey: ev.pubkey, npub: ev.npub, name: null, nip05: null
-    }, isAdmin, 'Author'));
+    tr.appendChild(s86BuildIdentityCell(ev, isAdmin, 'Author'));
 
     var contentTd = s86El('td', contentPreview(ev.content), 'clip');
     contentTd.title = ev.content || '';

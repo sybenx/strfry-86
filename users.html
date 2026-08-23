@@ -764,9 +764,9 @@ function cmpStrEmptyLast(a, b) {
 }
 
 var SORT_COMPARATORS = {
-  // a.npub/b.npub are only populated for rows already rendered once (lazy
-  // encode, see renderUsers) — this fallback still works, it just falls
-  // through to pubkey for never-rendered rows.
+  // a.npub/b.npub are only populated for rows already rendered once
+  // (s86EnsureNpub, common86.js, called from renderUsers) — this fallback
+  // still works, it just falls through to pubkey for never-rendered rows.
   user: function (a, b) {
     return cmpStrEmptyLast(
       (a.name || a.nip05 || a.npub || a.pubkey || '').toLowerCase(),
@@ -898,10 +898,10 @@ function renderUsers() {
   var tbody = document.createElement('tbody');
   currentRenderedRows.forEach(function (r) {
     // Only rendered rows (RENDER_MAX-bounded) ever pay the encode cost —
-    // never all 50,000 rows on load.
-    if (!r.npub) {
-      r.npub = s86HexToNpub(r.pubkey);
-    }
+    // never all 50,000 rows on load. s86EnsureNpub (common86.js) is the one
+    // shared place that does it; called here (not just inside the identity
+    // cell below) so the aria-label a few lines down sees the same value.
+    s86EnsureNpub(r);
     var tr = document.createElement('tr');
     tr.setAttribute('data-pubkey', r.pubkey);
 

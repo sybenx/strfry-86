@@ -629,6 +629,9 @@ function cmpStrEmptyLast(a, b) {
 }
 
 var BAN_SORT = {
+  // a.npub/b.npub are only populated for rows already rendered once
+  // (s86EnsureNpub, common86.js, called from renderBans) — this fallback
+  // still works, it just falls through to pubkey for never-rendered rows.
   user: function (a, b) {
     return cmpStrEmptyLast(
       (a.name || a.nip05 || a.npub || a.pubkey || '').toLowerCase(),
@@ -679,13 +682,20 @@ function updateBulkReasonButtons() {
   bulkReasonAppendBtn.disabled = disabled;
 }
 
-function matchesQuery(ban, q) {
+// Bans never carry npub from the server (see server86.py's /api/banned) and
+// it is never encoded just to search a possibly-large list — an npub1...
+// query is decoded once (below, outside the per-row loop) and matched
+// against ban.pubkey instead, same pattern as users.html.
+function matchesQuery(ban, q, queryNpubHex) {
   if (!q) {
     return true;
   }
+  if (queryNpubHex) {
+    return ban.pubkey === queryNpubHex;
+  }
   return [
     ban.name, ban.nip05, s86Nip05Domain(ban.nip05),
-    ban.npub, ban.pubkey, ban.reason, ban.report_type,
+    ban.pubkey, ban.reason, ban.report_type,
     ban.blocked != null ? String(ban.blocked) : '',
     ban.banned_at ? s86FormatDate(ban.banned_at) : '',
     ban.banned_at ? s86FormatRelativeAge(ban.banned_at) : ''
@@ -738,7 +748,8 @@ function renderBans(banned) {
   renderBlockedWindowNote();
 
   var q = filterInput.value.trim().toLowerCase();
-  var filtered = banned.filter(function (b) { return matchesQuery(b, q); });
+  var queryNpubHex = q.indexOf('npub1') === 0 ? s86NpubToHex(q) : null;
+  var filtered = banned.filter(function (b) { return matchesQuery(b, q, queryNpubHex); });
   var sorted = s86SortRows(filtered, BAN_SORT[sortField] || BAN_SORT.banned_at, sortDir);
   var truncation = s86TruncateForRender(sorted, S86_RENDER_MAX);
 
@@ -764,6 +775,10 @@ function renderBans(banned) {
     table.appendChild(s86BuildSortableTableHead(headCols, { field: sortField, dir: sortDir }, setBanSort));
     var tbody = document.createElement('tbody');
     truncation.shown.forEach(function (ban) {
+      // Populate ban.npub before the aria-label below reads it — same
+      // shared lazy encode the identity cell a few lines down would do on
+      // its own, called early so both see the same value.
+      s86EnsureNpub(ban);
       var tr = document.createElement('tr');
       if (isAdmin) {
         var boxTd = s86El('td', null, 'pick');

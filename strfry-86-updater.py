@@ -15,6 +15,7 @@ run (a clean no-op — nothing to fetch means nothing has changed).
 See README.md for the one-command curl install and the offline install.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -900,7 +901,20 @@ def edit_strfry_conf():
     tmp_path = conf_path + ".tmp"
     with open(tmp_path, "w", newline="") as f:
         f.write(new_content)
-    os.replace(tmp_path, conf_path)
+    try:
+        os.replace(tmp_path, conf_path)
+    except OSError as e:
+        # A single-file bind mount (Docker: `-v host/strfry.conf:/etc/strfry.conf`,
+        # confirmed against a real container) refuses to have its mountpoint
+        # replaced — os.replace raises EBUSY here even though writing the
+        # file's CONTENTS in place is fine. Fall back to that: not atomic
+        # against a mid-write crash, but the .bak above already exists, and
+        # this is the only way to land the edit at all on that layout.
+        if e.errno != errno.EBUSY:
+            raise
+        with open(conf_path, "w", newline="") as f:
+            f.write(new_content)
+        os.remove(tmp_path)
 
     if appended_block:
         print("strfry.conf: no writePolicy block found — appended a new one inside relay{}.")

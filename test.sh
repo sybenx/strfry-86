@@ -726,7 +726,7 @@ server86.compute_subscribers = _orig_compute_subscribers
 # (recipient), never the event's own single-use `pubkey` (sender)
 _orig_streaming = server86.run_strfry_scan_streaming
 _orig_resolve_profiles = server86.resolve_profiles
-server86.resolve_profiles = lambda pks: {}
+server86.resolve_profiles = lambda pks: ({}, None)
 
 
 def _streaming_recipients(filter_obj, on_event, timeout, on_progress=None):
@@ -743,9 +743,10 @@ def _streaming_recipients(filter_obj, on_event, timeout, on_progress=None):
 
 server86.run_strfry_scan_streaming = _streaming_recipients
 recipients_result = server86.compute_recipients()
-check(recipients_result["recipients"] == [{"pubkey": "f" * 64, "npub": server86.bech32.npub_encode("f" * 64),
+check(recipients_result["recipients"] == [{"pubkey": "f" * 64,
                                             "name": None, "nip05": None, "count": 2}],
-      "compute_recipients tallies the `p` tag (recipient), never the gift wrap's own single-use pubkey")
+      "compute_recipients tallies the `p` tag (recipient), never the gift wrap's own single-use pubkey "
+      "(and no longer carries npub — the client encodes that lazily)")
 check(recipients_result["span_start"] == 100 and recipients_result["span_end"] == 200,
       "compute_recipients reports the actual span of created_at seen")
 server86.run_strfry_scan_streaming = _orig_streaming
@@ -879,8 +880,9 @@ server86._live_poll_tick()
 check(server86._live_error is None and len(server86._live_recent_durable) == 2,
       "_live_poll_tick folds durable events into the durable ring")
 _ring_keys = set(server86._live_recent_durable[0].keys())
-check(_ring_keys == {"id", "kind", "created_at", "pubkey", "npub", "content", "result", "msg"},
-      "_live_poll_tick keeps the public feed fields (author + content; CLAUDE.md `/`)")
+check(_ring_keys == {"id", "kind", "created_at", "pubkey", "name", "nip05", "content", "result", "msg"},
+      "_live_poll_tick keeps the public feed fields (author + content; CLAUDE.md `/`) — "
+      "no npub, the client encodes that lazily now")
 check(server86._live_recent_durable[0]["pubkey"] == _pk_b
       and server86._live_recent_durable[0]["content"] == "hello note",
       "the durable ring carries author and content for the landing-page feed")
@@ -1157,8 +1159,11 @@ try:
     check(_judged is True and _accepted == 1 and _blocked == 1,
           "the feed counts one accept and one block — a reject is visible nowhere else")
     _rejected = [r for r in _rows if r["result"] == "blocked"][0]
-    check(_rejected["content"] == "spam" and _rejected["npub"].startswith("npub1"),
-          "a blocked row still carries its content preview and an encoded npub")
+    check(_rejected["content"] == "spam" and "npub" not in _rejected,
+          "a blocked row still carries its content preview; npub is no longer sent — "
+          "the client encodes it lazily from pubkey")
+    check(_rejected["pubkey"] == _pk_bad and "name" in _rejected and "nip05" in _rejected,
+          "a blocked row carries pubkey plus name/nip05 keys (null here — nothing cached for this pubkey)")
 
     # The fallback: no decision log at all must NOT claim everything was
     # accepted. An event nothing judged is unknown, and rule 9 says unknown
@@ -1672,7 +1677,7 @@ server86.compute_profile = lambda pk: {"total_events": 7, "kinds": {}, "kinds_wi
                                         "kinds_saturated": False, "profile": None, "previews": [],
                                         "reports": [], "reports_saturated": False,
                                         "relay_list": None, "warning": None}
-server86.resolve_profiles = lambda pks: {pks[0]: {"name": "alice", "nip05": "alice@example.com"}}
+server86.resolve_profiles = lambda pks: ({pks[0]: {"name": "alice", "nip05": "alice@example.com"}}, None)
 
 with server86._scan_lock:
     server86._authors_cache = dict(server86._authors_cache)
@@ -1753,7 +1758,7 @@ server86.run_strfry_scan = _fake_scan_for_profile
 resolve_calls = []
 def _fake_resolve(pks):
     resolve_calls.append(list(pks))
-    return {reporter1: {"name": "Alice", "nip05": "alice@example.com"}}
+    return {reporter1: {"name": "Alice", "nip05": "alice@example.com"}}, None
 server86.resolve_profiles = _fake_resolve
 
 result = server86.compute_profile(profile_subject)
@@ -1962,11 +1967,11 @@ pk_stale = "8" * 64
 pk_no_nip05 = "9" * 64
 
 _orig_resolve_profiles2 = server86.resolve_profiles
-server86.resolve_profiles = lambda pks: {
+server86.resolve_profiles = lambda pks: ({
     pk_claims: {"name": "alice", "nip05": "alice@example.com"},
     pk_stale: {"name": "bob", "nip05": "bob@other-domain.com"},
     pk_no_nip05: {"name": "carol", "nip05": None},
-}
+}, None)
 
 with server86._scan_lock:
     server86._authors_cache = dict(server86._authors_cache)
@@ -2317,6 +2322,90 @@ check(all(r.get("giftwrap_count") is None for r in _ul_partial.get("rows") or []
 server86._authors_job["status"] = "idle"
 server86._authors_job["partial_authors"] = None
 server86.run_strfry_scan_streaming = _orig_streaming
+
+# --- get_userlist_snapshot(): a name resolved via ANY other path since the -
+# --- last author scan still shows up here, without a rescan ----------------
+_orig_namecache_get_many = server86.namecache.get_many
+_stale_pk = "d" * 64
+server86._authors_cache.clear()
+server86._authors_cache.update({**server86._empty_authors_result(), "scanned_at": 111,
+                                "authors": [{"pubkey": _stale_pk, "count": 5, "name": None, "nip05": None}]})
+server86.namecache.get_many = lambda pks: (
+    {_stale_pk: {"name": "dave", "nip05": "dave@example.com", "checked_at": 1, "source": "local"}}
+    if _stale_pk in pks else {}
+)
+_ul_fresh = server86.get_userlist_snapshot()
+_fresh_row = [r for r in _ul_fresh["rows"] if r["pubkey"] == _stale_pk][0]
+check(_fresh_row["name"] == "dave" and _fresh_row["nip05"] == "dave@example.com",
+      "get_userlist_snapshot joins names.json at read time — a name resolved by ANY path "
+      "since the last author scan shows up here without a rescan")
+server86.namecache.get_many = _orig_namecache_get_many
+
+# --- compute_authors(): a single-event author skipped by the resolution ---
+# --- scan still renders a name if one is already cached in names.json ------
+_single_pk = "e" * 64
+_multi_pk = "f" * 64
+
+
+def _streaming_singleton(filter_obj, on_event, timeout, on_progress=None):
+    on_event({"pubkey": _single_pk, "created_at": 100, "kind": 1})
+    on_event({"pubkey": _multi_pk, "created_at": 100, "kind": 1})
+    on_event({"pubkey": _multi_pk, "created_at": 200, "kind": 1})
+    return 3
+
+
+_orig_resolve_for_singleton = server86.resolve_profiles
+server86.resolve_profiles = lambda pks: ({pk: {"name": "multi", "nip05": None} for pk in pks}, None)
+server86.namecache.get_many = lambda pks: (
+    {_single_pk: {"name": "eve", "nip05": None, "checked_at": 1, "source": "local"}}
+    if _single_pk in pks else {}
+)
+server86.run_strfry_scan_streaming = _streaming_singleton
+server86.run_strfry_scan = lambda filter_obj, timeout=10: []  # empty reports pass
+_singleton_result = server86.compute_authors("recent", progress_cb=lambda c, total=None: None)
+_by_pk_singleton = {a["pubkey"]: a for a in _singleton_result["authors"]}
+check(_by_pk_singleton[_multi_pk]["name"] == "multi",
+      "compute_authors still resolves a name for an author with more than one event, as before")
+check(_by_pk_singleton[_single_pk]["name"] == "eve",
+      "compute_authors: a single-event author skipped by the resolution scan still renders a "
+      "name already cached in names.json (joined cache-only, no new scan)")
+server86.namecache.get_many = _orig_namecache_get_many
+server86.resolve_profiles = _orig_resolve_for_singleton
+server86.run_strfry_scan_streaming = _orig_streaming
+
+# --- _resolve_profiles_locally(): its own longer timeout budget, and a ------
+# --- scan failure is surfaced rather than cached as a false "not found" ----
+_orig_run_scan_for_names = server86.run_strfry_scan
+_timeout_pk = "1" * 64
+_seen_timeouts = []
+
+
+def _scan_records_timeout(filter_obj, timeout=None):
+    _seen_timeouts.append(timeout)
+    raise RuntimeError(f"strfry scan exceeded {timeout}s budget after reading 0 events")
+
+
+server86.run_strfry_scan = _scan_records_timeout
+server86.namecache.get_many = lambda pks: {}
+_resolved, _err = server86._resolve_profiles_locally([_timeout_pk])
+check(_seen_timeouts and _seen_timeouts[0] == server86.NAME_RESOLVE_SCAN_TIMEOUT,
+      "_resolve_profiles_locally gives the name-resolution scan its own NAME_RESOLVE_SCAN_TIMEOUT "
+      "budget, not the tighter default SCAN_TIMEOUT")
+check(_err is not None and "exceeded" in _err,
+      "_resolve_profiles_locally surfaces a scan failure as an error instead of swallowing it")
+check(_resolved[_timeout_pk] == {"name": None, "nip05": None},
+      "_resolve_profiles_locally still returns a (null) result for the caller even when the scan failed")
+
+_set_local_calls = []
+_orig_set_local = server86.namecache.set_local
+server86.namecache.set_local = lambda *a, **kw: _set_local_calls.append((a, kw))
+server86._resolve_profiles_locally([_timeout_pk])
+check(_set_local_calls == [],
+      "_resolve_profiles_locally does not cache a false 'checked, found nothing' for a batch whose "
+      "scan itself failed — that would look identical to an absent profile for NAME_CACHE_TTL")
+server86.namecache.set_local = _orig_set_local
+server86.namecache.get_many = _orig_namecache_get_many
+server86.run_strfry_scan = _orig_run_scan_for_names
 
 server86._recipients_cache.clear()
 server86._recipients_cache.update({**server86._empty_recipients_result(), "scanned_at": 777, "events_read": 9})
