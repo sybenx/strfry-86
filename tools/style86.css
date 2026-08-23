@@ -106,16 +106,14 @@ button.linky:hover:not(:disabled) { background:none; color:var(--accent); opacit
 .toolbar > input[type="search"], .toolbar > input[type="text"] { flex:1; min-width:12em; }
 .modes { display:flex; flex-direction:column; gap:.3em; }
 .modes label { display:flex; align-items:baseline; gap:.5em; font-size:.88rem; }
-dl.tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(11em, 1fr));
-           gap:1px; margin:1.2rem 0;
+/* Flex (not auto-fit grid): the 1px gap + --rule background paint the
+   hairlines between tiles the way they always did, without an empty
+   grid track in a short last row filling solid gray where no tile is. */
+dl.tiles { display:flex; flex-wrap:wrap; gap:1px; margin:1.2rem 0;
+           background:var(--rule);
            border:1px solid var(--rule); border-radius:10px; overflow:hidden; }
-/* Hairline lives on each tile, not the grid container: a container
-   background showing through the gaps would also fill any UNFILLED
-   tracks in a short last row (tile count rarely divides evenly into the
-   fitted column count), painting a blank colored block where no tile
-   exists. */
 dl.tiles .tile { background:var(--surface); padding:.9em 1em;
-                 box-shadow:inset 0 0 0 1px var(--rule); }
+                 flex:1 1 11em; min-width:0; }
 dl.tiles dt { font-size:.68rem; font-weight:600; text-transform:uppercase;
               letter-spacing:.08em; color:var(--muted); }
 dl.tiles dd { margin:.3rem 0 0; font-family:var(--serif); font-size:1.5rem;
