@@ -2912,6 +2912,7 @@ import builtins
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 
@@ -3035,7 +3036,7 @@ def scenario_conf_discovery_and_backup(tmpdir):
     os.makedirs(conf_dir)
     conf_path = os.path.join(conf_dir, "strfry.conf")
     with open(conf_path, "w") as f:
-        f.write('db = "./strfry-db/"\n')
+        f.write('db = "./strfry-db/"\n\nrelay {\n    port = 7777\n}\n')
     # Clear the pin so discovery walks candidates; inject our temp conf as the
     # only candidate that exists.
     orig_candidates = updater.STRFRY_CONF_CANDIDATES
@@ -3055,6 +3056,10 @@ def scenario_conf_discovery_and_backup(tmpdir):
             body = f.read()
         check(updater.PLUGIN_PATH in body,
               "updater wrote plugin86.py path into the resolved strfry.conf")
+        relay_start = body.index("relay {")
+        relay_end = body.rindex("}")
+        check(relay_start < body.index("writePolicy") < body.index(updater.PLUGIN_PATH) < relay_end,
+              "a missing writePolicy block is appended INSIDE relay{}, not as a second top-level block")
         baks = [n for n in os.listdir(conf_dir) if n.startswith("strfry.conf.bak-")]
         check(len(baks) == 1,
               "updater writes exactly one .bak when it actually edits the conf")
@@ -3076,7 +3081,7 @@ def scenario_conf_discovery_and_backup(tmpdir):
 def scenario_conf_override_from_config_json(tmpdir):
     conf_path = os.path.join(tmpdir, "custom-strfry.conf")
     with open(conf_path, "w") as f:
-        f.write('writePolicy {\n    plugin = ""\n}\n')
+        f.write('relay {\n    writePolicy {\n        plugin = ""\n    }\n}\n')
     cfg_path = os.path.join(tmpdir, "config.json")
     json.dump({
         "admin_pubkey_hex": ADMIN_HEX,
@@ -3100,6 +3105,217 @@ def scenario_conf_override_from_config_json(tmpdir):
         updater.STRFRY_CONF_CANDIDATES = orig_candidates
 
 
+# --- edit_strfry_conf(): a fixture per real-world strfry.conf shape --------
+# edit_strfry_conf() used to find the writePolicy block and its plugin line
+# with a narrow line-scan (same-line brace only, whole-line replacement).
+# It now tokenizes the whole file and splices only the offsets it needs to
+# change — these fixtures are the concrete shapes that scan used to get
+# wrong, plus the vendor default it used to leave silently unconfigured.
+
+def _write_conf(tmpdir, text, name="strfry.conf"):
+    path = os.path.join(tmpdir, name)
+    with open(path, "w") as f:
+        f.write(text)
+    updater.STRFRY_CONF_PATH = path
+    return path
+
+
+def _reparse(path):
+    """(dotted-path -> unquoted value) for every scalar field, or ({}, False)
+    if the file no longer parses at all. Parsing itself IS the balance
+    check — ConfParseError covers unbalanced/unterminated braces."""
+    try:
+        tree = updater._parse_conf_tree(updater._tokenize_conf(open(path).read()))
+    except updater.ConfParseError:
+        return {}, False
+    fields = {}
+    def walk(node, prefix):
+        for k, v in node.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if v[0] == "block":
+                walk(v[1], p)
+            else:
+                fields[p] = updater._conf_unquote(v[1])
+    walk(tree, "")
+    return fields, True
+
+
+def scenario_conf_same_line_block(tmpdir):
+    # writePolicy { plugin = "" } entirely on one line — whole-line
+    # replacement used to eat this block's own closing brace.
+    path = _write_conf(tmpdir, 'relay {\n    writePolicy { plugin = "" }\n}\n')
+    status, used = updater.edit_strfry_conf()
+    fields, balanced = _reparse(path)
+    check(status == "set" and balanced,
+          "same-line writePolicy block: edited, file stays balanced")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "same-line writePolicy block: plugin value actually lands under relay.writePolicy")
+
+
+def scenario_conf_allman_braces(tmpdir):
+    # '{' alone on the line after 'writePolicy' — the old same-line-only
+    # regex missed this and appended a second, top-level writePolicy block
+    # instead of using the real one.
+    path = _write_conf(
+        tmpdir, 'relay {\n    writePolicy\n    {\n        plugin = ""\n    }\n}\n')
+    status, used = updater.edit_strfry_conf()
+    body = open(path).read()
+    fields, balanced = _reparse(path)
+    check(status == "set" and balanced, "Allman-brace writePolicy: recognised and edited")
+    check(body.count("writePolicy") == 1,
+          "Allman-brace writePolicy: no second block appended alongside the real one")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "Allman-brace writePolicy: plugin value lands under relay.writePolicy, not top-level")
+
+
+def scenario_conf_one_line_empty_block(tmpdir):
+    # writePolicy {} — open and close brace adjacent, the old block_end ==
+    # block_start case inserted the plugin line OUTSIDE the block.
+    path = _write_conf(tmpdir, 'relay {\n    writePolicy {}\n}\n')
+    status, used = updater.edit_strfry_conf()
+    fields, balanced = _reparse(path)
+    check(status == "set" and balanced,
+          "one-line empty writePolicy{}: plugin inserted, file stays balanced")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "one-line empty writePolicy{}: plugin lands INSIDE the block, not after it")
+
+
+def scenario_conf_no_write_policy_block(tmpdir):
+    # relay{} exists, writePolicy{} does not — must be inserted INSIDE
+    # relay{}, never as a second top-level block (strfry only ever reads
+    # relay.writePolicy.plugin — a top-level key of that name is a no-op).
+    path = _write_conf(tmpdir, 'relay {\n    port = 7777\n}\n')
+    status, used = updater.edit_strfry_conf()
+    fields, balanced = _reparse(path)
+    check(status == "set" and balanced,
+          "missing writePolicy block: inserted, file stays balanced")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "missing writePolicy block: new block resolves under relay., not top-level")
+
+
+def scenario_conf_unterminated_block(tmpdir):
+    # A block that never closes must fail cleanly, not crash the run.
+    path = _write_conf(tmpdir, 'relay {\n    writePolicy {\n        plugin = ""\n')
+    before = open(path).read()
+    status, used = updater.edit_strfry_conf()
+    after = open(path).read()
+    check(isinstance(status, str) and status.startswith("conf parse error"),
+          "unterminated block: reported as a conf parse error, not a crash")
+    check(before == after, "unterminated block: file is left untouched")
+
+
+def scenario_conf_brace_in_comment(tmpdir):
+    # A '{' or '}' inside a '#' comment must not affect block-depth tracking.
+    path = _write_conf(
+        tmpdir,
+        'relay {\n    # a stray { brace and a } brace in a comment\n'
+        '    writePolicy {\n        plugin = ""\n    }\n}\n')
+    status, used = updater.edit_strfry_conf()
+    fields, balanced = _reparse(path)
+    check(status == "set" and balanced,
+          "brace inside a comment: does not confuse block-depth tracking")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "brace inside a comment: plugin still lands in the right block")
+
+
+def scenario_conf_hash_and_quotes_in_values(tmpdir):
+    # A '#' or brace inside a quoted VALUE elsewhere in the file must not be
+    # read as a comment or as structure, and must survive the edit intact.
+    path = _write_conf(
+        tmpdir,
+        'relay {\n'
+        '    info {\n'
+        '        description = "Relay for #bitcoin fans {test}"\n'
+        '    }\n'
+        '    writePolicy {\n        plugin = ""\n    }\n'
+        '}\n')
+    status, used = updater.edit_strfry_conf()
+    body = open(path).read()
+    check(status == "set", "quoted # and braces in an unrelated value: plugin still gets set")
+    check('description = "Relay for #bitcoin fans {test}"' in body,
+          "quoted # and braces in an unrelated value: that value is untouched by the edit")
+
+
+def scenario_conf_dockurr_default_replaced(tmpdir):
+    # dockurr/strfry's own shipped default (see KNOWN_DEFAULT_PLUGINS) — the
+    # old refuse-to-overwrite behaviour left the documented one-line install
+    # against that image silently unmoderated, reporting success.
+    path = _write_conf(
+        tmpdir,
+        'relay {\n    writePolicy {\n        plugin = "/app/write-policy.py"\n'
+        '        timeoutSeconds = 10\n    }\n}\n')
+    status, used = updater.edit_strfry_conf()
+    fields, balanced = _reparse(path)
+    check(status == "set",
+          "dockurr/strfry's known-default no-op plugin is replaced, not left in place")
+    check(fields.get("relay.writePolicy.plugin") == updater.PLUGIN_PATH,
+          "dockurr/strfry default: plugin86.py is actually wired in after the run")
+    check(fields.get("relay.writePolicy.timeoutSeconds") == "10",
+          "dockurr/strfry default: an unrelated sibling field survives the override")
+
+
+def scenario_conf_genuine_foreign_plugin_still_refused(tmpdir):
+    # An operator's own deliberate, non-default value must still be left
+    # alone — only KNOWN_DEFAULT_PLUGINS values get silently replaced.
+    path = _write_conf(
+        tmpdir, 'relay {\n    writePolicy {\n        plugin = "/my/own-policy.py"\n    }\n}\n')
+    before = open(path).read()
+    status, used = updater.edit_strfry_conf()
+    after = open(path).read()
+    check(status == "existing plugin left untouched",
+          "a genuinely foreign (non-default) plugin value is still refused, not overwritten")
+    check(before == after, "refusing a foreign plugin value writes nothing")
+
+
+# --- find_server86_pids(): matches the real process, not any argv that ----
+# --- happens to contain SERVER_SCRIPT as a substring -----------------------
+def scenario_find_server86_pids_exact_match_only(tmpdir):
+    proc_dir = os.path.join(tmpdir, "proc")
+    os.makedirs(proc_dir)
+
+    def make_proc(pid, args):
+        d = os.path.join(proc_dir, str(pid))
+        os.makedirs(d)
+        with open(os.path.join(d, "cmdline"), "wb") as f:
+            f.write(b"\x00".join(a.encode() for a in args) + b"\x00")
+
+    make_proc(100, ["python3", updater.SERVER_SCRIPT])           # the real thing
+    make_proc(200, ["nano", updater.SERVER_SCRIPT])               # editor, same path in argv
+    make_proc(300, ["python3", "/config/strfry86/plugin86.py"])   # unrelated python process
+
+    orig_proc_dir = updater.PROC_DIR
+    updater.PROC_DIR = proc_dir
+    try:
+        pids = updater.find_server86_pids()
+    finally:
+        updater.PROC_DIR = orig_proc_dir
+    check(pids == [100],
+          "find_server86_pids matches only a python process actually running SERVER_SCRIPT — "
+          "not `nano server86.py` or an unrelated python process, which a substring/membership "
+          "check on the whole argv also matched")
+
+
+# --- _server86_port_bound(): a restart is verified by the port, not a pid -
+def scenario_server86_port_bound_check(tmpdir):
+    cfg_path = os.path.join(tmpdir, "config.json")
+    orig_cfg = updater.CONFIG_JSON_PATH
+    updater.CONFIG_JSON_PATH = cfg_path
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    json.dump({"port": port, "bind": "127.0.0.1"}, open(cfg_path, "w"))
+    try:
+        check(updater._server86_port_bound() is True,
+              "_server86_port_bound: True while something is actually listening on the configured port")
+    finally:
+        srv.close()
+    check(updater._server86_port_bound() is False,
+          "_server86_port_bound: False once nothing is listening there any more — a PID existing "
+          "briefly after spawn is not, by itself, evidence the admin UI came up")
+    updater.CONFIG_JSON_PATH = orig_cfg
+
+
 with_tmp_install_dir(scenario_fresh)
 with_tmp_install_dir(scenario_missing_contact_only)
 with_tmp_install_dir(scenario_missing_both)
@@ -3107,6 +3323,17 @@ with_tmp_install_dir(scenario_nothing_missing)
 with_tmp_install_dir(scenario_noninteractive)
 with_tmp_install_dir(scenario_conf_discovery_and_backup)
 with_tmp_install_dir(scenario_conf_override_from_config_json)
+with_tmp_install_dir(scenario_conf_same_line_block)
+with_tmp_install_dir(scenario_conf_allman_braces)
+with_tmp_install_dir(scenario_conf_one_line_empty_block)
+with_tmp_install_dir(scenario_conf_no_write_policy_block)
+with_tmp_install_dir(scenario_conf_unterminated_block)
+with_tmp_install_dir(scenario_conf_brace_in_comment)
+with_tmp_install_dir(scenario_conf_hash_and_quotes_in_values)
+with_tmp_install_dir(scenario_conf_dockurr_default_replaced)
+with_tmp_install_dir(scenario_conf_genuine_foreign_plugin_still_refused)
+with_tmp_install_dir(scenario_find_server86_pids_exact_match_only)
+with_tmp_install_dir(scenario_server86_port_bound_check)
 PYEOF
 UPDATER_OUTPUT="$(python3 "$UPDATER_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
 echo "$UPDATER_OUTPUT"

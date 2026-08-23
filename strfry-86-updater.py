@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -41,6 +42,7 @@ SERVER_SCRIPT = "/config/strfry86/server86.py"
 # for the new one to come up before giving up and warning.
 SERVER_KILL_WAIT = 5.0
 SERVER_VERIFY_WAIT = 3.0
+PROC_DIR = "/proc"
 CONFIG_JSON_PATH = os.path.join(INSTALL_DIR, "config.json")
 LOCAL_MANIFEST_PATH = os.path.join(INSTALL_DIR, "manifest.json")
 DEFAULT_PORT = 8686
@@ -65,6 +67,14 @@ STRFRY_BIN_CANDIDATES = (
 
 # Files never managed by the manifest / never overwritten by updates.
 OPERATOR_OWNED = {"config.json", "blacklist.json"}
+
+# dockurr/strfry — the image the README's one-line install targets — ships
+# its own relay.writePolicy.plugin already set to this no-op script. The old
+# refuse-to-overwrite behavior left that documented install path completing
+# with a WARNING and moderation silently never wired in. These are not
+# values an operator wrote by hand, so they're safe to replace outright
+# (still backed up first, like any other change this function makes).
+KNOWN_DEFAULT_PLUGINS = {"/app/write-policy.py"}
 
 # Retention: housekeeping constants, not prompts or config keys.
 KEEP_CONF_BACKUPS = 3
@@ -664,49 +674,115 @@ def ensure_config():
 
 # --------------------------------------------------------------------------
 # strfry.conf edit
+#
+# A real strfry.conf whole-document parse, not a line-scan near where the
+# plugin line is expected to be. That line-scan approach broke on several
+# real shapes: a same-line `writePolicy { plugin = "" }` (rewriting the
+# whole matched line ate the block's own closing brace or the surrounding
+# relay{}'s), Allman-style `writePolicy` with `{` on its own following line
+# (not recognised at all, so the fallback appended a second, top-level
+# writePolicy block outside relay{} — a key strfry never reads), and an
+# unterminated block (crashed with TypeError instead of failing cleanly).
+# This tokenizes the whole file once, offsets included, and only ever
+# splices the original text at those offsets — comments, spacing and
+# everything else the operator wrote survives untouched, the same guarantee
+# server86.py's own apply_strfry_conf_edits() makes for the Settings page.
 # --------------------------------------------------------------------------
 
-def is_comment_line(line):
-    return line.strip().startswith("#")
+class ConfParseError(Exception):
+    pass
 
 
-def find_write_policy_block(lines):
-    depth = 0
-    block_start = None
-    block_end = None
-    for i, line in enumerate(lines):
-        if is_comment_line(line):
+_CONF_TOKEN_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*"'   # quoted string (escapes not interpreted, kept raw)
+    r'|[{}=]'              # structural characters
+    r'|[^\s{}=#"]+'        # bareword: identifier, number, true/false, ...
+)
+
+
+def _tokenize_conf(text):
+    """(token, start, end) triples over strfry.conf-shaped text. Whitespace
+    is skipped; '#' outside a quoted string starts a comment that runs to
+    end-of-line. A '#' or brace INSIDE a quoted string is not structural —
+    the quoted-string alternative in _CONF_TOKEN_RE is tried first and
+    consumes the whole literal, braces and all."""
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
             continue
-        if block_start is None:
-            m = re.match(r'^\s*writePolicy\s*\{', line)
-            if m:
-                block_start = i
-                depth = line.count("{") - line.count("}")
-                if depth <= 0:
-                    block_end = i
-                    break
+        if c == "#":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
             continue
-        depth += line.count("{") - line.count("}")
-        if depth <= 0:
-            block_end = i
-            break
-    return block_start, block_end
+        m = _CONF_TOKEN_RE.match(text, i)
+        if not m:
+            raise ConfParseError(f"unrecognized character {c!r} at offset {i}")
+        tokens.append((m.group(0), m.start(), m.end()))
+        i = m.end()
+    return tokens
 
 
-def find_plugin_line(lines, block_start, block_end):
-    if block_start is None:
-        return None, None
-    for i in range(block_start, block_end + 1):
-        if is_comment_line(lines[i]):
-            continue
-        m = re.search(r'plugin\s*=\s*"([^"]*)"', lines[i])
-        if m:
-            return i, m.group(1)
-    return None, None
+def _parse_conf_tree(tokens):
+    """Recursive-descent parse into a nested dict: each key maps to either
+    ('block', subtree, open_end, close_start) — open_end/close_start are the
+    text offsets just inside the block's '{' and just before its matching
+    '}', the two splice points an edit ever needs — or
+    ('value', raw_token, start, end). Raises ConfParseError on anything that
+    doesn't fit the key=value / key{...} grammar, including a block that
+    never closes, instead of a bare crash on malformed input."""
+    idx = 0
+
+    def parse_block(top_level):
+        nonlocal idx
+        node = {}
+        while idx < len(tokens):
+            tok, start, end = tokens[idx]
+            if tok == "}":
+                if top_level:
+                    raise ConfParseError(f"unexpected '}}' at offset {start}")
+                idx += 1
+                return node
+            key = tok
+            idx += 1
+            if idx >= len(tokens):
+                raise ConfParseError(f"unexpected end of file after '{key}'")
+            nxt, nstart, nend = tokens[idx]
+            if nxt == "{":
+                open_end = nend
+                idx += 1
+                child = parse_block(False)
+                close_start = tokens[idx - 1][1]  # the '}' just consumed
+                node[key] = ("block", child, open_end, close_start)
+            elif nxt == "=":
+                idx += 1
+                if idx >= len(tokens):
+                    raise ConfParseError(f"unexpected end of file after '{key} ='")
+                vtok, vstart, vend = tokens[idx]
+                idx += 1
+                node[key] = ("value", vtok, vstart, vend)
+            else:
+                raise ConfParseError(f"unexpected token {nxt!r} after '{key}'")
+        if not top_level:
+            raise ConfParseError("unterminated block — missing '}'")
+        return node
+
+    root = parse_block(top_level=True)
+    if idx != len(tokens):
+        raise ConfParseError("trailing tokens after top-level parse")
+    return root
+
+
+def _conf_unquote(vtok):
+    if vtok.startswith('"') and vtok.endswith('"') and len(vtok) >= 2:
+        return vtok[1:-1]
+    return vtok
 
 
 def edit_strfry_conf():
-    """Point writePolicy.plugin at plugin86.py.
+    """Point relay.writePolicy.plugin at plugin86.py.
 
     Returns (status, conf_path). conf_path is the file we resolved (even when
     missing or left untouched) so the caller can prune backups next to it;
@@ -724,20 +800,51 @@ def edit_strfry_conf():
     source = status.get("source") or "unknown"
     print(f"strfry.conf: using {conf_path} ({source})")
 
-    with open(conf_path, "r") as f:
+    # newline='' disables universal-newline translation on both read and
+    # write, so a file's own \r\n vs \n convention is read back verbatim
+    # instead of being silently collapsed to \n (which text mode's default
+    # translate-on-read does — the very thing the newline-detection below
+    # exists to preserve).
+    with open(conf_path, "r", newline="") as f:
         original = f.read()
-
     newline = "\r\n" if "\r\n" in original else "\n"
-    lines = original.splitlines(keepends=True)
 
-    block_start, block_end = find_write_policy_block(lines)
-    plugin_idx, plugin_value = find_plugin_line(lines, block_start, block_end)
+    try:
+        tokens = _tokenize_conf(original)
+        root = _parse_conf_tree(tokens)
+    except ConfParseError as e:
+        print(f"WARNING: strfry.conf failed to parse ({e}) — skipping strfry.conf edit.")
+        return f"conf parse error: {e}", conf_path
+
+    relay_entry = root.get("relay")
+    if relay_entry is None or relay_entry[0] != "block":
+        print("WARNING: strfry.conf has no relay{} block — skipping strfry.conf edit.")
+        return "no relay block", conf_path
+    _, relay_children, relay_open_end, relay_close_start = relay_entry
+
+    wp_entry = relay_children.get("writePolicy")
+    if wp_entry is not None and wp_entry[0] != "block":
+        print("WARNING: strfry.conf's writePolicy is not a block — skipping strfry.conf edit.")
+        return "writePolicy is not a block", conf_path
+
+    if wp_entry is not None:
+        _, wp_children, wp_open_end, wp_close_start = wp_entry
+        plugin_entry = wp_children.get("plugin")
+    else:
+        plugin_entry = None
+
+    if plugin_entry is not None and plugin_entry[0] != "value":
+        print("WARNING: strfry.conf's writePolicy.plugin is not a value — skipping strfry.conf edit.")
+        return "plugin is not a value", conf_path
+
+    plugin_value = _conf_unquote(plugin_entry[1]) if plugin_entry is not None else None
 
     if plugin_value == PLUGIN_PATH:
         print("strfry.conf: writePolicy.plugin already set to strfry-86 — no changes made.")
         return "already configured", conf_path
 
-    if plugin_value not in (None, ""):
+    replacing_default = plugin_value in KNOWN_DEFAULT_PLUGINS
+    if plugin_value not in (None, "") and not replacing_default:
         print(
             f"WARNING: strfry.conf writePolicy.plugin is already set to "
             f"'{plugin_value}' — NOT overwriting. Configure manually if you "
@@ -745,39 +852,63 @@ def edit_strfry_conf():
         )
         return "existing plugin left untouched", conf_path
 
-    new_line = f'    plugin = "{PLUGIN_PATH}"{newline}'
-
-    new_lines = list(lines)
+    new_plugin_value = f'"{PLUGIN_PATH}"'
     appended_block = False
-    if plugin_idx is not None:
-        new_lines[plugin_idx] = new_line
-    elif block_start is not None:
-        new_lines.insert(block_end, new_line)
+    if plugin_entry is not None:
+        # Splice only the value token — everything else on and around this
+        # line (indentation, trailing comment) is untouched.
+        _, _, vstart, vend = plugin_entry
+        new_content = original[:vstart] + new_plugin_value + original[vend:]
+    elif wp_entry is not None:
+        # writePolicy{} exists but has no plugin key (e.g. `writePolicy {}`)
+        # — insert one just before its closing brace, wherever that is.
+        insert = f'{newline}        plugin = {new_plugin_value}{newline}    '
+        new_content = original[:wp_close_start] + insert + original[wp_close_start:]
     else:
-        if new_lines and not new_lines[-1].endswith(("\n", "\r\n")):
-            new_lines[-1] = new_lines[-1] + newline
-        new_lines.append(newline)
-        new_lines.append(f"writePolicy {{{newline}")
-        new_lines.append(new_line)
-        new_lines.append(f"}}{newline}")
+        # No writePolicy block at all — insert a whole new one just before
+        # relay{}'s own closing brace, so it lands inside relay{} regardless
+        # of whether relay{} (or anything else in the file) uses K&R or
+        # Allman brace style; nothing here depends on line layout.
+        insert = (
+            f'{newline}    writePolicy {{{newline}'
+            f'        plugin = {new_plugin_value}{newline}'
+            f'    }}{newline}'
+        )
+        new_content = original[:relay_close_start] + insert + original[relay_close_start:]
         appended_block = True
 
-    new_content = "".join(new_lines)
     if new_content == original:
-        # Byte-identical — no backup, no write. The only path that may write
-        # a .bak is the one that actually changes the file below.
         print("strfry.conf: writePolicy.plugin already set to strfry-86 — no changes made.")
         return "already configured", conf_path
+
+    # Re-parse the edited text before it ever touches disk. The splices
+    # above only ever insert well-formed, self-balanced fragments or replace
+    # a brace-free value token, so this should never fail — it's the same
+    # defense-in-depth server86.py's write_strfry_conf() applies: never
+    # trust an edit was correct just because the code that produced it looks
+    # right.
+    try:
+        _parse_conf_tree(_tokenize_conf(new_content))
+    except ConfParseError as e:
+        print(f"WARNING: edited strfry.conf failed to reparse ({e}) — nothing written.")
+        return f"internal error: edit failed to reparse ({e})", conf_path
 
     backup_path = f"{conf_path}.bak-{int(time.time())}"
     shutil.copy2(conf_path, backup_path)
     print(f"strfry.conf backed up to {backup_path}")
 
-    with open(conf_path, "w") as f:
+    tmp_path = conf_path + ".tmp"
+    with open(tmp_path, "w", newline="") as f:
         f.write(new_content)
+    os.replace(tmp_path, conf_path)
 
     if appended_block:
-        print("strfry.conf: no writePolicy block found — appended a new one.")
+        print("strfry.conf: no writePolicy block found — appended a new one inside relay{}.")
+    if replacing_default:
+        print(
+            f"strfry.conf: replaced known-default no-op plugin '{plugin_value}' "
+            f"with {PLUGIN_PATH}"
+        )
     print(f"strfry.conf: writePolicy.plugin set to {PLUGIN_PATH}")
     return "set", conf_path
 
@@ -793,22 +924,50 @@ def chmod_plugin():
 
 
 def find_server86_pids():
-    proc_dir = "/proc"
-    if not os.path.isdir(proc_dir):
+    """PIDs of processes actually running SERVER_SCRIPT under a python
+    interpreter — not just any process whose argv happens to contain that
+    path as a substring, which previously matched e.g. `nano
+    /config/strfry86/server86.py` open in another shell and killed it."""
+    if not os.path.isdir(PROC_DIR):
         return []
     pids = []
-    for entry in os.listdir(proc_dir):
+    for entry in os.listdir(PROC_DIR):
         if not entry.isdigit():
             continue
-        cmdline_path = os.path.join(proc_dir, entry, "cmdline")
+        cmdline_path = os.path.join(PROC_DIR, entry, "cmdline")
         try:
             with open(cmdline_path, "rb") as f:
-                cmdline = f.read().decode("utf-8", errors="replace")
+                args = [a.decode("utf-8", errors="replace")
+                        for a in f.read().split(b"\x00") if a]
         except OSError:
             continue
-        if "server86.py" in cmdline:
-            pids.append(int(entry))
+        if len(args) < 2 or SERVER_SCRIPT not in args[1:]:
+            continue
+        if not os.path.basename(args[0]).startswith("python"):
+            continue
+        pids.append(int(entry))
     return pids
+
+
+def _server86_port_bound():
+    """True if something is actively accepting on the configured admin
+    port. server86.py exits 0 silently on EADDRINUSE and on any startup
+    crash (main(), server86.py ~5556), so a PID existing for a moment after
+    spawn is not evidence the admin UI actually came up — only a bound
+    port is."""
+    try:
+        with open(CONFIG_JSON_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        cfg = {}
+    port = cfg.get("port", DEFAULT_PORT)
+    bind = cfg.get("bind", DEFAULT_BIND)
+    host = "127.0.0.1" if bind in ("0.0.0.0", "", None) else bind
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 def restart_server86():
@@ -862,7 +1021,7 @@ def restart_server86():
 
     verify_deadline = time.monotonic() + SERVER_VERIFY_WAIT
     while time.monotonic() < verify_deadline:
-        if find_server86_pids():
+        if find_server86_pids() and _server86_port_bound():
             return "restarted"
         time.sleep(0.2)
     return "did NOT come back up — check stderr"
@@ -951,11 +1110,17 @@ def main():
 
     installed, updated, unchanged = sync_files(manifest, fetch_bytes, source_label)
 
+    # Must happen right after sync, before ensure_config(): sync_files()
+    # writes plugin86.py via a fresh temp file + os.replace, so the old
+    # inode's exec bit is gone the moment it lands. ensure_config() can then
+    # block indefinitely on an interactive prompt — strfry re-execs its
+    # write-policy plugin on mtime change and needs it executable the whole
+    # time this run is in progress, not just once main() finishes.
+    chmod_plugin()
+
     config_status = ensure_config()
 
     conf_status, conf_path = edit_strfry_conf()
-
-    chmod_plugin()
 
     restart_status = restart_server86()
     if restart_status == "restarted":

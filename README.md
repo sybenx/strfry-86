@@ -129,6 +129,8 @@ The updater finds `strfry.conf` the same way the admin UI does: an explicit `str
 
 A backup is written next to that file as `strfry.conf.bak-<unix-timestamp>` **only when the run actually changes the file** (sets `writePolicy.plugin`). Already-configured and refused-overwrite runs write nothing. The updater keeps the 3 newest backups and the 1 newest applied bundle, pruning older ones after each successful run. Files you've renamed by hand are never touched.
 
+If `writePolicy.plugin` is already set to something else, the updater normally leaves it alone and warns rather than clobbering a deliberate choice — with one exception: `dockurr/strfry`'s own shipped default (`/app/write-policy.py`, a no-op) is recognized and replaced outright, backed up first like any other change. Without that, the documented one-line install against that image would complete and print success while moderation stayed silently off.
+
 ## Trust model
 
 The updater executes code fetched from this repo's `main` branch on every run — don't point it at someone else's fork unless you trust it as much as you'd trust running their code directly.
