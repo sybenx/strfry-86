@@ -2070,6 +2070,50 @@ check(server86._active_scan["name"] is None,
 server86.run_strfry_count = _orig_run_strfry_count
 server86.run_strfry_scan_streaming = _orig_streaming
 
+# The REAL streaming function against a child that emits NOTHING. Every test
+# above mocks run_strfry_scan_streaming, so none of them exercise its deadline.
+# The budget used to be checked only inside `for raw_line in proc.stdout`, which
+# blocks in the read — so a silent strfry (pre-output index merge, or a stall on
+# LMDB contention) was never checked, the job never ended, and because the caller
+# holds the global lock for the whole call, every other scan/purge/console was
+# blocked until restart.
+_orig_bin = server86.require_strfry_bin
+_orig_conf_fn = server86.require_strfry_conf
+_orig_cwd_fn = server86.get_relay_cwd
+_orig_popen_real = server86.subprocess.Popen
+server86.require_strfry_bin = lambda: sys.executable
+server86.require_strfry_conf = lambda: os.devnull
+server86.get_relay_cwd = lambda: None
+server86.subprocess.Popen = lambda argv, **kw: _orig_popen_real(
+    [sys.executable, "-c", "import time; time.sleep(60)"], **kw)
+_silent = {}
+
+
+def _run_silent():
+    _t0 = _time.monotonic()
+    try:
+        server86.run_strfry_scan_streaming({}, lambda e: None, timeout=1)
+        _silent["outcome"] = "returned"
+    except RuntimeError as e:
+        _silent["outcome"] = str(e)
+    _silent["elapsed"] = _time.monotonic() - _t0
+
+
+import threading as _threading_silent
+_silent_thread = _threading_silent.Thread(target=_run_silent, daemon=True)
+_silent_thread.start()
+_silent_thread.join(timeout=15)
+check(not _silent_thread.is_alive(),
+      "a strfry that emits NOTHING still hits its wall-clock budget — it cannot block forever holding the global lock")
+check("exceeded" in _silent.get("outcome", ""),
+      "a silent strfry stall is reported as a budget overrun, not as a normal return")
+check(_silent.get("elapsed", 99) < 10,
+      "the budget fires near its deadline rather than whenever output happens to arrive")
+server86.require_strfry_bin = _orig_bin
+server86.require_strfry_conf = _orig_conf_fn
+server86.get_relay_cwd = _orig_cwd_fn
+server86.subprocess.Popen = _orig_popen_real
+
 # 'failed' is not 'result', for the other two async scans too (authors,
 # recipients) — same rule as the walk above: a scan that hit its deadline
 # preserves the PREVIOUS cache byte-identical (aside from `error`) and

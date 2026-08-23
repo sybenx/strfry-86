@@ -2068,9 +2068,31 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
 
     count = 0
     timed_out = False
+
+    # The budget MUST be enforced off a timer, not only off the read loop
+    # below. `for raw_line in proc.stdout` blocks inside the read, so a
+    # strfry that emits nothing — its pre-output index merge on a bounded
+    # multi-kind scan, or a genuine stall on LMDB contention — never reaches
+    # the in-loop check and the deadline never fires. The caller holds the
+    # global job lock for this whole call, so that wedges every other scan,
+    # both purges, compact and the console until server86 is restarted.
+    # Killing the child is what unblocks the read (it EOFs), so the timer
+    # kills rather than just flagging.
+    def on_deadline():
+        nonlocal timed_out
+        timed_out = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), on_deadline)
+    watchdog.daemon = True
+    watchdog.start()
+
     try:
         for raw_line in proc.stdout:
-            if time.monotonic() > deadline:
+            if timed_out or time.monotonic() > deadline:
                 timed_out = True
                 proc.kill()
                 break
@@ -2086,6 +2108,7 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
             if on_progress is not None and count % 500 == 0:
                 on_progress(count)
     finally:
+        watchdog.cancel()
         try:
             proc.stdout.close()
         except (OSError, ValueError):
