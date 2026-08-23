@@ -1,2 +1,14 @@
 __pycache__/
 *.pyc
+names.json
+names.json.lock
+*-cache.json
+author-mode-durations.json
+audit-log.json
+domain-bans.json
+decisions.jsonl
+decisions.jsonl.1
+blacklist.json
+config.json
+server86.log
+.DS_Store
