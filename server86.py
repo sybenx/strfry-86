@@ -233,7 +233,13 @@ _scan_lock = threading.Lock()
 _active_scan = {"name": None}
 _JOB_REGISTRY = {}  # populated once every job dict below has been created
 
-_authors_job = {"status": "idle", "mode": None, "started_at": None, "progress": None, "total": None, "rate": None, "eta": None}
+_authors_job = {
+    "status": "idle", "mode": None, "started_at": None,
+    "progress": None, "total": None, "rate": None, "eta": None,
+    # Mid-scan top authors for the Users table. Lives on the job, never on
+    # the persisted cache — a failed run must not look like a result (rule 6).
+    "partial_authors": None,
+}
 # _authors_cache is initialized after _load_cache_or()/_empty_authors_result() are defined below.
 
 CONTACT_APPEAL_CHECK_INTERVAL = 1.0
@@ -1711,11 +1717,23 @@ def get_userlist_snapshot():
     client can render — rather than inventing zeros. `giftwrap_count` is a
     FLOOR (render `≥ n`, rule per CLAUDE.md) whenever the recipients scan is
     saturated — RECIPIENT_SCAN_LIMIT is reached routinely (WHY.md §5), so
-    this is the common case, not an edge case."""
+    this is the common case, not an edge case.
+
+    While an author scan is running, `rows` come from the job's
+    `partial_authors` (top authors tallied so far) so the table can fill
+    during the scan; giftwrap/report columns stay null until the final
+    join. Partials never carry a `scanned_at` for this attempt."""
     authors_status = get_authors_status()
     recipients_status = get_recipients_status()
     reports_status = get_reports_status()
-    authors = authors_status.get("authors") or []
+    partial = (
+        authors_status.get("status") == "running"
+        and isinstance(authors_status.get("partial_authors"), list)
+    )
+    if partial:
+        authors = authors_status["partial_authors"]
+    else:
+        authors = authors_status.get("authors") or []
     recipients = recipients_status.get("recipients") or []
     recipient_counts = {r["pubkey"]: r.get("count") for r in recipients if isinstance(r, dict) and r.get("pubkey")}
     recipients_saturated = bool(recipients_status.get("saturated"))
@@ -1726,18 +1744,22 @@ def get_userlist_snapshot():
         if not isinstance(a, dict) or not a.get("pubkey"):
             continue
         pk = a["pubkey"]
+        # Partial rows use "count"; the finished cache uses "count" too on
+        # the authors cache, mapped to event_count for the table.
+        event_count = a.get("count") if a.get("count") is not None else a.get("event_count")
         rows.append({
             "pubkey": pk,
             "npub": a.get("npub"),
             "name": a.get("name"),
             "nip05": a.get("nip05"),
-            "event_count": a.get("count"),
+            "event_count": event_count,
             "last_seen": a.get("last_seen"),
-            "giftwrap_count": recipient_counts.get(pk),
-            "reporters": report_counts.get(pk),
+            "giftwrap_count": None if partial else recipient_counts.get(pk),
+            "reporters": a.get("reporters") if partial else report_counts.get(pk),
         })
     return {
         "rows": rows,
+        "authors_partial": partial,
         "authors_scanned_at": authors_status.get("scanned_at"),
         "authors_error": authors_status.get("error"),
         "authors_modes": authors_status.get("modes"),
@@ -2932,6 +2954,8 @@ def _run_scan_job(name, job, cache, cache_path, compute_fn):
             job["total"] = None
             job["rate"] = None
             job["eta"] = None
+            if "partial_authors" in job:
+                job["partial_authors"] = None
             _active_scan["name"] = None
         return
 
@@ -2948,6 +2972,8 @@ def _run_scan_job(name, job, cache, cache_path, compute_fn):
         job["total"] = None
         job["rate"] = None
         job["eta"] = None
+        if "partial_authors" in job:
+            job["partial_authors"] = None
         _active_scan["name"] = None
 
 
@@ -3037,6 +3063,10 @@ def _start_scan_job(name, job, run_target, extra_job_fields=None, on_started=Non
             "status": "running", "started_at": int(time.time()),
             "progress": 0, "total": None, "rate": None, "eta": None,
         })
+        if name == "authors":
+            # Empty list (not None) so the client can start painting an empty
+            # table immediately; None means "not a streaming scan".
+            job["partial_authors"] = []
         if extra_job_fields:
             job.update(extra_job_fields)
         status = dict(job)
@@ -3068,12 +3098,59 @@ def _scan_status(name, job, cache):
     return cached
 
 
+def _publish_authors_partial(tally, force=False, _state=None):
+    """Publish the current top-RENDER_MAX authors onto `_authors_job` for
+    the Users table to stream while the scan is still running.
+
+    Lives only on the job dict — never the persisted authors cache and
+    never stamped with scanned_at. Throttled to ~1.5s between publishes
+    so a full-list tally is not fully sorted on every 500-event progress
+    tick; `force=True` always publishes (stream end)."""
+    if _state is None:
+        _state = {"last_at": 0.0}
+    now = time.monotonic()
+    if not force and (now - _state["last_at"]) < 1.5:
+        return
+    _state["last_at"] = now
+    # Rank by count only mid-scan — the reports pass has not run yet, so
+    # reporters is always null here (rule 9: unknown, not 0).
+    ranked = sorted(
+        ((pk, e) for pk, e in tally.items() if is_hex64(pk)),
+        key=lambda kv: kv[1]["count"],
+        reverse=True,
+    )[:RENDER_MAX]
+    partial = []
+    for pk, entry in ranked:
+        try:
+            npub = bech32.npub_encode(pk)
+        except (ValueError, TypeError):
+            continue
+        partial.append({
+            "pubkey": pk,
+            "npub": npub,
+            "name": None,
+            "nip05": None,
+            "count": entry["count"],
+            "last_seen": entry["last_seen"],
+            "reporters": None,
+        })
+    with _scan_lock:
+        if _authors_job.get("status") != "running":
+            return
+        _authors_job["partial_authors"] = partial
+
+
 def compute_authors(mode, progress_cb=None):
     """One bounded scan of AUTHOR_SCAN_MODES[mode], tallied per author and
     per kind while streaming — no list of event bodies is ever held in
     full. Depends on NIP-01 `limit` returning the newest matching events
     first, as documented; verify that against the deployed strfry version
     before relying on it.
+
+    While streaming, the top RENDER_MAX authors by count so far are
+    published onto `_authors_job["partial_authors"]` so GET /api/authors
+    and /api/userlist can fill the Users table mid-scan. Partials never
+    touch the persisted cache.
 
     A second, independent scan tallies DISTINCT reporters per pubkey from
     recent kind-1984 reports — never itself grounds for a ban, a signal to
@@ -3090,6 +3167,7 @@ def compute_authors(mode, progress_cb=None):
     tally = {}  # pubkey -> {"count": int, "last_seen": int, "kind": int_or_None}
     kind_counts = {}
     span = {"start": None, "end": None}
+    partial_state = {"last_at": 0.0}
 
     def on_event(ev):
         if not isinstance(ev, dict):
@@ -3114,7 +3192,15 @@ def compute_authors(mode, progress_cb=None):
         if span["end"] is None or created_at > span["end"]:
             span["end"] = created_at
 
-    events_read = run_strfry_scan_streaming(filter_obj, on_event, timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb)
+    def on_progress(count, total=None):
+        if progress_cb:
+            progress_cb(count, total=total)
+        _publish_authors_partial(tally, force=False, _state=partial_state)
+
+    events_read = run_strfry_scan_streaming(
+        filter_obj, on_event, timeout=AUTHOR_SCAN_DEADLINE, on_progress=on_progress,
+    )
+    _publish_authors_partial(tally, force=True, _state=partial_state)
     saturated = events_read >= limit
 
     singleton_kinds = {}

@@ -2129,6 +2129,64 @@ check(server86._authors_cache["scanned_at"] == 555 and server86._authors_cache["
       "a failed author scan preserves the PREVIOUS cache byte-identical, never a partial")
 check(server86._authors_cache.get("error") is not None,
       "a failed author scan attaches an error (not a warning) to the authors cache, and no rendered result claims to be this attempt's")
+check(server86._authors_job.get("partial_authors") is None,
+      "a failed author scan clears partial_authors — mid-scan rows never become the result")
+server86.run_strfry_scan_streaming = _orig_streaming
+
+# Mid-scan partial_authors: the Users table streams top authors without
+# touching the persisted cache or scanned_at.
+_partial_pk_hi = "a" * 64
+_partial_pk_lo = "b" * 64
+_partial_events = [
+    {"pubkey": _partial_pk_hi, "created_at": 100 + i, "kind": 1}
+    for i in range(10)
+] + [
+    {"pubkey": _partial_pk_lo, "created_at": 50, "kind": 1},
+]
+
+
+def _streaming_partial(filter_obj, on_event, timeout, on_progress=None):
+    for i, ev in enumerate(_partial_events):
+        on_event(ev)
+        if on_progress is not None and (i + 1) % 5 == 0:
+            on_progress(i + 1)
+    if on_progress is not None:
+        on_progress(len(_partial_events))
+    return len(_partial_events)
+
+
+server86._authors_cache.clear()
+server86._authors_cache.update({**server86._empty_authors_result(), "scanned_at": 999, "events_read": 7,
+                                "authors": [{"pubkey": "c" * 64, "npub": "npub1x", "count": 1}]})
+server86._authors_job.update({
+    "status": "running", "mode": "recent", "started_at": int(_time.time()),
+    "progress": 0, "total": 20000, "rate": None, "eta": None, "partial_authors": [],
+})
+server86.run_strfry_scan_streaming = _streaming_partial
+server86.run_strfry_scan = lambda filter_obj, timeout=10: []  # empty reports pass
+_partial_result = server86.compute_authors("recent", progress_cb=lambda c, total=None: None)
+check(server86._authors_cache["scanned_at"] == 999,
+      "compute_authors mid-scan publish never mutates the persisted authors cache")
+# After compute_authors returns, the job is still "running" from our setup —
+# the last forced publish should still be on the job until _run_scan_job clears it.
+check(isinstance(server86._authors_job.get("partial_authors"), list)
+      and len(server86._authors_job["partial_authors"]) >= 1,
+      "compute_authors publishes partial_authors onto the job during the stream")
+_top = server86._authors_job["partial_authors"][0]
+check(_top["pubkey"] == _partial_pk_hi and _top["count"] == 10 and _top["name"] is None
+      and _top["reporters"] is None,
+      "partial_authors ranks by count, omits names/reporters (fill in on completion)")
+# Simulate running status merge for userlist
+server86._authors_job["status"] = "running"
+_ul_partial = server86.get_userlist_snapshot()
+check(_ul_partial.get("authors_partial") is True
+      and any(r.get("pubkey") == _partial_pk_hi for r in _ul_partial.get("rows") or []),
+      "GET /api/userlist streams partial author rows while the scan is running")
+check(all(r.get("giftwrap_count") is None for r in _ul_partial.get("rows") or []),
+      "partial userlist rows leave giftwrap null until the final join")
+# Success path: _run_scan_job would clear partial; assert helper leave-clean
+server86._authors_job["status"] = "idle"
+server86._authors_job["partial_authors"] = None
 server86.run_strfry_scan_streaming = _orig_streaming
 
 server86._recipients_cache.clear()

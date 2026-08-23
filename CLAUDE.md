@@ -168,8 +168,10 @@ Columns: User (identity dot + best label) · NIP-05 · Events · Reports · Gift
 relay, never a developer-relay number.
 - Logged out: heading, header, login button only — no list, no control, no filter.
 - Rows come from `GET /api/userlist` (the join of the authors, recipients and reports
-  caches). Unknown cells render `—` and fill in as scans answer (rule 9). Search is
-  client-side over ALL rows, instant, no debounce fetch.
+  caches). While an author scan is running, rows stream from `partial_authors` on
+  `GET /api/authors` (top authors by count so far; names/gift-wraps/reports stay `—`
+  until the scan finishes). Unknown cells render `—` and fill in as scans answer
+  (rule 9). Search is client-side over ALL rows, instant, no debounce fetch.
 - Gift-wrap column is a FLOOR while the recipient scan saturates: render `≥ n` and label
   the column header `(floor — scan capped)`. Never render a saturated count bare.
 - Report counts come from `POST /api/reports` (index count of kind 1984 per p-tag, cached).
@@ -252,9 +254,12 @@ older than itself. `test.sh` fails only on the single-kind alarm.
   Unset `relay_url` = `failed` per rule 6; fix lives in `config.json` via `/api/relay-url`
   on `/report` — never `strfry.conf`.
 - `GET /api/authors`: empty response starts nothing; carries `modes` with measured
-  durations (null until a run exists).
+  durations (null until a run exists). While a scan is `running`, also carries
+  `partial_authors` (top `RENDER_MAX` by count so far, no names/reporters) so the
+  Users table can stream; partials never stamp `scanned_at` or replace the cache.
 - `GET /api/audit` (paged, newest first) and `POST /api/undo` back `/audit`.
 - `GET /api/userlist`: carries `last_seen` per row (Last active); no `first_seen` exists.
+  While the author scan is running, `rows` are the partial tally (`authors_partial:true`).
 - `GET /api/metrics`: the six tiles. Cache reads and one `stat()` of the LMDB directory —
   never a scan. `events_per_sec` is null until two poll ticks have landed; `accept_rate`
   and `blocked` are null with no decision log. Nothing here is ever 0-by-default.

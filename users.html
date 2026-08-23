@@ -1060,6 +1060,43 @@ function stopPolling() {
   }
 }
 
+function partialAuthorsToRows(partial) {
+  return (partial || []).map(function (a) {
+    return {
+      pubkey: a.pubkey,
+      npub: a.npub,
+      name: a.name,
+      nip05: a.nip05,
+      event_count: a.count,
+      last_seen: a.last_seen,
+      giftwrap_count: null,
+      reporters: a.reporters
+    };
+  });
+}
+
+function applyPartialAuthors(data) {
+  // Stream the in-progress tally into the table. Gift-wrap / report
+  // columns stay — until the final userlist join after the scan ends.
+  if (!data || data.status !== 'running' || !Array.isArray(data.partial_authors)) {
+    return;
+  }
+  var prev = lastUserlist || {};
+  lastUserlist = {
+    rows: partialAuthorsToRows(data.partial_authors),
+    authors_partial: true,
+    authors_scanned_at: prev.authors_scanned_at,
+    authors_error: prev.authors_error,
+    authors_modes: data.modes || prev.authors_modes,
+    recipients_scanned_at: prev.recipients_scanned_at,
+    recipients_saturated: prev.recipients_saturated,
+    recipients_error: prev.recipients_error,
+    reports_scanned_at: prev.reports_scanned_at,
+    reports_error: prev.reports_error
+  };
+  renderUsers();
+}
+
 function applyAuthorsStatus(data) {
   lastAuthorsStatus = data;
   var running = data.status === 'running';
@@ -1068,9 +1105,15 @@ function applyAuthorsStatus(data) {
   scanBtn.disabled = running || blocked;
   updateScanButtonLabel();
   if (running || blocked) {
-    provenanceLine.textContent = s86ScanStatusText(data);
+    var progress = s86ScanStatusText(data);
+    if (running && Array.isArray(data.partial_authors) && data.partial_authors.length) {
+      progress += ' — showing top ' + data.partial_authors.length.toLocaleString()
+        + ' so far (names fill in when the scan finishes)';
+    }
+    provenanceLine.textContent = progress;
     emptyStateLine.textContent = '';
     compositionDetails.style.display = 'none';
+    applyPartialAuthors(data);
   } else {
     renderProvenance(data);
     renderComposition(data);
@@ -1085,9 +1128,10 @@ function pollAuthorsStatus() {
       var wasActive = prev.status === 'running' || !!prev.blocked_by;
       applyAuthorsStatus(data);
       // Keep polling while running OR blocked (same rule as s86PollStatus) —
-      // status alone is idle when waiting on another job.
+      // status alone is idle when waiting on another job. 1s while running
+      // so partial author rows feel live; 3s when only blocked.
       if (data.status === 'running' || data.blocked_by) {
-        pollTimer = setTimeout(pollAuthorsStatus, 3000);
+        pollTimer = setTimeout(pollAuthorsStatus, data.status === 'running' ? 1000 : 3000);
       } else {
         stopPolling();
         if (wasActive) {
