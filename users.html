@@ -711,13 +711,17 @@ function renderProvenance(data) {
     + ' (' + s86FormatRelativeAge(data.scanned_at) + ')'];
   if (data.saturated) {
     parts.push(data.mode === 'full'
-      ? 'SATURATED: relay has outgrown the full-list limit, this is a window, not a complete list'
+      ? 'ran out of time before finishing — see detail below (rare; the scan has a lot of headroom)'
       : 'window limit reached');
   }
   if (data.warning) {
     parts.push(data.warning);
   }
   var ul = lastUserlist || {};
+  if (ul.authors_kinds_stale) {
+    parts.push('the author-scan allowlist changed since this scan (a kind was added in Settings) — '
+      + 'this list does NOT include that kind yet; run a full scan to pick it up');
+  }
   if (ul.recipients_scanned_at) {
     parts.push('gift wraps ' + s86FormatRelativeAge(ul.recipients_scanned_at)
       + (ul.recipients_saturated ? ' — SATURATED, counts are floors' : ''));
@@ -770,7 +774,9 @@ function renderComposition(data) {
   compositionLine.appendChild(s86El('p', multiEvents.toLocaleString() + ' events from '
     + multiAuthors.toLocaleString() + ' authors who posted more than once'));
   if (data.reports_saturated) {
-    compositionLine.appendChild(s86El('p', 'report tally is a FLOOR — the 5,000-event cap was reached and older reports were not counted'));
+    compositionLine.appendChild(s86El('p', 'report tally is a FLOOR — the '
+      + (data.reports_scan_limit ? data.reports_scan_limit.toLocaleString() : '')
+      + '-event cap was reached and older reports were not counted'));
   }
 }
 

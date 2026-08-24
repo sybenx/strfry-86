@@ -471,65 +471,94 @@ CLAUDE.md's claim — see §7, item 1.
 
 ### server86.py
 
-| Constant | Value | Def. | Enforced at |
+As of the 2026-08-23 cap rework, every module-level bound in this file is explicitly
+marked HARD or CONFIGURABLE in a comment at its own definition — that block
+([server86.py:127-259](server86.py#L127-L259)) is the source of truth for what each
+one protects, in the caller's own words; this table gives def-lines and values only,
+not a re-derived "enforced at" site list (the old version of this table cited exact
+enforcement line numbers, which drift on every edit — not repeated here to avoid
+re-asserting stale precision next time this file changes without this table changing
+with it).
+
+**HARD** — a subprocess deadline or a process-lifetime in-memory buffer; raising one
+requires a measurement, not just a decision.
+
+| Constant | Value | Def. |
+|---|---|---|
+| `AUTHOR_SCAN_KINDS` | the SHIPPED default allowlist — not what a scan actually uses; see `extra_author_scan_kinds` in the CONFIGURABLE table below | [155-163](server86.py#L155-L163) |
+| `AUTHOR_SCAN_MODES` | `"recent"` (limit 20000) / `"full"` (no limit) | [164-169](server86.py#L164-L169) |
+| `AUTHOR_SCAN_DEADLINE` | 240s | [178](server86.py#L178) — the only bound left on the full author scan, the recipient scan, and the subscriber scan, now that `AUTHOR_SCAN_FULL_LIMIT`/`RECIPIENT_SCAN_LIMIT`/`SUBSCRIBER_SCAN_LIMIT` are gone (see §7 note below) |
+| `REPORT_WALK_DEADLINE` | 1800s | [179](server86.py#L179) — unlike the deadline above, still an all-or-nothing FAILURE timeout: `compute_report_walk` raises and discards on timeout |
+| `REPORT_AUTHOR_KEY_BYTES` | 8 | [180](server86.py#L180) |
+| `RATE_SMOOTHING_WINDOW` | 10s | [181](server86.py#L181) |
+| `SCAN_TIMEOUT` | 10s | [182](server86.py#L182) |
+| `NAME_RESOLVE_SCAN_TIMEOUT` | 60s | [189](server86.py#L189) |
+| `GAP_NOTICE_SHARE` | 0.02 | [194](server86.py#L194) |
+| `KIND_ALARM_SHARE` | 0.005 | [195](server86.py#L195) |
+| `CONSOLE_VERBS` | `("scan","info","export")` | [197](server86.py#L197) |
+| `CONSOLE_STDOUT_MAX` / `CONSOLE_STDERR_MAX` | 256 KiB / 64 KiB | [198-199](server86.py#L198-L199) |
+| `CONSOLE_RESPONSE_STDOUT_MAX` / `_STDERR_MAX` | 32 KiB / 8 KiB | [206-207](server86.py#L206-L207) |
+| `MEMORY_SOFT_BYTES` | 400 MiB | [227](server86.py#L227) |
+| `CACHE_LIST_MAX` | 50,000 | [228](server86.py#L228) — became MORE load-bearing after the cap rework: it's now the only thing bounding an uncapped author/recipient scan's retained row list |
+| `STREAM_STDERR_MAX` | 64 KiB | [229](server86.py#L229) |
+| `POST_BODY_MAX` | 2 MiB | [230](server86.py#L230) |
+| `LIVE_POLL_INTERVAL` | 3s | [240](server86.py#L240) |
+| `LIVE_BUFFER_MAX` | 500 | [246](server86.py#L246) — replaces the old `LIVE_POLL_LIMIT`/`LIVE_RECENT_MAX` aliases-of-`RENDER_MAX`; bounds the durable-kind ring AND the poll's own scan limit, deliberately split from the display-only `RENDER_PAGE_MAX` below (see §7 note) |
+| `LIVE_EPHEMERAL_MAX` | 100 | [251](server86.py#L251) |
+| `LIVE_FEED_SEED` | 50 | [252](server86.py#L252) |
+| `LIVE_FEED_SEED_SCAN_MAX` | 2,000 | [255](server86.py#L255) |
+| `LIVE_CONTENT_MAX` | 280 chars | [256](server86.py#L256) |
+| `DECISION_TAIL_MAX` | 500 | [258](server86.py#L258) — no longer aliased to the live-buffer/render constants; same value by convention only |
+| `DECISION_READ_BYTES` | 1 MiB | [259](server86.py#L259) |
+| `NIP98_KIND` | 27235 | [122](server86.py#L122) |
+| `NIP98_MAX_SKEW` | 60s | [123](server86.py#L123) |
+| `NIP98_REPLAY_TTL` | =`NIP98_MAX_SKEW*2`=120s | [124](server86.py#L124) |
+| `NAME_CACHE_TTL` | 24×3600s | [125](server86.py#L125) |
+| `STDERR_TAIL_CHARS` | 300 | [602](server86.py#L602) |
+| `CONTACT_APPEAL_CHECK_INTERVAL` | 1.0s | [293](server86.py#L293) |
+| `CONSOLE_TIMEOUT` | 30s | [1851](server86.py#L1851) |
+| `COMPACT_TIMEOUT` | 3600s | [1852](server86.py#L1852) |
+| `COMPACT_OUTPUT_NAME` | `"data.mdb.compacted"` | [1853](server86.py#L1853) |
+| `GIFTWRAP_RETENTION_INTERVAL` | 3600s | [2815](server86.py#L2815) |
+| `GIFTWRAP_RETENTION_TIMEOUT` | 3600s | [2816](server86.py#L2816) |
+| `EPHEMERAL_KIND_MIN` / `MAX` | 20000 / 29999 | [2823-2824](server86.py#L2823-L2824) |
+| `EPHEMERAL_PURGE_TIMEOUT` | 3600s | [2826](server86.py#L2826) |
+
+**Display-only** — bounds one response's row count, not a memory/subprocess cost:
+
+| Constant | Value | Def. |
+|---|---|---|
+| `RENDER_PAGE_MAX` | 500 | [192](server86.py#L192) — split out of the old `RENDER_MAX` specifically so raising it can never again silently multiply the `LIVE_BUFFER_MAX`/`DECISION_TAIL_MAX` buffers that used to alias it |
+| `PROFILE_PREVIEW_MAX` | 20 | [190](server86.py#L190) — pure in-memory slice of an already-fetched list |
+
+**CONFIGURABLE** — an operator preference in `config.json` (Settings page, `int` fields),
+with the value below as the factory default only; each has a `get_<name>()` accessor
+and a `MIN`/`MAX` clamp in `CONFIG_INT_BOUNDS` ([server86.py:2923-2934](server86.py#L2923-L2934)).
+None of these feed a subprocess timeout or a process-lifetime buffer of their own —
+what actually bounds each one stays a fixed HARD constant from the table above
+(`SCAN_TIMEOUT` for the profile/report fields, nothing at all for the pure
+size/length fields).
+
+| Constant | Default | Def. | Accessor |
 |---|---|---|---|
-| `AUTHOR_SCAN_KINDS` | allowlisted kind set | [133-141](server86.py#L133-L141) | [147](server86.py#L147) (inside `AUTHOR_SCAN_MODES`), [3849](server86.py#L3849), [3936](server86.py#L3936) |
-| `AUTHOR_SCAN_FULL_LIMIT` | 1,500,000 | [142](server86.py#L142) | [147](server86.py#L147) (as `AUTHOR_SCAN_MODES["full"]["limit"]`) |
-| `AUTHOR_SCAN_MODES` | recent/full definitions | [143-148](server86.py#L143-L148) | [3163-3164](server86.py#L3163-L3164), [3357](server86.py#L3357)/[3367](server86.py#L3367), [4111](server86.py#L4111) |
-| `AUTHOR_SCAN_DEADLINE` | 240s | [149](server86.py#L149) | [1211](server86.py#L1211)/[1215](server86.py#L1215), [3201](server86.py#L3201), [3429](server86.py#L3429), [3672](server86.py#L3672)/[3698](server86.py#L3698), [3847-3849](server86.py#L3847-L3849) |
-| `REPORT_WALK_DEADLINE` | 1800s | [150](server86.py#L150) | [3895](server86.py#L3895), [3930](server86.py#L3930) |
-| `REPORT_AUTHOR_KEY_BYTES` | 8 | [151](server86.py#L151) | [3926](server86.py#L3926) |
-| `RATE_SMOOTHING_WINDOW` | 10s | [152](server86.py#L152) | [2912](server86.py#L2912) |
-| `REASON_MAX_LEN` | 500 chars | [153](server86.py#L153) | [4126](server86.py#L4126), [5496](server86.py#L5496) |
-| `REASON_UNDO_MAX` | 50 | [154](server86.py#L154) | [5353-5354](server86.py#L5353-L5354) |
-| `RECIPIENT_SCAN_LIMIT` | 250,000 | [155](server86.py#L155) | [3408](server86.py#L3408), [3428](server86.py#L3428), [3431](server86.py#L3431) |
-| `SUBSCRIBER_SCAN_LIMIT` | 50,000 | [156](server86.py#L156) | [3562](server86.py#L3562), [3676](server86.py#L3676), [3697](server86.py#L3697), [3700](server86.py#L3700), [3738](server86.py#L3738) |
-| `SCAN_TIMEOUT` | 10s | [157](server86.py#L157) | default at [591](server86.py#L591)/[2026](server86.py#L2026); explicit at [2211](server86.py#L2211), [3216](server86.py#L3216), [3517](server86.py#L3517), [4242](server86.py#L4242)-[4483](server86.py#L4483) (multiple) |
-| `REPORT_SCAN_LIMIT` | 5,000 | [158](server86.py#L158) | [3216](server86.py#L3216)/[3218](server86.py#L3218), [3515](server86.py#L3515)/[3517](server86.py#L3517)/[3529](server86.py#L3529) |
-| `NAME_RESOLVE_MAX` | 500 | [159](server86.py#L159) | [3264](server86.py#L3264), [3438](server86.py#L3438), [3713](server86.py#L3713), [4530](server86.py#L4530) |
-| `NAME_CACHE_MAX` | 20,000 | [160](server86.py#L160) | [2231](server86.py#L2231), [5446](server86.py#L5446) |
-| `PROFILE_EVENT_LIMIT` | 500 | [161](server86.py#L161) | [4253](server86.py#L4253)/[4259](server86.py#L4259), [4474](server86.py#L4474)-[4486](server86.py#L4486) |
-| `PROFILE_PREVIEW_MAX` | 20 | [162](server86.py#L162) | [4278](server86.py#L4278) |
-| `PROFILE_REPORT_LIMIT` | 100 | [163](server86.py#L163) | [4288](server86.py#L4288)/[4291](server86.py#L4291) |
-| `PROFILE_DAY_EVENTS_MAX` | 50 | [164](server86.py#L164) | [4446](server86.py#L4446)/[4450](server86.py#L4450) |
-| `DOMAIN_LOOKUP_MAX` | 1,000 | [165](server86.py#L165) | [4509-4510](server86.py#L4509-L4510) |
-| `RENDER_MAX` | 500 | [167](server86.py#L167) | seeds `LIVE_POLL_LIMIT`/`LIVE_RECENT_MAX`/`DECISION_TAIL_MAX`; [3121](server86.py#L3121), [5116](server86.py#L5116)/[5119](server86.py#L5119) |
-| `FIGURE_HEAD_MAX` | 10 | [168](server86.py#L168) | **none — zero read sites in server86.py itself** (see §7, item 6) |
-| `GAP_NOTICE_SHARE` | 0.02 | [170](server86.py#L170) | [3808](server86.py#L3808) |
-| `KIND_ALARM_SHARE` | 0.005 | [171](server86.py#L171) | [3821](server86.py#L3821) |
-| `CONSOLE_VERBS` | `("scan","info","export")` | [173](server86.py#L173) | [1817](server86.py#L1817)/[1820](server86.py#L1820) |
-| `CONSOLE_STDOUT_MAX` | 256 KiB | [174](server86.py#L174) | [1963](server86.py#L1963), [1999](server86.py#L1999) |
-| `CONSOLE_STDERR_MAX` | 64 KiB | [175](server86.py#L175) | [1968](server86.py#L1968), [1999](server86.py#L1999) |
-| `MEMORY_SOFT_BYTES` | 400 MiB | [191](server86.py#L191) | [1905](server86.py#L1905)/[1909-1910](server86.py#L1909-L1910), [3045](server86.py#L3045)/[3051-3052](server86.py#L3051-L3052), [5576](server86.py#L5576) |
-| `CACHE_LIST_MAX` | 50,000 | [192](server86.py#L192) | [277](server86.py#L277)-[286](server86.py#L286), [3257](server86.py#L3257), [3435-3436](server86.py#L3435-L3436) |
-| `STREAM_STDERR_MAX` | 64 KiB | [193](server86.py#L193) | [2083-2084](server86.py#L2083-L2084) |
-| `POST_BODY_MAX` | 2 MiB | [194](server86.py#L194) | [5013](server86.py#L5013)/[5015](server86.py#L5015) |
-| `LIVE_POLL_INTERVAL` | 3s | [196](server86.py#L196) | [1104](server86.py#L1104), [4866](server86.py#L4866) |
-| `LIVE_POLL_LIMIT` | =`RENDER_MAX` | [197](server86.py#L197) | [1061](server86.py#L1061) |
-| `LIVE_RECENT_MAX` | =`RENDER_MAX` | [202](server86.py#L202) | [888](server86.py#L888), [903](server86.py#L903) |
-| `LIVE_EPHEMERAL_MAX` | 100 | [203](server86.py#L203) | [889](server86.py#L889), [900](server86.py#L900), [1023](server86.py#L1023) |
-| `LIVE_FEED_SEED` | 50 | [204](server86.py#L204) | [929](server86.py#L929)/[938](server86.py#L938), [986](server86.py#L986), [1022](server86.py#L1022) |
-| `LIVE_FEED_SEED_SCAN_MAX` | 2,000 | [207](server86.py#L207) | [986](server86.py#L986) |
-| `LIVE_CONTENT_MAX` | 280 chars | [208](server86.py#L208) | [812](server86.py#L812), [848](server86.py#L848) |
-| `DECISION_TAIL_MAX` | =`RENDER_MAX` | [210](server86.py#L210) | [681](server86.py#L681), [709](server86.py#L709) |
-| `DECISION_READ_BYTES` | 1 MiB | [211](server86.py#L211) | [670](server86.py#L670)/[674](server86.py#L674) |
-| `NIP98_KIND` | 27235 | [121](server86.py#L121) | [4714](server86.py#L4714) |
-| `NIP98_MAX_SKEW` | 60s | [122](server86.py#L122) | [4742](server86.py#L4742) |
-| `NIP98_REPLAY_TTL` | =`NIP98_MAX_SKEW*2`=120s | [123](server86.py#L123) | [4585](server86.py#L4585) |
-| `NAME_CACHE_TTL` | 24×3600s | [124](server86.py#L124) | [2204](server86.py#L2204) |
-| `STDERR_TAIL_CHARS` | 300 | [554](server86.py#L554) | [563](server86.py#L563) |
-| `CONTACT_APPEAL_CHECK_INTERVAL` | 1.0s | [245](server86.py#L245) | [304](server86.py#L304), [3601](server86.py#L3601) |
-| `CONSOLE_TIMEOUT` | 30s | [1784](server86.py#L1784) | [1976](server86.py#L1976)-[1989](server86.py#L1989) |
-| `COMPACT_TIMEOUT` | 3600s | [1785](server86.py#L1785) | [1565](server86.py#L1565)-[1577](server86.py#L1577) |
-| `COMPACT_OUTPUT_NAME` | `"data.mdb.compacted"` | [1786](server86.py#L1786) | [1491](server86.py#L1491) |
-| `AUDIT_LOG_MAX` | 500 | [2272](server86.py#L2272) | [2296-2297](server86.py#L2296-L2297) |
-| `GIFTWRAP_RETENTION_DEFAULT` | 30 | [2575](server86.py#L2575) | [1110](server86.py#L1110)/[1114](server86.py#L1114), [2660](server86.py#L2660)/[2662](server86.py#L2662) |
-| `GIFTWRAP_RETENTION_MIN` | 7 | [2576](server86.py#L2576) | [1115](server86.py#L1115), [2667](server86.py#L2667), [2698-2699](server86.py#L2698-L2699), [2764](server86.py#L2764) |
-| `GIFTWRAP_RETENTION_MAX` | 30 | [2577](server86.py#L2577) | same sites as MIN |
-| `GIFTWRAP_RETENTION_INTERVAL` | 3600s | [2578](server86.py#L2578) | [1457](server86.py#L1457) |
-| `GIFTWRAP_RETENTION_TIMEOUT` | 3600s | [2579](server86.py#L2579) | [1180](server86.py#L1180)/[1183](server86.py#L1183) |
-| `EPHEMERAL_KIND_MIN` / `MAX` | 20000 / 29999 | [2586-2587](server86.py#L2586-L2587) | [1203](server86.py#L1203), [1225-1226](server86.py#L1225-L1226), [2588](server86.py#L2588) |
-| `EPHEMERAL_PURGE_TIMEOUT` | 3600s | [2589](server86.py#L2589) | [1247](server86.py#L1247)/[1250](server86.py#L1250) |
+| `report_scan_limit` | 5,000 | [2834](server86.py#L2834) | `get_report_scan_limit()` [3140](server86.py#L3140) |
+| `name_resolve_max` | 500 | [2837](server86.py#L2837) | `get_name_resolve_max()` [3144](server86.py#L3144) |
+| `name_cache_max` | 20,000 | [2840](server86.py#L2840) | `get_name_cache_max()` [3148](server86.py#L3148) |
+| `domain_lookup_max` | 1,000 | [2843](server86.py#L2843) | `get_domain_lookup_max()` [3152](server86.py#L3152) |
+| `profile_event_limit` | 500 | [2846](server86.py#L2846) | `get_profile_event_limit()` [3156](server86.py#L3156) |
+| `profile_report_limit` | 100 | [2849](server86.py#L2849) | `get_profile_report_limit()` [3160](server86.py#L3160) |
+| `profile_day_events_max` | 50 | [2852](server86.py#L2852) | `get_profile_day_events_max()` [3164](server86.py#L3164) |
+| `reason_max_len` | 500 chars | [2855](server86.py#L2855) | `get_reason_max_len()` [3168](server86.py#L3168) |
+| `reason_undo_max` | 50 | [2858](server86.py#L2858) | `get_reason_undo_max()` [3172](server86.py#L3172) |
+| `audit_log_max` | 500 | [2866](server86.py#L2866) | `get_audit_log_max()` [3176](server86.py#L3176) — the one entry with a floor (`AUDIT_LOG_MAX_MIN`=100), not just a default: this is the only undo authority in the project, so a value set too low destroys undo capability for actions already taken, not just a view |
+| `giftwrap_retention_days` | 30 (min 7, max 30) | [2812-2814](server86.py#L2812-L2814) | `get_giftwrap_retention_days()` [3120](server86.py#L3120) — pre-existing, unchanged by this rework |
+| `extra_author_scan_kinds` | `[]` (a `"kind_list"` type — comma-separated non-negative ints, not an int itself, no `CONFIG_INT_BOUNDS` entry) | [2930-2935](server86.py#L2930-L2935) | `get_extra_author_scan_kinds()` [3199](server86.py#L3199); `get_effective_author_scan_kinds()` [3222](server86.py#L3222) unions it with `AUTHOR_SCAN_KINDS` — never a replacement, an operator can only widen coverage |
+
+**Removed in the 2026-08-23 cap rework** (see PROJECT-MAP §7's newest note for detail):
+`AUTHOR_SCAN_FULL_LIMIT`, `RECIPIENT_SCAN_LIMIT`, `SUBSCRIBER_SCAN_LIMIT` (all three
+scans now run until they finish or `AUTHOR_SCAN_DEADLINE` binds — no separate count
+cap), and `FIGURE_HEAD_MAX` (dead code in this file; the load-bearing copy was always
+`common86.js`'s independently-hardcoded `S86_FIGURE_HEAD_MAX`).
 
 ### plugin86.py
 
@@ -544,8 +573,10 @@ CLAUDE.md's claim — see §7, item 1.
 ### common86.js — a separate, independently-hardcoded set
 
 These are **not fetched from any endpoint** — a change to a server-side constant (e.g.
-`RENDER_MAX`) does not propagate to its client twin without a manual edit in both
-places.
+`RENDER_PAGE_MAX`) does not propagate to its client twin without a manual edit in both
+places. `S86_RENDER_MAX` maps to the new `RENDER_PAGE_MAX` (display-only), not to
+`LIVE_BUFFER_MAX` — the server-side split that separated those two had no client-side
+counterpart to split, since the live-feed ring buffer only ever existed server-side.
 
 `S86_RENDER_MAX`=500 ([common86.js:17](common86.js#L17)),
 `S86_FIGURE_HEAD_MAX`=10 ([common86.js:16](common86.js#L16)),
@@ -687,3 +718,53 @@ Most concrete first.
     unbounded — every historical page this project has ever deleted is still
     physically present in every existing install, forever, and this is not visible
     from the repo alone.
+
+16. **The 2026-08-23 cap rework changed what "saturated" means for three scans, not
+    just their numbers.** `AUTHOR_SCAN_FULL_LIMIT`, `RECIPIENT_SCAN_LIMIT`, and
+    `SUBSCRIBER_SCAN_LIMIT` were removed outright rather than raised — each of those
+    three scans is backed by `run_strfry_scan_streaming`, which never buffers more
+    than one event, so the count cap was never protecting memory; it was only making
+    a "full" scan quietly stop being full once a relay's matching-event count passed
+    it. `AUTHOR_SCAN_DEADLINE` (240s) is now the sole bound on all three, and
+    `run_strfry_scan_streaming` grew a `timeout_ok` parameter
+    ([server86.py:2164](server86.py#L2164)) so hitting that deadline is a completed
+    "ran out of time" result (fresh `scanned_at`, `saturated`/`timed_out` True, a
+    `warning` naming the exact shortfall) rather than the failure it used to be —
+    `compute_report_walk`'s own deadline (`REPORT_WALK_DEADLINE`) deliberately did
+    NOT get this treatment, since a partial database walk isn't a usable totals
+    record the way a partial author/recipient/subscriber list still is. Ten other
+    constants (`REPORT_SCAN_LIMIT`, `NAME_RESOLVE_MAX`, `NAME_CACHE_MAX`,
+    `DOMAIN_LOOKUP_MAX`, `PROFILE_EVENT_LIMIT`, `PROFILE_REPORT_LIMIT`,
+    `PROFILE_DAY_EVENTS_MAX`, `REASON_MAX_LEN`, `REASON_UNDO_MAX`, `AUDIT_LOG_MAX`)
+    moved from module constants to `config.json`-backed operator settings, following
+    the pre-existing `giftwrap_retention_days` pattern; see §6's new CONFIGURABLE
+    table. `RENDER_MAX` was split into `RENDER_PAGE_MAX` (display-only) and
+    `LIVE_BUFFER_MAX` (the process-lifetime live-feed ring buffer it used to alias
+    without saying so), specifically so raising a page-size constant can never again
+    silently triple a persistent server-wide buffer. This makes §6, item 3's point
+    about this file's own claimed "one block" constants organization more true than
+    it was, not less — the bounds block ([server86.py:127-259](server86.py#L127-L259))
+    now explicitly marks every entry HARD or CONFIGURABLE inline, but the
+    CONFIGURABLE defaults/accessors still live near `CONFIG_EDITABLE_FIELDS`, ~2700
+    lines later, matching the pre-existing `giftwrap_retention_days` layout rather
+    than consolidating everything into one physical location.
+
+17. **`AUTHOR_SCAN_KINDS` is a floor, not the whole allowlist, as of the same rework.**
+    The gap-alarm ladder (`GAP_NOTICE_SHARE`/`KIND_ALARM_SHARE`,
+    [server86.py:194-195](server86.py#L194-L195)) was deliberately kept — verified
+    against a seeded test-relay's real 300-kind unlisted tail, all four ladder states
+    render as designed — but its `stale` state used to terminate outside the UI
+    (edit `AUTHOR_SCAN_KINDS` in server86.py, redeploy). `extra_author_scan_kinds`
+    ([server86.py:2930-2935](server86.py#L2930-L2935)) closes that loop: a new
+    `"kind_list"` CONFIG_EDITABLE_FIELDS type, additive only —
+    `get_effective_author_scan_kinds()` ([server86.py:3222](server86.py#L3222)) is
+    the shipped default UNIONED with operator additions, and every scan/count/
+    comparison that means "the allowlist" reads that function now, never
+    `AUTHOR_SCAN_KINDS` directly (the two exceptions are the constant's own
+    definition and the `AUTHOR_SCAN_KINDS` gap-drift check in test.sh, which now
+    audits the effective set instead). Adding a kind does not retroactively cover
+    an already-completed author-scan cache — `_authors_cache_kinds_stale()`
+    ([server86.py:4008](server86.py#L4008)) compares a cached FULL-mode scan's
+    recorded `scan_kinds` against the current effective set and surfaces
+    `authors_kinds_stale` on `/api/userlist`, so the Users page says so rather than
+    presenting stale coverage as current.

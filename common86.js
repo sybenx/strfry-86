@@ -2187,8 +2187,8 @@ function s86BuildCommandGenerator(options) {
           ? 'no subscriber scan has been run yet'
           : (!subsFresh
             ? 'the subscriber scan is more than 7 days old'
-            : 'the subscriber scan hit its ' + (subscribers.scan_limit ? subscribers.scan_limit.toLocaleString() + '-event ' : '')
-              + 'cap — a floor cannot be used as an exemption list'));
+            : 'the subscriber scan ran out of time (' + (subscribers.warning || 'incomplete')
+              + ') — a floor cannot be used as an exemption list'));
       extraEl.appendChild(s86El('p', 'subscriber-exempt form unavailable: ' + reason
         + '. Run the missing scan(s) on the report page, or uncheck "exempt subscribers" for the blanket form below.'));
       setCommands(blanketItems);

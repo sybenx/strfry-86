@@ -1059,12 +1059,12 @@ relayUrlSaveBtn.addEventListener('click', function () {
 
 var recipientsPanel = s86BuildScanPanel({
   heading: 'gift-wrap recipients',
-  costText: 'reads the newest 250,000 gift-wrap events — a few seconds to a couple of minutes',
+  costText: 'reads every gift-wrap event — a few seconds to a couple of minutes, longer on a very large relay',
   buttonLabel: 'scan gift-wrap recipients',
   onStart: function () { return startSimpleJob('/api/recipients', fetchRecipients, applyRecipientsStatus); },
   renderResult: function (container, record) {
     container.appendChild(s86BuildKeyValueTable([
-      ['gift-wrap events read', record.events_read, record.saturated ? 'SATURATED — window limit reached' : ''],
+      ['gift-wrap events read', record.events_read, record.saturated ? (record.warning || 'ran out of time') : ''],
       ['distinct recipients', record.recipients.length, ''],
       ['window', s86FormatDate(record.span_start) + ' → ' + s86FormatDate(record.span_end), '']
     ]));
@@ -1073,7 +1073,7 @@ var recipientsPanel = s86BuildScanPanel({
 
 var subscribersPanel = s86BuildScanPanel({
   heading: 'DM-inbox subscribers',
-  costText: 'reads up to 50,000 DM-relay-list and general-relay-list events — a few seconds to a couple of minutes',
+  costText: 'reads every DM-relay-list and general-relay-list event — a few seconds to a couple of minutes, longer on a very large relay',
   buttonLabel: 'scan subscribers',
   onStart: function () { return startSimpleJob('/api/subscribers', fetchSubscribers, applySubscribersStatus); },
   renderResult: function (container, record) {
@@ -1090,8 +1090,8 @@ var subscribersPanel = s86BuildScanPanel({
   // scan that just completed.
   extraNote: function (record) {
     if (record.saturated) {
-      return 'subscriber scan hit its ' + (record.scan_limit ? record.scan_limit.toLocaleString() + '-event ' : '')
-        + 'cap — the exempt purge command is unavailable until the cap is raised, because a floor cannot be used as an exemption list.';
+      return (record.warning || 'subscriber scan ran out of time')
+        + ' — the exempt purge command is unavailable, because a floor cannot be used as an exemption list.';
     }
     if (!record.scanned_at) {
       return null;

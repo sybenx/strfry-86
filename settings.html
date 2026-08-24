@@ -640,6 +640,8 @@ function buildFieldRow(field, onDirty) {
     control = document.createElement('input');
     control.type = field.type === 'int' ? 'number' : 'text';
     control.value = field.value == null ? '' : String(field.value);
+    if (field.type === 'int' && field.min != null) { control.min = field.min; }
+    if (field.type === 'int' && field.max != null) { control.max = field.max; }
   }
   control.id = id;
   control.setAttribute('data-path', field.path);

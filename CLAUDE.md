@@ -55,9 +55,19 @@ Three processes live in this repo; strfry itself does not.
   confirm-gated forms elsewhere.
 - Recipient-scan saturation is safe to leave (it can only under-delete); subscriber-scan
   saturation instead refuses the exempt-purge action it would otherwise mislabel as
-  complete.
+  complete. Neither scan carries a count cap any more — both run until they finish or
+  `AUTHOR_SCAN_DEADLINE` binds, so saturation is now the rare "ran out of time" case
+  instead of the routine one — but the asymmetry in what saturation MEANS for each is
+  unchanged and is the reason the two get handled differently on `/stats`.
 - Every scan/job panel is in exactly one of four states — never run, running, result,
   failed — and a failed run never overwrites the cached result or its timestamp.
+- The author-scan kind allowlist (`AUTHOR_SCAN_KINDS`) is a floor an operator can
+  extend from Settings (`extra_author_scan_kinds`), never a ceiling they can shrink —
+  every scan/count/comparison that means "the allowlist" reads
+  `get_effective_author_scan_kinds()` (shipped default ∪ operator additions), never the
+  raw constant. Adding a kind does not retroactively cover an existing author-scan
+  cache; the Users page says so (`authors_kinds_stale`) rather than presenting stale
+  coverage as current.
 - Settings saves rewrite only the one config field/token touched, leaving the rest of
   `strfry.conf` byte-identical; the file is brace-checked and backed up before write.
 - The live feed and Stats page share a single server-side strfry poll fanned out over

@@ -127,67 +127,94 @@ NAME_CACHE_TTL = 24 * 3600
 # --- bounds --------------------------------------------------------------
 # Every bound in the project, in one block, so the bounded-scan rule can be
 # audited by reading this block alone. Every scan is bounded by either a
-# constant `limit` (never a value taken from a request) or an explicit
-# `authors` list assembled from data server86 already holds — nothing else
-# counts as a bound, per the hard constraint in CLAUDE.md.
+# constant `limit`, a HARD wall-clock deadline, or an explicit `authors`
+# list assembled from data server86 already holds — nothing else counts as
+# a bound, per the hard constraint in CLAUDE.md.
+#
+# Two kinds of bound live here, and they are not interchangeable:
+#   - HARD: guards a subprocess deadline or a process-lifetime in-memory
+#     buffer. Never raise one of these without measuring what it actually
+#     costs — see AUTHOR_SCAN_DEADLINE below for what that measurement
+#     looks like.
+#   - CONFIGURABLE (marked below, defined near CONFIG_EDITABLE_FIELDS):
+#     an operator preference with no memory/subprocess consequence of its
+#     own — bounded, if at all, by a HARD constant that stays fixed
+#     regardless of the configured value. The value here is only the
+#     factory default; get_<name>() near CONFIG_EDITABLE_FIELDS is the
+#     actual accessor every call site uses.
+#
+# A scan backed by run_strfry_scan_streaming() never buffers more than one
+# event at a time, so it has nothing left to cap except its HARD deadline —
+# AUTHOR_SCAN_FULL_LIMIT, RECIPIENT_SCAN_LIMIT and SUBSCRIBER_SCAN_LIMIT
+# used to impose an extra count cap on top of that anyway, which meant a
+# "full" scan quietly stopped being full on a relay big enough to reach the
+# count before the deadline. Removed; AUTHOR_SCAN_DEADLINE is now the only
+# bound on all three, and hitting it is a "ran out of time" result, not a
+# failure — see compute_authors/compute_recipients/compute_subscribers.
 
 AUTHOR_SCAN_KINDS = (
-    # Every kind EXCEPT 1059 (gift wraps: single-use keys, structurally
-    # unbannable, and 88% of events on the reference relay). See CLAUDE.md
-    # "Auditing the allowlist" for how this tuple is checked for drift
-    # against a live relay — test.sh runs that check when one is reachable.
+    # The SHIPPED default — every kind EXCEPT 1059 (gift wraps: single-use
+    # keys, structurally unbannable, and 88% of events on the reference
+    # relay). See CLAUDE.md "Auditing the allowlist" for how this tuple is
+    # checked for drift against a live relay — test.sh runs that check when
+    # one is reachable. This is a floor, never the full picture on its
+    # own — an operator can ADD kinds via config.json's
+    # `extra_author_scan_kinds` (CONFIGURABLE, see CONFIG_EDITABLE_FIELDS)
+    # but can never remove one of these; every scan/count/comparison in
+    # this file that means "the allowlist" reads
+    # get_effective_author_scan_kinds(), never this tuple directly, except
+    # the two places that exist specifically to define or audit the
+    # shipped default itself.
     0, 1, 3, 4, 5, 6, 7, 21, 42, 321, 445, 1000, 1018, 1040, 1111, 1311, 1337,
     1618, 1619, 1984, 1985, 2003, 4000, 4244, 5300, 6300, 7000, 9735, 10002,
     10050, 30000, 30023, 30078, 30166, 30383, 30800, 34236, 36787, 420001,
 )
-AUTHOR_SCAN_FULL_LIMIT = 1500000  # named separately: saturation at this value ends completeness
 AUTHOR_SCAN_MODES = {
     # Selectable by NAME only; a request never supplies a filter, a limit,
-    # or a kinds array — see the mode validation in do_POST.
-    "recent": {"limit": 20000},                                              # all kinds, newest 20k, ~3s
-    "full": {"kinds": AUTHOR_SCAN_KINDS, "limit": AUTHOR_SCAN_FULL_LIMIT},    # every moderation-kind event, ~137s measured
+    # or a kinds array — see the mode validation in do_POST. "full"'s
+    # `kinds` is deliberately absent here — it would freeze the SHIPPED
+    # default at import time, before an operator's config.json is ever
+    # read. compute_authors fills it in per-call from
+    # get_effective_author_scan_kinds() instead.
+    "recent": {"limit": 20000},  # all kinds, newest 20k, ~3s — a UI mode, not a completeness claim
+    "full": {},                  # kinds filled in per-call; every effective-allowlist event, NO count limit
 }
-AUTHOR_SCAN_DEADLINE = 240      # seconds; a FAILURE timeout for the deep scans, not a bound
-REPORT_WALK_DEADLINE = 1800     # seconds; FAILURE timeout for the one unlimited scan (see compute_report_walk)
+# HARD — wall-clock deadline for every streaming deep scan (full author
+# scan, recipient scan, subscriber scan). Measured on the reference relay
+# (2026-08-23): AUTHOR_SCAN_KINDS matched 914,357 events and the full scan
+# took ~137s — 103s of headroom, so the allowlisted event count would have
+# to grow ~75% from here before this deadline binds. When it does bind, the
+# scan does not fail: it returns whatever it read so far, flagged the same
+# way a saturated bounded scan used to be (see `saturated`/`timed_out`
+# below), just triggered by the clock instead of a count.
+AUTHOR_SCAN_DEADLINE = 240
+REPORT_WALK_DEADLINE = 1800     # HARD — seconds; FAILURE timeout for the one all-or-nothing scan (see compute_report_walk): a partial database walk is not a usable totals record, so this one still raises and discards on timeout, unlike AUTHOR_SCAN_DEADLINE above.
 REPORT_AUTHOR_KEY_BYTES = 8     # bytes of pubkey retained per distinct non-giftwrap author during the walk
 RATE_SMOOTHING_WINDOW = 10      # seconds of history the live throughput estimate (rate/eta) averages over
-REASON_MAX_LEN = 500            # characters accepted for a ban reason
-REASON_UNDO_MAX = 50            # entries whose prior reasons are snapshotted for undo
-RECIPIENT_SCAN_LIMIT = 250000   # newest kind-1059 events tallied for storage accounting
-SUBSCRIBER_SCAN_LIMIT = 50000   # kind-10050/10002 events searched for this relay's own URL
-SCAN_TIMEOUT = 10               # seconds; every other scan subprocess
-REPORT_SCAN_LIMIT = 5000        # kind-1984 events read to build the reports-against tally
-NAME_RESOLVE_MAX = 500          # pubkeys per batched kind-0 lookup
-# An `authors: [...]` filter with up to NAME_RESOLVE_MAX entries is a
-# different shape of work than the other bounded scans above — strfry has
-# to check each listed author, not just stream and stop at a row limit —
-# and on a large database SCAN_TIMEOUT's 10s can be too tight for that,
-# silently: the whole batch gets cached as "no name found" for
-# NAME_CACHE_TTL, indistinguishable from an actual absent profile.
-NAME_RESOLVE_SCAN_TIMEOUT = 60  # seconds; see _resolve_profiles_locally
-NAME_CACHE_MAX = 20000          # entries retained in names.json
-PROFILE_EVENT_LIMIT = 500       # events read for one pubkey's kind tally
-PROFILE_PREVIEW_MAX = 20        # event previews retained from that read
-PROFILE_REPORT_LIMIT = 100      # kind-1984 events read for reports against one pubkey
-PROFILE_DAY_EVENTS_MAX = 50     # events read for one pubkey's single-day view
-DOMAIN_LOOKUP_MAX = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
-# --- rendering caps: no result reaches a page uncapped --------------------
-RENDER_MAX = 500                # list rows rendered client-side before truncation
-FIGURE_HEAD_MAX = 10             # ranked rows shown before the tail is summarised
+SCAN_TIMEOUT = 10               # HARD — seconds; every other scan subprocess
+# An `authors: [...]` filter is a different shape of work than a `limit`-
+# bounded scan — strfry has to check each listed author, not just stream
+# and stop at a row count — and on a large database SCAN_TIMEOUT's 10s can
+# be too tight for that, silently: the whole batch gets cached as "no name
+# found" for NAME_CACHE_TTL, indistinguishable from an actual absent
+# profile. See _resolve_profiles_locally.
+NAME_RESOLVE_SCAN_TIMEOUT = 60  # HARD — seconds
+PROFILE_PREVIEW_MAX = 20        # event previews retained from a profile's kind-tally read — pure in-memory slice of an already-fetched list, not its own scan bound
+# --- rendering: display only — no memory or subprocess bound of its own ---
+RENDER_PAGE_MAX = 500           # rows the client renders/paginates per page. Kept a separate name from the live-buffer constants below on purpose: those bound a persistent shared buffer, this bounds nothing but one response's row count, and conflating them once meant raising "the display size" silently multiplied a process-lifetime buffer three times over.
 # --- allowlist audit: size and actionability are separate questions -------
 GAP_NOTICE_SHARE = 0.02         # gap worth a sentence, never an alarm on its own
 KIND_ALARM_SHARE = 0.005        # ONE unlisted kind this big is the actionable alarm
 # --- stats console (read-only) ---------------------------------------------
 CONSOLE_VERBS = ("scan", "info", "export")  # --count/read-only; all else refused
-CONSOLE_STDOUT_MAX = 256 * 1024  # hard cap on captured console stdout (then kill)
-CONSOLE_STDERR_MAX = 64 * 1024   # hard cap on captured console stderr
+CONSOLE_STDOUT_MAX = 256 * 1024  # HARD — cap on captured console stdout (then kill the child)
+CONSOLE_STDERR_MAX = 64 * 1024   # HARD — cap on captured console stderr
 # The HTTP response's own tail slice — distinct from the two caps above.
 # CONSOLE_STDOUT_MAX/CONSOLE_STDERR_MAX bound what run_console_command ever
 # holds in memory; these bound what actually goes out over the wire to the
 # console pane, same tail-favoring shape, just sized for a browser pane
 # instead of a memory budget. Every response names its own total/shown byte
-# counts (RENDER_MAX's "omitted tail" pattern) so a slice here is never
-# silent the way it used to be.
+# counts so a slice here is never silent the way it used to be.
 CONSOLE_RESPONSE_STDOUT_MAX = 32 * 1024
 CONSOLE_RESPONSE_STDERR_MAX = 8 * 1024
 # --- memory ceilings -------------------------------------------------------
@@ -195,7 +222,11 @@ CONSOLE_RESPONSE_STDERR_MAX = 8 * 1024
 # headroom for the job itself). CACHE_LIST_MAX is the safety valve on
 # author/recipient row lists that otherwise grow with every distinct pubkey a
 # scan has ever seen — client search still runs over the retained head
-# (highest signal first); the omitted tail is named on the result.
+# (highest signal first); the omitted tail is named on the result. This one
+# got MORE load-bearing once AUTHOR_SCAN_FULL_LIMIT/RECIPIENT_SCAN_LIMIT
+# were removed above: it is now the only thing standing between an
+# uncapped author/recipient scan and an unbounded retained row list, so it
+# stays HARD.
 #
 # There is deliberately NO RLIMIT_AS hard cap. It limits ADDRESS SPACE, not
 # RSS, and every strfry subprocess inherits it — strfry opens its LMDB with
@@ -205,20 +236,30 @@ CONSOLE_RESPONSE_STDERR_MAX = 8 * 1024
 # be undone by a child, so there is no per-spawn escape hatch either. Growth
 # this project actually controls is bounded where it happens: CONSOLE_STDOUT_MAX,
 # STREAM_STDERR_MAX, CACHE_LIST_MAX, POST_BODY_MAX, and the soft gate below.
-MEMORY_SOFT_BYTES = 400 * 1024 * 1024   # refuse new scan jobs above this RSS
-CACHE_LIST_MAX = 50000          # max author/recipient rows retained after a scan
-STREAM_STDERR_MAX = 64 * 1024   # stderr retained from a streaming scan
-POST_BODY_MAX = 2 * 1024 * 1024 # NIP-98 POST bodies (settings raw is the largest)
+MEMORY_SOFT_BYTES = 400 * 1024 * 1024   # HARD — refuse new scan jobs above this RSS
+CACHE_LIST_MAX = 50000          # HARD — max author/recipient rows retained after a scan
+STREAM_STDERR_MAX = 64 * 1024   # HARD — stderr retained from a streaming scan
+POST_BODY_MAX = 2 * 1024 * 1024 # HARD — NIP-98 POST bodies (settings raw is the largest)
 GZIP_MIN_BYTES = 1024           # below this, gzip's own framing overhead isn't worth it
 GZIP_LEVEL = 6                  # zlib level 6: ~9% smaller than level 1 for ~2x the CPU
-# --- live layer: one shared strfry poll fanned out over SSE ----------------
+# --- live layer: one shared strfry poll fanned out over SSE (all HARD) -----
+# Every constant below bounds a process-lifetime buffer held ONCE and shared
+# by every connected SSE client, not a per-request or per-client cost —
+# raising any of these multiplies persistent server RSS, not just one
+# response. (This is exactly the distinction RENDER_PAGE_MAX above was split
+# out of: that one bounds a single response, these bound the server for as
+# long as it runs.)
 LIVE_POLL_INTERVAL = 3          # seconds between `since`-bounded polls of new events
-LIVE_POLL_LIMIT = RENDER_MAX    # never read more than one page of new events per poll
+# One row here (id/pubkey hex strings, up to LIVE_CONTENT_MAX=280 bytes of
+# content, a handful of small fields) is on the order of ~1KB as a Python
+# dict. At LIVE_BUFFER_MAX=500 + LIVE_EPHEMERAL_MAX=100 rows, the two rings
+# together hold on the order of ~600KB, once, for the life of the process —
+# not per client, not per poll tick.
+LIVE_BUFFER_MAX = 500           # durable-kind ring size AND the poll's own scan limit= (never fetch more per tick than the ring retains)
 # Two rings, two caps: NIP-16 ephemeral kinds (20000–29999) must not share a
 # slot budget with durable notes. The default / filter is "kinds with content";
 # ephemeral auth/presence usually has none, so a single shared ring looked
 # like content "disappearing" while it was only being shoved out by spam.
-LIVE_RECENT_MAX = RENDER_MAX    # durable kinds (everything outside 20000–29999)
 LIVE_EPHEMERAL_MAX = 100        # kinds 20000–29999 only; inspectable, not starvation
 LIVE_FEED_SEED = 50             # newest durable events loaded at startup so / is never blank
 # Overfetch ceiling when seeding: newest-N of ALL kinds can be almost all
@@ -226,8 +267,8 @@ LIVE_FEED_SEED = 50             # newest durable events loaded at startup so / i
 LIVE_FEED_SEED_SCAN_MAX = 2000  # hard cap on the seed scan's limit=
 LIVE_CONTENT_MAX = 280          # content bytes retained per ring row (preview, not full body)
 # --- decision log: the only channel that can see a REJECT ------------------
-DECISION_TAIL_MAX = RENDER_MAX  # newest decision records read back per poll
-DECISION_READ_BYTES = 1 << 20   # bytes read from the tail of each log segment
+DECISION_TAIL_MAX = 500         # HARD — newest decision records read back per poll; a transient list, same size as LIVE_BUFFER_MAX by convention only, not aliased to it (a decision record and a live-feed row are different shapes and can drift independently)
+DECISION_READ_BYTES = 1 << 20   # HARD — bytes read from the tail of each log segment
 
 _strfry_bin_path = None
 _strfry_bin_checked = False
@@ -645,7 +686,7 @@ _live_seen_at_since = set()         # ids already counted AT exactly _live_since
 _live_delta_baseline_at = None      # scanned_at this delta count is relative to
 _live_new_events = 0
 _live_deletes = 0
-_live_recent_durable = []           # non-ephemeral kinds; cap LIVE_RECENT_MAX
+_live_recent_durable = []           # non-ephemeral kinds; cap LIVE_BUFFER_MAX
 _live_recent_ephemeral = []         # kinds 20000–29999; cap LIVE_EPHEMERAL_MAX
 _live_error = None
 _live_subscribers = []              # list of queue.Queue, one per open SSE connection
@@ -894,7 +935,7 @@ def _dual_cap_feed_rows(rows):
             ephemeral.append(r)
         else:
             durable.append(r)
-    durable = durable[-LIVE_RECENT_MAX:]
+    durable = durable[-LIVE_BUFFER_MAX:]
     ephemeral = ephemeral[-LIVE_EPHEMERAL_MAX:]
     merged = durable + ephemeral
     merged.sort(key=lambda r: r.get("created_at") or 0)
@@ -909,7 +950,7 @@ def _live_append_row_unlocked(row):
         del _live_recent_ephemeral[:-LIVE_EPHEMERAL_MAX]
     else:
         _live_recent_durable.append(row)
-        del _live_recent_durable[:-LIVE_RECENT_MAX]
+        del _live_recent_durable[:-LIVE_BUFFER_MAX]
 
 
 def _live_feed_state():
@@ -1086,7 +1127,7 @@ def _live_poll_tick():
                 _live_seen_at_since = set()
 
     try:
-        events = run_strfry_scan({"since": _live_since, "limit": LIVE_POLL_LIMIT}, timeout=SCAN_TIMEOUT)
+        events = run_strfry_scan({"since": _live_since, "limit": LIVE_BUFFER_MAX}, timeout=SCAN_TIMEOUT)
     except Exception as e:
         with _live_lock:
             _live_error = f"{type(e).__name__}: {e}"[:300]
@@ -1744,8 +1785,11 @@ def get_userlist_snapshot():
     Userlist page. Never starts a scan. Missing fields stay null so the
     client can render — rather than inventing zeros. `giftwrap_count` is a
     FLOOR (render `≥ n`, rule per CLAUDE.md) whenever the recipients scan is
-    saturated — RECIPIENT_SCAN_LIMIT is reached routinely (WHY.md §5), so
-    this is the common case, not an edge case.
+    saturated — the recipient scan now runs to completion or
+    AUTHOR_SCAN_DEADLINE, whichever comes first, so saturation is the rare
+    case (see AUTHOR_SCAN_DEADLINE), not the routine one WHY.md §5 used to
+    describe. A saturated recipient list can still only under-count, never
+    over-count, which is what makes it safe to treat as a floor either way.
 
     While an author scan is running, `rows` come from the job's
     `partial_authors` (top authors tallied so far) so the table can fill
@@ -1798,6 +1842,7 @@ def get_userlist_snapshot():
         "authors_scanned_at": authors_status.get("scanned_at"),
         "authors_error": authors_status.get("error"),
         "authors_modes": authors_status.get("modes"),
+        "authors_kinds_stale": authors_status.get("kinds_stale", False),
         "recipients_scanned_at": recipients_scanned_at,
         "recipients_saturated": recipients_saturated,
         "recipients_error": recipients_status.get("error"),
@@ -2129,16 +2174,23 @@ def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):
         raise RuntimeError(f"strfry scan --count returned non-numeric output: {lines[-1]!r}")
 
 
-def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
+def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
     """Run `strfry scan <filter>` and call on_event(parsed_dict) for each
     line as it arrives, never holding more than one parsed event at a time
-    (used for the `limit`-bounded author scan, which can return up to
-    AUTHOR_SCAN_FULL_LIMIT full event bodies — too much to buffer as a
-    list). If given, on_progress(count) is called every 500 events, not
-    every one, so a long scan's background thread doesn't contend the
-    status lock a polling GET also reads on every request. Returns the
-    number of events read. Raises on failure (missing binary, non-zero
-    exit, or exceeding the wall-clock budget)."""
+    (used for the author/recipient/subscriber scans, any of which can be
+    genuinely unbounded — too much to ever buffer as a list). If given,
+    on_progress(count) is called every 500 events, not every one, so a long
+    scan's background thread doesn't contend the status lock a polling GET
+    also reads on every request.
+
+    Raises on failure (missing binary or non-zero exit) always. On hitting
+    the wall-clock budget: raises, same as before, UNLESS `timeout_ok=True`
+    — then the partial read is not a failure, and the return value becomes
+    `(count, timed_out)` instead of a bare count, so the caller can hand
+    back what it read so far as a "ran out of time" result rather than
+    losing it. Default is False (raise) so a caller that hasn't opted in
+    keeps the old all-or-nothing behavior — see REPORT_WALK_DEADLINE for
+    why that's still the right choice for compute_report_walk."""
     strfry_bin = require_strfry_bin()
     filter_json = json.dumps(filter_obj, separators=(",", ":"))
     argv = [strfry_bin, "--config", require_strfry_conf(), "scan", filter_json]
@@ -2223,12 +2275,14 @@ def run_strfry_scan_streaming(filter_obj, on_event, timeout, on_progress=None):
             proc.wait()
         stderr_thread.join(timeout=2)
 
-    if timed_out:
+    if timed_out and not timeout_ok:
         raise RuntimeError(f"strfry scan exceeded {timeout}s budget after reading {count} events")
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not timed_out:
         with stderr_lock:
             tail = stderr_tail(bytes(stderr_buf))
         raise RuntimeError(f"strfry scan exited {proc.returncode}: {tail}")
+    if timeout_ok:
+        return count, timed_out
     return count
 
 
@@ -2343,7 +2397,7 @@ def _resolve_profiles_locally(pubkeys):
             error = f"name resolution failed: {e}"
             results = {}
         if results:
-            namecache.set_local(results, now, max_entries=NAME_CACHE_MAX)
+            namecache.set_local(results, now, max_entries=get_name_cache_max())
             for pk, hit in results.items():
                 cached[pk] = {"name": hit["name"], "nip05": hit["nip05"], "checked_at": now, "source": "local"}
 
@@ -2384,8 +2438,10 @@ def _load_cache_or(path, empty_result):
 
 
 # --- server-side audit log -------------------------------------------------
+# AUDIT_LOG_MAX is CONFIGURABLE — see get_audit_log_max() near
+# CONFIG_EDITABLE_FIELDS, where its default/floor/ceiling are defined
+# alongside the rest of that group.
 AUDIT_LOG_PATH = os.path.join(SCRIPT_DIR, "audit-log.json")
-AUDIT_LOG_MAX = 500
 
 
 def _empty_audit_log():
@@ -2399,7 +2455,7 @@ if not isinstance(_audit_log.get("records"), list):
 
 
 def audit_append(record):
-    """Append one admin-action record and persist. Caps at AUDIT_LOG_MAX."""
+    """Append one admin-action record and persist. Caps at get_audit_log_max()."""
     if not isinstance(record, dict):
         return
     rec = dict(record)
@@ -2409,8 +2465,9 @@ def audit_append(record):
     with _audit_lock:
         records = list(_audit_log.get("records") or [])
         records.append(rec)
-        if len(records) > AUDIT_LOG_MAX:
-            records = records[-AUDIT_LOG_MAX:]
+        cap = get_audit_log_max()
+        if len(records) > cap:
+            records = records[-cap:]
         _audit_log["records"] = records
         try:
             _save_cache_atomic(AUDIT_LOG_PATH, _audit_log)
@@ -2781,6 +2838,48 @@ EPHEMERAL_KIND_MAX = 29999
 _EPHEMERAL_KINDS = list(range(EPHEMERAL_KIND_MIN, EPHEMERAL_KIND_MAX + 1))
 EPHEMERAL_PURGE_TIMEOUT = 3600
 
+# CONFIGURABLE defaults/bounds — see get_<name>() functions below and
+# CONFIG_INT_BOUNDS. Each one used to be a plain module constant; none of
+# them feed a subprocess timeout or a process-lifetime buffer (those stayed
+# HARD, in the bounds block near the top of the file), so an operator
+# preference here costs nothing structural to raise or lower within its
+# range.
+REPORT_SCAN_LIMIT_DEFAULT = 5000        # kind-1984 events read to build the reports-against tally
+REPORT_SCAN_LIMIT_MIN = 500
+REPORT_SCAN_LIMIT_MAX = 100000
+NAME_RESOLVE_MAX_DEFAULT = 500          # pubkeys per batched kind-0 lookup
+NAME_RESOLVE_MAX_MIN = 50
+NAME_RESOLVE_MAX_MAX = 5000
+NAME_CACHE_MAX_DEFAULT = 20000          # entries retained in names.json
+NAME_CACHE_MAX_MIN = 1000
+NAME_CACHE_MAX_MAX = 200000
+DOMAIN_LOOKUP_MAX_DEFAULT = 1000        # pubkeys accepted in one /api/pubkeys/lookup body
+DOMAIN_LOOKUP_MAX_MIN = 50
+DOMAIN_LOOKUP_MAX_MAX = 20000
+PROFILE_EVENT_LIMIT_DEFAULT = 500       # events read for one pubkey's kind tally
+PROFILE_EVENT_LIMIT_MIN = 50
+PROFILE_EVENT_LIMIT_MAX = 5000
+PROFILE_REPORT_LIMIT_DEFAULT = 100      # kind-1984 events read for reports against one pubkey
+PROFILE_REPORT_LIMIT_MIN = 10
+PROFILE_REPORT_LIMIT_MAX = 2000
+PROFILE_DAY_EVENTS_MAX_DEFAULT = 50     # events read for one pubkey's single-day view
+PROFILE_DAY_EVENTS_MAX_MIN = 10
+PROFILE_DAY_EVENTS_MAX_MAX = 1000
+REASON_MAX_LEN_DEFAULT = 500            # characters accepted for a ban reason
+REASON_MAX_LEN_MIN = 50
+REASON_MAX_LEN_MAX = 5000
+REASON_UNDO_MAX_DEFAULT = 50            # entries whose prior reasons are snapshotted for undo
+REASON_UNDO_MAX_MIN = 5
+REASON_UNDO_MAX_MAX = 500
+# audit_log_max's floor is not a UX nicety like the others' — the audit log
+# is the ONLY undo authority in the project (audit.html says so explicitly).
+# A value set too low silently destroys undo capability for actions already
+# taken, not just a view; AUDIT_LOG_MAX_MIN exists to make that mistake
+# require deliberately typing a small number, not a mis-click on a slider.
+AUDIT_LOG_MAX_DEFAULT = 500
+AUDIT_LOG_MAX_MIN = 100
+AUDIT_LOG_MAX_MAX = 20000
+
 CONFIG_EDITABLE_FIELDS = {
     # config.json keys the Settings page may write. admin_pubkey_hex is
     # deliberately NOT here: it is the credential that authorises the very
@@ -2800,7 +2899,81 @@ CONFIG_EDITABLE_FIELDS = {
                                 "minimum 7)"),
     "port": ("int", "Admin UI port", "port server86 binds; takes effect on next start"),
     "bind": ("string", "Admin UI bind address", "interface server86 binds; takes effect on next start"),
+    "report_scan_limit": ("int", "Report scan size",
+                           "kind-1984 events read to build the reports-against tally (default 5,000)"),
+    "name_resolve_max": ("int", "Name lookup batch size",
+                          "pubkeys per batched kind-0 name lookup (default 500) — a heavier "
+                          "lookup shape than a plain scan; raising it costs more time per batch"),
+    "name_cache_max": ("int", "Name cache size",
+                        "resolved names/nip05s kept in names.json before the oldest are evicted "
+                        "(default 20,000)"),
+    "domain_lookup_max": ("int", "Domain roster lookup size",
+                           "pubkeys accepted in one /domain roster lookup (default 1,000) — a "
+                           "request over this is rejected outright, never truncated"),
+    "profile_event_limit": ("int", "Profile event window",
+                             "events read for one pubkey's kind tally on /profile (default 500)"),
+    "profile_report_limit": ("int", "Profile report window",
+                              "kind-1984 events read for reports against one pubkey (default 100)"),
+    "profile_day_events_max": ("int", "Profile day-view window",
+                                "events read for one pubkey's single-day view (default 50)"),
+    "reason_max_len": ("int", "Ban reason max length",
+                        "characters accepted for a ban reason; longer is rejected outright, "
+                        "never truncated (default 500)"),
+    "reason_undo_max": ("int", "Bulk reason-edit undo size",
+                         "entries whose prior reasons are snapshotted for undo on a bulk reason "
+                         "edit; a larger edit gets no undo at all (default 50)"),
+    "audit_log_max": ("int", "Audit log size",
+                       f"admin-action records retained — this is the ONLY undo authority in the "
+                       f"project, so a value set too low destroys undo capability for actions "
+                       f"already taken. Floor {AUDIT_LOG_MAX_MIN} enforced for that reason "
+                       f"(default {AUDIT_LOG_MAX_DEFAULT})"),
+    "extra_author_scan_kinds": ("kind_list", "Extra author-scan kinds",
+                                 "comma-separated kind numbers ADDED to the shipped allowlist for the "
+                                 "full author scan, database totals, and the database walk — this can "
+                                 "only widen coverage, never remove a shipped kind. Adding a kind here "
+                                 "does not retroactively cover the CURRENT author-scan cache; rerun a "
+                                 "full scan to include it."),
 }
+
+# min/max for the CONFIGURABLE int fields above, keyed by CONFIG_EDITABLE_FIELDS
+# key. Not every "int" field is here — "port" is deliberately unclamped, since
+# any operator-chosen port is as valid as any other. Read by get_settings_payload
+# (to show the bound on the page) and write_app_config (to enforce it on save).
+CONFIG_INT_BOUNDS = {
+    "report_scan_limit": (REPORT_SCAN_LIMIT_MIN, REPORT_SCAN_LIMIT_MAX),
+    "name_resolve_max": (NAME_RESOLVE_MAX_MIN, NAME_RESOLVE_MAX_MAX),
+    "name_cache_max": (NAME_CACHE_MAX_MIN, NAME_CACHE_MAX_MAX),
+    "domain_lookup_max": (DOMAIN_LOOKUP_MAX_MIN, DOMAIN_LOOKUP_MAX_MAX),
+    "profile_event_limit": (PROFILE_EVENT_LIMIT_MIN, PROFILE_EVENT_LIMIT_MAX),
+    "profile_report_limit": (PROFILE_REPORT_LIMIT_MIN, PROFILE_REPORT_LIMIT_MAX),
+    "profile_day_events_max": (PROFILE_DAY_EVENTS_MAX_MIN, PROFILE_DAY_EVENTS_MAX_MAX),
+    "reason_max_len": (REASON_MAX_LEN_MIN, REASON_MAX_LEN_MAX),
+    "reason_undo_max": (REASON_UNDO_MAX_MIN, REASON_UNDO_MAX_MAX),
+    "audit_log_max": (AUDIT_LOG_MAX_MIN, AUDIT_LOG_MAX_MAX),
+}
+
+
+def _get_config_int(key, default, min_v=None, max_v=None):
+    """Generic reader for one CONFIGURABLE int field in config.json.
+    Missing/invalid -> default. Clamped to [min_v, max_v] when given — same
+    shape as get_giftwrap_retention_days, generalised so ten near-identical
+    fields don't need ten copies of this."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh).get(key)
+    except (OSError, ValueError):
+        return default
+    if raw is None or raw == "":
+        return default
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if min_v is not None:
+        n = max(min_v, n)
+    if max_v is not None:
+        n = min(max_v, n)
+    return n
 
 # Help text for strfry.conf fields whose blank value means "use the default"
 # rather than "set this empty". Sourced from strfry's own distributed conf:
@@ -2983,6 +3156,96 @@ def get_giftwrap_retention_days():
     return max(GIFTWRAP_RETENTION_MIN, min(GIFTWRAP_RETENTION_MAX, days))
 
 
+def get_report_scan_limit():
+    return _get_config_int("report_scan_limit", REPORT_SCAN_LIMIT_DEFAULT, REPORT_SCAN_LIMIT_MIN, REPORT_SCAN_LIMIT_MAX)
+
+
+def get_name_resolve_max():
+    return _get_config_int("name_resolve_max", NAME_RESOLVE_MAX_DEFAULT, NAME_RESOLVE_MAX_MIN, NAME_RESOLVE_MAX_MAX)
+
+
+def get_name_cache_max():
+    return _get_config_int("name_cache_max", NAME_CACHE_MAX_DEFAULT, NAME_CACHE_MAX_MIN, NAME_CACHE_MAX_MAX)
+
+
+def get_domain_lookup_max():
+    return _get_config_int("domain_lookup_max", DOMAIN_LOOKUP_MAX_DEFAULT, DOMAIN_LOOKUP_MAX_MIN, DOMAIN_LOOKUP_MAX_MAX)
+
+
+def get_profile_event_limit():
+    return _get_config_int("profile_event_limit", PROFILE_EVENT_LIMIT_DEFAULT, PROFILE_EVENT_LIMIT_MIN, PROFILE_EVENT_LIMIT_MAX)
+
+
+def get_profile_report_limit():
+    return _get_config_int("profile_report_limit", PROFILE_REPORT_LIMIT_DEFAULT, PROFILE_REPORT_LIMIT_MIN, PROFILE_REPORT_LIMIT_MAX)
+
+
+def get_profile_day_events_max():
+    return _get_config_int("profile_day_events_max", PROFILE_DAY_EVENTS_MAX_DEFAULT, PROFILE_DAY_EVENTS_MAX_MIN, PROFILE_DAY_EVENTS_MAX_MAX)
+
+
+def get_reason_max_len():
+    return _get_config_int("reason_max_len", REASON_MAX_LEN_DEFAULT, REASON_MAX_LEN_MIN, REASON_MAX_LEN_MAX)
+
+
+def get_reason_undo_max():
+    return _get_config_int("reason_undo_max", REASON_UNDO_MAX_DEFAULT, REASON_UNDO_MAX_MIN, REASON_UNDO_MAX_MAX)
+
+
+def get_audit_log_max():
+    return _get_config_int("audit_log_max", AUDIT_LOG_MAX_DEFAULT, AUDIT_LOG_MAX_MIN, AUDIT_LOG_MAX_MAX)
+
+
+def get_extra_author_scan_kinds():
+    """Operator-added kinds from config.json's `extra_author_scan_kinds` —
+    a list of non-negative ints, missing/invalid/empty -> (). Never
+    validated against NIP kind-number conventions beyond "non-negative
+    integer": an operator adding a kind their own relay actually uses is
+    trusted the same way REASON_MAX_LEN trusts an operator's own reason
+    text."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh).get("extra_author_scan_kinds")
+    except (OSError, ValueError):
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for v in raw:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int) and v >= 0:
+            out.append(v)
+    return tuple(out)
+
+
+def get_effective_author_scan_kinds():
+    """The SHIPPED default UNION any operator additions — never a
+    replacement, so an operator can only widen coverage, never silently
+    drop a kind this project ships allowlisted. This is what every scan,
+    count, and comparison that means "the allowlist" should read; direct
+    reads of AUTHOR_SCAN_KINDS are reserved for the two places that define
+    or audit the shipped default itself."""
+    return tuple(sorted(set(AUTHOR_SCAN_KINDS) | set(get_extra_author_scan_kinds())))
+
+
+# Every CONFIGURABLE int field's accessor, keyed the same as CONFIG_INT_BOUNDS
+# — used by get_settings_payload so the page shows the value actually in
+# effect (defaulted/clamped), not a raw, possibly-unset config.json read.
+CONFIG_INT_GETTERS = {
+    "report_scan_limit": get_report_scan_limit,
+    "name_resolve_max": get_name_resolve_max,
+    "name_cache_max": get_name_cache_max,
+    "domain_lookup_max": get_domain_lookup_max,
+    "profile_event_limit": get_profile_event_limit,
+    "profile_report_limit": get_profile_report_limit,
+    "profile_day_events_max": get_profile_day_events_max,
+    "reason_max_len": get_reason_max_len,
+    "reason_undo_max": get_reason_undo_max,
+    "audit_log_max": get_audit_log_max,
+}
+
+
 def get_settings_payload():
     conf_status = strfry_conf_status()
     conf_text, conf_err = read_strfry_conf()
@@ -3004,6 +3267,10 @@ def get_settings_payload():
     for key, (ftype, label, help_text) in CONFIG_EDITABLE_FIELDS.items():
         if key == "giftwrap_retention_days":
             value = get_giftwrap_retention_days()
+        elif key in CONFIG_INT_GETTERS:
+            value = CONFIG_INT_GETTERS[key]()
+        elif ftype == "kind_list":
+            value = ", ".join(str(k) for k in get_extra_author_scan_kinds())
         else:
             value = cfg_data.get(key, "") if cfg_data.get(key) is not None else ""
         field = {
@@ -3019,6 +3286,8 @@ def get_settings_payload():
             field["min"] = GIFTWRAP_RETENTION_MIN
             field["max"] = GIFTWRAP_RETENTION_MAX
             field["step"] = 1
+        elif key in CONFIG_INT_BOUNDS:
+            field["min"], field["max"] = CONFIG_INT_BOUNDS[key]
         app_fields.append(field)
     conf_path = conf_status.get("path")
     return {
@@ -3087,7 +3356,25 @@ def write_app_config(edits=None, raw=None):
                     return False, f"{key} must be a whole number"
                 if key == "giftwrap_retention_days":
                     n = max(GIFTWRAP_RETENTION_MIN, min(GIFTWRAP_RETENTION_MAX, n))
+                elif key in CONFIG_INT_BOUNDS:
+                    lo, hi = CONFIG_INT_BOUNDS[key]
+                    n = max(lo, min(hi, n))
                 new_data[key] = n
+            elif spec[0] == "kind_list":
+                text = str(value).strip()
+                if not text:
+                    new_data[key] = []
+                else:
+                    kinds = []
+                    for tok in text.replace(",", " ").split():
+                        try:
+                            k = int(tok)
+                        except ValueError:
+                            return False, f"{key}: {tok!r} is not a whole number"
+                        if k < 0:
+                            return False, f"{key}: {tok!r} must not be negative"
+                        kinds.append(k)
+                    new_data[key] = sorted(set(kinds))
             elif key == "strfry_conf_path" and not str(value).strip():
                 new_data.pop(key, None)
             else:
@@ -3424,7 +3711,7 @@ def _scan_status(name, job, cache):
 
 
 def _publish_authors_partial(tally, force=False, _state=None):
-    """Publish the current top-RENDER_MAX authors onto `_authors_job` for
+    """Publish the current top-RENDER_PAGE_MAX authors onto `_authors_job` for
     the Users table to stream while the scan is still running.
 
     Lives only on the job dict — never the persisted authors cache and
@@ -3443,7 +3730,7 @@ def _publish_authors_partial(tally, force=False, _state=None):
         ((pk, e) for pk, e in tally.items() if is_hex64(pk)),
         key=lambda kv: kv[1]["count"],
         reverse=True,
-    )[:RENDER_MAX]
+    )[:RENDER_PAGE_MAX]
     partial = []
     for pk, entry in ranked:
         partial.append({
@@ -3467,7 +3754,7 @@ def compute_authors(mode, progress_cb=None):
     first, as documented; verify that against the deployed strfry version
     before relying on it.
 
-    While streaming, the top RENDER_MAX authors by count so far are
+    While streaming, the top RENDER_PAGE_MAX authors by count so far are
     published onto `_authors_job["partial_authors"]` so GET /api/authors
     and /api/userlist can fill the Users table mid-scan. Partials never
     touch the persisted cache.
@@ -3481,9 +3768,24 @@ def compute_authors(mode, progress_cb=None):
     press."""
     start = time.monotonic()
     filter_obj = dict(AUTHOR_SCAN_MODES[mode])
-    limit = filter_obj["limit"]
+    scan_kinds = None
+    if mode == "full":
+        # Filled in here, not at import time, so an operator's config.json
+        # additions (get_effective_author_scan_kinds) are picked up fresh
+        # on every scan, not frozen at whatever they were when server86
+        # started.
+        scan_kinds = get_effective_author_scan_kinds()
+        filter_obj["kinds"] = list(scan_kinds)
+    limit = filter_obj.get("limit")
+    # "full" mode carries no limit — get the exact matching count up front
+    # (cheap: index-only, per run_strfry_count's own docstring) so a
+    # progress bar has a real denominator and, if AUTHOR_SCAN_DEADLINE ends
+    # up binding, the result can say exactly how far short it fell.
+    total_matching = None
+    if limit is None:
+        total_matching = run_strfry_count({"kinds": list(scan_kinds)}, timeout=AUTHOR_SCAN_DEADLINE)
     if progress_cb:
-        progress_cb(0, total=limit)
+        progress_cb(0, total=limit if limit is not None else total_matching)
     tally = {}  # pubkey -> {"count": int, "last_seen": int, "kind": int_or_None}
     kind_counts = {}
     span = {"start": None, "end": None}
@@ -3517,11 +3819,12 @@ def compute_authors(mode, progress_cb=None):
             progress_cb(count, total=total)
         _publish_authors_partial(tally, force=False, _state=partial_state)
 
-    events_read = run_strfry_scan_streaming(
+    events_read, timed_out = run_strfry_scan_streaming(
         filter_obj, on_event, timeout=AUTHOR_SCAN_DEADLINE, on_progress=on_progress,
+        timeout_ok=True,
     )
     _publish_authors_partial(tally, force=True, _state=partial_state)
-    saturated = events_read >= limit
+    saturated = timed_out or (limit is not None and events_read >= limit)
 
     singleton_kinds = {}
     for entry in tally.values():
@@ -3532,10 +3835,11 @@ def compute_authors(mode, progress_cb=None):
     reports_ok = True
     reports_scanned = 0
     reports_saturated = False
+    report_scan_limit = get_report_scan_limit()
     try:
-        report_events = run_strfry_scan({"kinds": [1984], "limit": REPORT_SCAN_LIMIT}, timeout=SCAN_TIMEOUT)
+        report_events = run_strfry_scan({"kinds": [1984], "limit": report_scan_limit}, timeout=SCAN_TIMEOUT)
         reports_scanned = len(report_events)
-        reports_saturated = reports_scanned >= REPORT_SCAN_LIMIT
+        reports_saturated = reports_scanned >= report_scan_limit
         for ev in report_events:
             reporter = ev.get("pubkey")
             tags = ev.get("tags")
@@ -3584,7 +3888,7 @@ def compute_authors(mode, progress_cb=None):
     # real relay they are overwhelmingly gift-wrap-adjacent throwaway
     # keys with no kind-0 to find, and resolving them would spend the
     # whole cap on the least useful rows.
-    to_resolve = [r["pubkey"] for r in rows if r["count"] != 1][:NAME_RESOLVE_MAX]
+    to_resolve = [r["pubkey"] for r in rows if r["count"] != 1][:get_name_resolve_max()]
     name_resolution_error = None
     try:
         profiles, name_resolution_error = resolve_profiles(to_resolve)
@@ -3612,6 +3916,16 @@ def compute_authors(mode, progress_cb=None):
     del rows
 
     warning = None if reports_ok else "reports tally failed — sorting by event count only"
+    if timed_out:
+        # Rare by design (see AUTHOR_SCAN_DEADLINE) — genuinely unbounded now
+        # that "full" mode carries no count limit, so this is the one place
+        # completeness can still be silently lost if it isn't said plainly.
+        deadline_note = (
+            f"ran out of time after {AUTHOR_SCAN_DEADLINE}s — read {events_read:,} of "
+            f"{total_matching:,} matching events" if total_matching is not None
+            else f"ran out of time after {AUTHOR_SCAN_DEADLINE}s — read {events_read:,} events"
+        )
+        warning = (warning + " — " + deadline_note) if warning else deadline_note
     if list_omitted:
         trunc_note = (
             f"author list truncated to top {CACHE_LIST_MAX:,} of "
@@ -3626,7 +3940,10 @@ def compute_authors(mode, progress_cb=None):
         "duration": time.monotonic() - start,
         "mode": mode,
         "limit": limit,
+        "scan_kinds": list(scan_kinds) if scan_kinds is not None else None,
+        "total_matching": total_matching,
         "saturated": saturated,
+        "timed_out": timed_out,
         "events_read": events_read,
         "span_start": span["start"],
         "span_end": span["end"],
@@ -3634,6 +3951,7 @@ def compute_authors(mode, progress_cb=None):
         "singleton_kinds": singleton_kinds,
         "reports_saturated": reports_saturated,
         "reports_scanned": reports_scanned,
+        "reports_scan_limit": report_scan_limit,
         "list_total": list_total,
         "list_omitted": list_omitted,
         "warning": warning,
@@ -3644,10 +3962,11 @@ def compute_authors(mode, progress_cb=None):
 
 def _empty_authors_result():
     return {
-        "scanned_at": None, "duration": None, "mode": None, "limit": None, "saturated": False,
+        "scanned_at": None, "duration": None, "mode": None, "limit": None,
+        "scan_kinds": None, "total_matching": None, "saturated": False, "timed_out": False,
         "events_read": 0, "span_start": None, "span_end": None,
         "kinds": {}, "singleton_kinds": {},
-        "reports_saturated": False, "reports_scanned": 0,
+        "reports_saturated": False, "reports_scanned": 0, "reports_scan_limit": None,
         "list_total": 0, "list_omitted": 0,
         "warning": None, "error": None, "authors": [],
     }
@@ -3686,6 +4005,23 @@ def start_authors_scan(mode):
     return _start_scan_job("authors", _authors_job, run, extra_job_fields={"mode": mode})
 
 
+def _authors_cache_kinds_stale(status):
+    """True when the cached FULL-mode author scan's kind set no longer
+    covers every kind in the CURRENT effective allowlist — i.e. an
+    operator added a kind via config.json's extra_author_scan_kinds AFTER
+    this scan ran, so the cache does not yet include events of that kind.
+    'recent' mode scans every kind unconditionally and is never stale by
+    this measure; a cache with no recorded scan_kinds (never run in full
+    mode, or from before this field existed) is not 'stale', just not
+    comparable — silence over a false claim either way."""
+    if status.get("mode") != "full":
+        return False
+    cached_kinds = status.get("scan_kinds")
+    if not cached_kinds:
+        return False
+    return not set(get_effective_author_scan_kinds()) <= set(cached_kinds)
+
+
 def get_authors_status():
     """GET /api/authors: never scans, never starts one. `modes` names every
     selectable AUTHOR_SCAN_MODES entry with its bound and its measured
@@ -3696,6 +4032,7 @@ def get_authors_status():
         name: {"events": cfg.get("limit"), "typical_seconds": _author_mode_durations.get(name)}
         for name, cfg in AUTHOR_SCAN_MODES.items()
     }
+    status["kinds_stale"] = _authors_cache_kinds_stale(status)
     return status
 
 
@@ -3714,7 +4051,7 @@ def _authors_status_for_http(status):
     get_userlist_snapshot()/authors_scan_pubkeys(). The full `authors` array
     (up to CACHE_LIST_MAX entries) duplicates that response wholesale, so
     drop it from the HTTP view only; `partial_authors` stays — it's
-    RENDER_MAX-bounded and users.html renders it directly mid-scan."""
+    RENDER_PAGE_MAX-bounded and users.html renders it directly mid-scan."""
     view = dict(status)
     view.pop("authors", None)
     return view
@@ -3732,22 +4069,29 @@ def _authors_status_for_http(status):
 
 def _empty_recipients_result():
     return {
-        "scanned_at": None, "events_read": 0, "span_start": None, "span_end": None,
-        "saturated": False, "list_total": 0, "list_omitted": 0,
+        "scanned_at": None, "events_read": 0, "total_matching": None, "span_start": None, "span_end": None,
+        "saturated": False, "timed_out": False, "list_total": 0, "list_omitted": 0,
         "warning": None, "error": None, "recipients": [],
     }
 
 
 def compute_recipients(progress_cb=None):
-    """One bounded scan of the newest RECIPIENT_SCAN_LIMIT gift-wrap
-    events, tallying the `p` tag — the wrapped message's recipient, never
-    the event's `pubkey`, which is a fresh single-use sender key — while
-    streaming, so no event body is ever held in full. Gift-wrap CONTENT is
-    encrypted and senders are unlinkable; nothing here reveals who is
-    talking to whom, and recipient counts are for retention/capacity
-    decisions only, never a moderation signal."""
+    """One scan of EVERY kind-1059 gift-wrap event, tallying the `p` tag —
+    the wrapped message's recipient, never the event's `pubkey`, which is a
+    fresh single-use sender key — while streaming, so no event body is ever
+    held in full and there is no count limit left to fall short of. Gift-
+    wrap CONTENT is encrypted and senders are unlinkable; nothing here
+    reveals who is talking to whom, and recipient counts are for
+    retention/capacity decisions only, never a moderation signal.
+
+    Bounded only by AUTHOR_SCAN_DEADLINE now — see that constant for what
+    "ran out of time" means here. Kept as a FLOOR when it happens (CACHE_LIST_MAX-style):
+    an incomplete tally still only under-counts, never invents a recipient,
+    so it's always safe for the retention-purge estimate that reads this to
+    treat it as "at least this many", the same way it always has."""
+    total_matching = run_strfry_count({"kinds": [1059]}, timeout=AUTHOR_SCAN_DEADLINE)
     if progress_cb:
-        progress_cb(0, total=RECIPIENT_SCAN_LIMIT)
+        progress_cb(0, total=total_matching)
     tally = {}
     span = {"start": None, "end": None}
 
@@ -3766,18 +4110,18 @@ def compute_recipients(progress_cb=None):
         if span["end"] is None or created_at > span["end"]:
             span["end"] = created_at
 
-    events_read = run_strfry_scan_streaming(
-        {"kinds": [1059], "limit": RECIPIENT_SCAN_LIMIT}, on_event,
-        timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb,
+    events_read, timed_out = run_strfry_scan_streaming(
+        {"kinds": [1059]}, on_event,
+        timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb, timeout_ok=True,
     )
-    saturated = events_read >= RECIPIENT_SCAN_LIMIT
+    saturated = timed_out
 
     rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
     list_total = len(rows)
     list_omitted = max(0, list_total - CACHE_LIST_MAX)
     rows = rows[:CACHE_LIST_MAX]
     tally.clear()
-    to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
+    to_resolve = [pk for pk, _ in rows[:get_name_resolve_max()]]
     name_resolution_error = None
     try:
         profiles, name_resolution_error = resolve_profiles(to_resolve)
@@ -3797,20 +4141,31 @@ def compute_recipients(progress_cb=None):
     del rows
 
     warning = None
-    if list_omitted:
+    if timed_out:
+        # Rare (same AUTHOR_SCAN_DEADLINE headroom as the author scan) — but
+        # when it happens, say exactly how far short of complete this is,
+        # not just "SATURATED".
         warning = (
+            f"ran out of time after {AUTHOR_SCAN_DEADLINE}s — read {events_read:,} of "
+            f"{total_matching:,} gift-wrap events"
+        )
+    if list_omitted:
+        trunc_note = (
             f"recipient list truncated to top {CACHE_LIST_MAX:,} of "
             f"{list_total:,} (lowest-count tail dropped to protect memory)"
         )
+        warning = (warning + " — " + trunc_note) if warning else trunc_note
     if name_resolution_error:
         warning = (warning + " — " + name_resolution_error) if warning else name_resolution_error
 
     return {
         "scanned_at": int(time.time()),
         "events_read": events_read,
+        "total_matching": total_matching,
         "span_start": span["start"],
         "span_end": span["end"],
         "saturated": saturated,
+        "timed_out": timed_out,
         "list_total": list_total,
         "list_omitted": list_omitted,
         "warning": warning,
@@ -3847,16 +4202,17 @@ def get_recipients_status():
 
 def _empty_reports_result():
     return {
-        "scanned_at": None, "events_read": 0, "saturated": False,
+        "scanned_at": None, "events_read": 0, "saturated": False, "scan_limit": None,
         "warning": None, "error": None, "counts": {},
     }
 
 
 def compute_reports(progress_cb=None):
+    report_scan_limit = get_report_scan_limit()
     if progress_cb:
-        progress_cb(0, total=REPORT_SCAN_LIMIT)
+        progress_cb(0, total=report_scan_limit)
     reporters_by_pubkey = {}
-    events = run_strfry_scan({"kinds": [1984], "limit": REPORT_SCAN_LIMIT}, timeout=SCAN_TIMEOUT)
+    events = run_strfry_scan({"kinds": [1984], "limit": report_scan_limit}, timeout=SCAN_TIMEOUT)
     for ev in events:
         reporter = ev.get("pubkey")
         tags = ev.get("tags")
@@ -3868,7 +4224,8 @@ def compute_reports(progress_cb=None):
     return {
         "scanned_at": int(time.time()),
         "events_read": len(events),
-        "saturated": len(events) >= REPORT_SCAN_LIMIT,
+        "saturated": len(events) >= report_scan_limit,
+        "scan_limit": report_scan_limit,
         "warning": None,
         "error": None,
         "counts": {pk: len(reporters) for pk, reporters in reporters_by_pubkey.items()},
@@ -3900,8 +4257,8 @@ def get_reports_status():
 
 def _empty_subscribers_result():
     return {
-        "scanned_at": None, "relay_url": None, "saturated": False,
-        "scan_limit": SUBSCRIBER_SCAN_LIMIT, "counted": {},
+        "scanned_at": None, "relay_url": None, "saturated": False, "timed_out": False,
+        "counted": {},
         "warning": None, "error": None,
         "subscribers": [], "general_subscribers": [],
     }
@@ -3979,11 +4336,11 @@ def set_relay_url(value):
 
 
 def compute_subscribers(progress_cb=None):
-    """Two bounded scans, kept separate: kind 10050 (NIP-17 DM relay lists)
-    and kind 10002 (general relay lists) — a pubkey listing this relay for
-    general use is a different relationship from one listing it for DMs.
-    Each is capped at SUBSCRIBER_SCAN_LIMIT and matched host-only against
-    get_relay_url().
+    """Two scans, kept separate: kind 10050 (NIP-17 DM relay lists) and kind
+    10002 (general relay lists) — a pubkey listing this relay for general
+    use is a different relationship from one listing it for DMs. Neither
+    carries a count limit any more; both are bounded only by
+    AUTHOR_SCAN_DEADLINE, matched host-only against get_relay_url().
 
     An unconfigured relay.info.url is a FAILED run, not a result: raising
     here means the caller (_run_scan_job) preserves whatever cache existed
@@ -3997,10 +4354,13 @@ def compute_subscribers(progress_cb=None):
     a saturated subscriber list is a FLOOR, so missing subscribers means
     missing exemptions means MORE deletion, not less (the opposite of a
     saturated recipient scan, which only deletes less). `counted` runs an
-    exact index count per kind alongside the bounded tally read, so
-    saturation is a fact rather than an inference, and callers (the
-    exempt-purge command builder) must refuse to build an exemption list
-    from a saturated scan."""
+    exact index count per kind alongside the tally read, so saturation is a
+    fact rather than an inference, and callers (the exempt-purge command
+    builder) must refuse to build an exemption list from a saturated scan.
+    This asymmetry is exactly why this scan stayed a rare-but-real risk even
+    after the count cap was removed elsewhere: AUTHOR_SCAN_DEADLINE hitting
+    here is worse than it hitting the recipient scan, so `counted` exists
+    specifically so a truncated tally is never mistaken for a complete one."""
     relay_url = get_relay_url()
     relay_host = _hostname_of(relay_url)
     if relay_host is None:
@@ -4011,11 +4371,12 @@ def compute_subscribers(progress_cb=None):
     counted = {}
 
     def scan_kind(kind):
-        counted[str(kind)] = run_strfry_count({"kinds": [kind]}, timeout=AUTHOR_SCAN_DEADLINE)
+        total = run_strfry_count({"kinds": [kind]}, timeout=AUTHOR_SCAN_DEADLINE)
+        counted[str(kind)] = total
 
         tally = {}  # pubkey -> latest created_at among matching events
         if progress_cb:
-            progress_cb(0, total=SUBSCRIBER_SCAN_LIMIT)
+            progress_cb(0, total=total)
 
         def on_event(ev):
             if not isinstance(ev, dict):
@@ -4035,14 +4396,15 @@ def compute_subscribers(progress_cb=None):
             if pk not in tally or created_at > tally[pk]:
                 tally[pk] = created_at
 
-        events_read = run_strfry_scan_streaming(
-            {"kinds": [kind], "limit": SUBSCRIBER_SCAN_LIMIT}, on_event,
-            timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb,
+        events_read, timed_out = run_strfry_scan_streaming(
+            {"kinds": [kind]}, on_event,
+            timeout=AUTHOR_SCAN_DEADLINE, on_progress=progress_cb, timeout_ok=True,
         )
-        return tally, events_read >= SUBSCRIBER_SCAN_LIMIT
+        return tally, timed_out, events_read
 
-    dm_tally, dm_saturated = scan_kind(10050)
-    general_tally, general_saturated = scan_kind(10002)
+    dm_tally, dm_timed_out, dm_events_read = scan_kind(10050)
+    general_tally, general_timed_out, general_events_read = scan_kind(10002)
+    timed_out = dm_timed_out or general_timed_out
 
     # giftwrap_count cross-references the last COMPLETED recipients scan,
     # which may be older than this scan or (giftwrap_count: null) may never
@@ -4052,7 +4414,7 @@ def compute_subscribers(progress_cb=None):
 
     def build_rows(tally):
         rows = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)
-        to_resolve = [pk for pk, _ in rows[:NAME_RESOLVE_MAX]]
+        to_resolve = [pk for pk, _ in rows[:get_name_resolve_max()]]
         try:
             profiles, _ = resolve_profiles(to_resolve)
         except Exception as e:
@@ -4073,13 +4435,26 @@ def compute_subscribers(progress_cb=None):
             })
         return out
 
+    warning = None
+    if timed_out:
+        # Rare, same AUTHOR_SCAN_DEADLINE headroom as the other two scans —
+        # but this is the one where an operator needs the exact shortfall,
+        # not just a flag, because it gates whether the exempt-purge command
+        # is even offered (see extraNote on /stats).
+        parts = []
+        if dm_timed_out:
+            parts.append(f"DM relay list: read {dm_events_read:,} of {counted.get('10050', 0):,}")
+        if general_timed_out:
+            parts.append(f"general relay list: read {general_events_read:,} of {counted.get('10002', 0):,}")
+        warning = f"ran out of time after {AUTHOR_SCAN_DEADLINE}s — " + "; ".join(parts)
+
     return {
         "scanned_at": int(time.time()),
         "relay_url": relay_url,
-        "saturated": dm_saturated or general_saturated,
-        "scan_limit": SUBSCRIBER_SCAN_LIMIT,
+        "saturated": timed_out,
+        "timed_out": timed_out,
         "counted": counted,
-        "warning": None,
+        "warning": warning,
         "error": None,
         "subscribers": build_rows(dm_tally),
         "general_subscribers": build_rows(general_tally),
@@ -4188,7 +4563,9 @@ def compute_report_totals(progress_cb=None):
     start = time.monotonic()
     total_events = run_strfry_count({}, timeout=AUTHOR_SCAN_DEADLINE)
     giftwrap_events = run_strfry_count({"kinds": [1059]}, timeout=AUTHOR_SCAN_DEADLINE)
-    allowlist_events = run_strfry_count({"kinds": list(AUTHOR_SCAN_KINDS)}, timeout=AUTHOR_SCAN_DEADLINE)
+    allowlist_events = run_strfry_count(
+        {"kinds": list(get_effective_author_scan_kinds())}, timeout=AUTHOR_SCAN_DEADLINE,
+    )
     duration = time.monotonic() - start
 
     non_giftwrap = total_events - giftwrap_events
@@ -4275,7 +4652,7 @@ def compute_report_walk(progress_cb=None):
     duration = count_duration + (time.monotonic() - stream_start)
     rate = events_read / duration if duration > 0 else None
 
-    allowlist_kinds_set = set(AUTHOR_SCAN_KINDS)
+    allowlist_kinds_set = set(get_effective_author_scan_kinds())
     unlisted_kinds = {
         k: c for k, c in kind_counts.items()
         if k not in allowlist_kinds_set and k != 1059
@@ -4465,8 +4842,8 @@ def validate_reason_request(body):
     mode = body.get("mode")
     if not isinstance(pubkeys, list) or not all(is_hex64(pk) for pk in pubkeys):
         return None, None, None, "malformed pubkeys list"
-    if not isinstance(reason, str) or len(reason) > REASON_MAX_LEN:
-        return None, None, None, "reason missing or exceeds REASON_MAX_LEN"
+    if not isinstance(reason, str) or len(reason) > get_reason_max_len():
+        return None, None, None, "reason missing or exceeds the configured reason length limit"
     if mode not in ("replace", "append"):
         return None, None, None, "mode must be 'replace' or 'append'"
     return [pk.lower() for pk in pubkeys], reason, mode, None
@@ -4591,14 +4968,15 @@ def compute_profile(pubkey_hex):
     kinds_saturated = False
     previews = []
     profile_fields = None
+    profile_event_limit = get_profile_event_limit()
     try:
-        events = run_strfry_scan({"authors": [pubkey_hex], "limit": PROFILE_EVENT_LIMIT}, timeout=SCAN_TIMEOUT)
+        events = run_strfry_scan({"authors": [pubkey_hex], "limit": profile_event_limit}, timeout=SCAN_TIMEOUT)
         # `limit` returns the newest matching events first (verified —
         # see CLAUDE.md's "strfry scan execution rules"), but sort
         # explicitly anyway so this doesn't depend on strfry's own
         # ordering staying newest-first within one response.
         events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
-        kinds_saturated = len(events) >= PROFILE_EVENT_LIMIT
+        kinds_saturated = len(events) >= profile_event_limit
         for ev in events:
             kind = ev.get("kind")
             if not isinstance(kind, int):
@@ -4625,12 +5003,13 @@ def compute_profile(pubkey_hex):
 
     reports = []
     reports_saturated = False
+    profile_report_limit = get_profile_report_limit()
     try:
         report_events = run_strfry_scan(
-            {"kinds": [1984], "#p": [pubkey_hex], "limit": PROFILE_REPORT_LIMIT}, timeout=SCAN_TIMEOUT
+            {"kinds": [1984], "#p": [pubkey_hex], "limit": profile_report_limit}, timeout=SCAN_TIMEOUT
         )
         report_events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
-        reports_saturated = len(report_events) >= PROFILE_REPORT_LIMIT
+        reports_saturated = len(report_events) >= profile_report_limit
         for ev in report_events:
             reporter = ev.get("pubkey")
             if not isinstance(reporter, str):
@@ -4689,7 +5068,7 @@ def compute_profile(pubkey_hex):
     return {
         "total_events": total_events,
         "kinds": kinds,
-        "kinds_window": PROFILE_EVENT_LIMIT,
+        "kinds_window": profile_event_limit,
         "kinds_saturated": kinds_saturated,
         "profile": profile_fields,
         "previews": previews,
@@ -4785,12 +5164,13 @@ def compute_profile_day(pubkey_hex, since, until):
     `truncated` says so explicitly rather than letting a full day of events
     look like a complete one. Admin-only because it scans; needs no button
     beyond picking the date, same reasoning as opening /profile itself."""
+    profile_day_events_max = get_profile_day_events_max()
     events = run_strfry_scan(
-        {"authors": [pubkey_hex], "since": since, "until": until, "limit": PROFILE_DAY_EVENTS_MAX},
+        {"authors": [pubkey_hex], "since": since, "until": until, "limit": profile_day_events_max},
         timeout=SCAN_TIMEOUT,
     )
     events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
-    truncated = len(events) >= PROFILE_DAY_EVENTS_MAX
+    truncated = len(events) >= profile_day_events_max
     previews = [_build_event_preview(ev) for ev in events]
     return {"previews": previews, "truncated": truncated}
 
@@ -4822,11 +5202,12 @@ def compute_profile_new_events(pubkey_hex, since):
     False, every new event was actually read, so total_events and each
     kinds[] entry can be incremented by an EXACT delta instead of
     re-scanning the whole pubkey."""
+    profile_event_limit = get_profile_event_limit()
     events = run_strfry_scan(
-        {"authors": [pubkey_hex], "since": since, "limit": PROFILE_EVENT_LIMIT}, timeout=SCAN_TIMEOUT,
+        {"authors": [pubkey_hex], "since": since, "limit": profile_event_limit}, timeout=SCAN_TIMEOUT,
     )
     events.sort(key=lambda ev: ev.get("created_at") or 0, reverse=True)
-    truncated = len(events) >= PROFILE_EVENT_LIMIT
+    truncated = len(events) >= profile_event_limit
     kinds_delta = {}
     for ev in events:
         kind = ev.get("kind")
@@ -4849,8 +5230,9 @@ def validate_pubkeys_lookup_request(body):
     domain = body.get("domain")
     if not isinstance(pubkeys, list) or len(pubkeys) == 0:
         return None, None, "malformed pubkeys list"
-    if len(pubkeys) > DOMAIN_LOOKUP_MAX:
-        return None, None, f"too many pubkeys (max {DOMAIN_LOOKUP_MAX})"
+    domain_lookup_max = get_domain_lookup_max()
+    if len(pubkeys) > domain_lookup_max:
+        return None, None, f"too many pubkeys (max {domain_lookup_max})"
     if not all(is_hex64(pk) for pk in pubkeys):
         return None, None, "malformed pubkey in list"
     if not isinstance(domain, str) or not domain.strip():
@@ -4870,7 +5252,7 @@ def compute_pubkeys_lookup(pubkeys, domain):
         scan_counts = {a["pubkey"]: a.get("count") for a in _authors_cache.get("authors", [])}
 
     try:
-        profiles, _ = resolve_profiles(pubkeys[:NAME_RESOLVE_MAX])
+        profiles, _ = resolve_profiles(pubkeys[:get_name_resolve_max()])
     except Exception as e:
         log(f"server86: pubkeys/lookup name resolution failed: {e}")
         profiles = {}
@@ -5469,10 +5851,10 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 offset = 0
             records = get_audit_records(q)
-            page = records[offset:offset + RENDER_MAX]
+            page = records[offset:offset + RENDER_PAGE_MAX]
             self._send_json(200, {
                 "records": page, "total": len(records),
-                "offset": offset, "limit": RENDER_MAX,
+                "offset": offset, "limit": RENDER_PAGE_MAX,
             })
             return
 
@@ -5698,6 +6080,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             updated, skipped = blacklist.set_reasons(pubkeys, reason, mode, now=int(time.time()))
             if updated:
+                reason_undo_max = get_reason_undo_max()
                 audit_append({
                     "type": "reason",
                     "actor": auth.get("pubkey"),
@@ -5706,8 +6089,8 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": mode,
                     "entries": [
                         {"pubkey": u["pubkey"], "old_reason": u.get("old_reason")}
-                        for u in updated[:REASON_UNDO_MAX]
-                    ] if len(updated) <= REASON_UNDO_MAX else None,
+                        for u in updated[:reason_undo_max]
+                    ] if len(updated) <= reason_undo_max else None,
                     "count": len(updated),
                 })
             self._send_json(200, {"ok": True, "updated": updated, "skipped": skipped})
@@ -5799,7 +6182,7 @@ class Handler(BaseHTTPRequestHandler):
             cache_hits = {pk: h for pk, h in hits.items() if pk not in fresh_banned}
 
             stamped = blacklist.set_names(banned_hits, banned_queried, now=now)
-            stamped += namecache.set_external(cache_hits, cache_queried, now=now, max_entries=NAME_CACHE_MAX)
+            stamped += namecache.set_external(cache_hits, cache_queried, now=now, max_entries=get_name_cache_max())
 
             stamped_set = set(stamped)
             named = sorted(pk for pk in hits if pk in stamped_set)
@@ -5843,13 +6226,14 @@ class Handler(BaseHTTPRequestHandler):
         skipped = []
         now = int(time.time())
         reasons_by_pk = {}
+        reason_max_len = get_reason_max_len()
         for entry in entries:
             if not isinstance(entry, dict):
                 skipped.append(entry)
                 continue
             raw_pk = entry.get("pubkey")
             reason = entry.get("reason") or ""
-            if not isinstance(reason, str) or len(reason) > REASON_MAX_LEN:
+            if not isinstance(reason, str) or len(reason) > reason_max_len:
                 skipped.append(raw_pk)
                 continue
             pubkey = None

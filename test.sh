@@ -707,6 +707,13 @@ import tempfile as _tempfile
 _cache_tmpdir = _tempfile.mkdtemp()
 server86.RECIPIENTS_CACHE_PATH = os.path.join(_cache_tmpdir, "recipients-cache.json")
 server86.SUBSCRIBERS_CACHE_PATH = os.path.join(_cache_tmpdir, "subscribers-cache.json")
+# Redirected here rather than down near the other authors-scan tests: a
+# deadline-hit author scan now COMPLETES (see the "ran out of time" tests
+# below) rather than always failing, and a completed scan persists to disk
+# — so this must be redirected before the first test that can reach that
+# success path, not just before the tests that read/write _authors_cache
+# in memory only.
+server86.AUTHORS_CACHE_PATH = os.path.join(_cache_tmpdir, "authors-cache.json")
 
 # relay_url now lives in config.json, not strfry.conf — redirect CONFIG_PATH
 # too, same reasoning as the cache paths above: a test run must never write
@@ -771,23 +778,28 @@ check(server86.get_subscribers_status()["scanned_at"] == 222,
       "/api/subscribers: scan completes, persists, and GET reflects it without scanning again")
 server86.compute_subscribers = _orig_compute_subscribers
 
-# recipients tally: bounded by the constant limit, tallies the `p` tag
-# (recipient), never the event's own single-use `pubkey` (sender)
+# recipients tally: NO count limit any more (AUTHOR_SCAN_DEADLINE is the
+# only bound), tallies the `p` tag (recipient), never the event's own
+# single-use `pubkey` (sender)
 _orig_streaming = server86.run_strfry_scan_streaming
 _orig_resolve_profiles = server86.resolve_profiles
+_orig_run_strfry_count = server86.run_strfry_count
 server86.resolve_profiles = lambda pks: ({}, None)
+server86.run_strfry_count = lambda filter_obj, timeout=None: 2
 
 
-def _streaming_recipients(filter_obj, on_event, timeout, on_progress=None):
-    check(filter_obj == {"kinds": [1059], "limit": server86.RECIPIENT_SCAN_LIMIT},
-          "compute_recipients scans exactly {kinds:[1059], limit:RECIPIENT_SCAN_LIMIT} — no wider filter")
+def _streaming_recipients(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
+    check(filter_obj == {"kinds": [1059]},
+          "compute_recipients scans exactly {kinds:[1059]} — no count limit, no wider filter")
     check(timeout == server86.AUTHOR_SCAN_DEADLINE,
           "compute_recipients uses AUTHOR_SCAN_DEADLINE, the async failure timeout, not SCAN_TIMEOUT")
+    check(timeout_ok is True,
+          "compute_recipients opts into timeout_ok so a deadline is a partial result, not a failure")
     sender = "e" * 64
     recipient = "f" * 64
     on_event({"pubkey": sender, "created_at": 100, "tags": [["p", recipient]]})
     on_event({"pubkey": sender, "created_at": 200, "tags": [["p", recipient]]})
-    return 2
+    return 2, False
 
 
 server86.run_strfry_scan_streaming = _streaming_recipients
@@ -798,7 +810,10 @@ check(recipients_result["recipients"] == [{"pubkey": "f" * 64,
       "(and no longer carries npub — the client encodes that lazily)")
 check(recipients_result["span_start"] == 100 and recipients_result["span_end"] == 200,
       "compute_recipients reports the actual span of created_at seen")
+check(recipients_result["total_matching"] == 2 and recipients_result["saturated"] is False,
+      "compute_recipients reports the exact total_matching count from run_strfry_count and isn't saturated when it finished")
 server86.run_strfry_scan_streaming = _orig_streaming
+server86.run_strfry_count = _orig_run_strfry_count
 
 # subscribers: host-only matching (rejects a lookalike suffix domain),
 # kind 10050 vs 10002 kept separate, giftwrap_count cross-referenced from
@@ -851,17 +866,19 @@ general_pubkey = "b" * 64
 lookalike_pubkey = "c" * 64
 
 
-def _streaming_subscribers(filter_obj, on_event, timeout, on_progress=None):
+def _streaming_subscribers(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
     kind = filter_obj["kinds"][0]
-    check(filter_obj["limit"] == server86.SUBSCRIBER_SCAN_LIMIT,
-          f"compute_subscribers bounds kind {kind} scan by SUBSCRIBER_SCAN_LIMIT")
+    check("limit" not in filter_obj,
+          f"compute_subscribers no longer caps the kind {kind} scan by a count — AUTHOR_SCAN_DEADLINE is the only bound")
+    check(timeout_ok is True,
+          f"compute_subscribers opts into timeout_ok for kind {kind} so a deadline is a partial result, not a failure")
     if kind == 10050:
         on_event({"pubkey": dm_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com/"]]})
         on_event({"pubkey": lookalike_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com.evil.com"]]})
-        return 2
+        return 2, False
     else:
         on_event({"pubkey": general_pubkey, "created_at": 50, "tags": [["relay", "relay.example.com"]]})
-        return 1
+        return 1, False
 
 
 _subscriber_counts = {10050: 2, 10002: 1}
@@ -892,19 +909,18 @@ check(subs_result["counted"] == {"10050": 2, "10002": 1},
 # Saturation: a subscriber-list FLOOR is unsafe in the direction that
 # matters (missing subscribers means missing exemptions means MORE
 # deletion), unlike a saturated recipient scan, which only deletes less.
-server86.SUBSCRIBER_SCAN_LIMIT = 1
-
-
-def _streaming_subscribers_saturated(filter_obj, on_event, timeout, on_progress=None):
+# There is no count cap left to hit — simulated directly via timed_out.
+def _streaming_subscribers_saturated(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
     on_event({"pubkey": dm_pubkey, "created_at": 100, "tags": [["relay", "wss://relay.example.com/"]]})
-    return filter_obj["limit"]
+    return 1, True
 
 
 server86.run_strfry_scan_streaming = _streaming_subscribers_saturated
 saturated_result = server86.compute_subscribers()
 check(saturated_result["saturated"] is True,
-      "compute_subscribers reports saturated when the bounded scan hit SUBSCRIBER_SCAN_LIMIT")
-server86.SUBSCRIBER_SCAN_LIMIT = 50000
+      "compute_subscribers reports saturated when AUTHOR_SCAN_DEADLINE binds before either kind's scan finishes")
+check("ran out of time" in (saturated_result["warning"] or ""),
+      "compute_subscribers names the exact per-kind shortfall in warning when it times out")
 
 server86.run_strfry_scan_streaming = _orig_streaming
 server86.run_strfry_count = _orig_run_strfry_count
@@ -1431,6 +1447,51 @@ try:
     check(_filt == {"kinds": [1059], "until": 1_700_000_000 - 14 * 86400},
           "giftwrap retention filter is kinds:[1059] until now−days")
 
+    # extra_author_scan_kinds: default-union-operator-additions, never a
+    # replacement — an operator can widen AUTHOR_SCAN_KINDS but never
+    # shrink it, and the effective set is what every scan/count/comparison
+    # actually uses (get_effective_author_scan_kinds), never the raw
+    # AUTHOR_SCAN_KINDS constant directly.
+    check(server86.get_extra_author_scan_kinds() == (),
+          "extra_author_scan_kinds defaults to empty when unset")
+    check(set(server86.get_effective_author_scan_kinds()) == set(server86.AUTHOR_SCAN_KINDS),
+          "the effective allowlist equals the shipped default when no kinds have been added")
+    _ok, _err = server86.write_app_config(edits={"extra_author_scan_kinds": "99999, 2, 99999"})
+    check(_ok and server86.get_extra_author_scan_kinds() == (2, 99999),
+          "extra_author_scan_kinds parses a comma-separated list, dedupes, and sorts — "
+          "2 is already shipped, so this also proves duplicates against the default aren't an error")
+    check(99999 in server86.get_effective_author_scan_kinds()
+          and set(server86.AUTHOR_SCAN_KINDS) <= set(server86.get_effective_author_scan_kinds()),
+          "the effective allowlist is the UNION of shipped + operator-added — nothing shipped is ever dropped")
+    _ok, _err = server86.write_app_config(edits={"extra_author_scan_kinds": "12, not-a-number"})
+    check(_ok is False and "not-a-number" in (_err or ""),
+          "extra_author_scan_kinds rejects a non-integer token outright — never silently drops it")
+    check(server86.get_extra_author_scan_kinds() == (2, 99999),
+          "a rejected extra_author_scan_kinds edit leaves the previous value untouched")
+    _ok, _err = server86.write_app_config(edits={"extra_author_scan_kinds": "-5"})
+    check(_ok is False and "negative" in (_err or ""),
+          "extra_author_scan_kinds rejects a negative kind number")
+    _ok, _err = server86.write_app_config(edits={"extra_author_scan_kinds": ""})
+    check(_ok and server86.get_extra_author_scan_kinds() == (),
+          "extra_author_scan_kinds clears back to empty (pure default) on a blank save")
+
+    # kinds_stale: the cache-invalidation notice this feature promised —
+    # adding a kind must never let the CURRENT authors cache look like it
+    # already covers it.
+    check(server86._authors_cache_kinds_stale({"mode": "recent", "scan_kinds": None}) is False,
+          "kinds_stale is always False for 'recent' mode — it scans every kind unconditionally")
+    check(server86._authors_cache_kinds_stale({"mode": "full", "scan_kinds": None}) is False,
+          "kinds_stale is False (not True) when a full-mode cache has no recorded scan_kinds — not comparable, not a false claim")
+    _stale_before = list(server86.AUTHOR_SCAN_KINDS)
+    check(server86._authors_cache_kinds_stale({"mode": "full", "scan_kinds": _stale_before}) is False,
+          "kinds_stale is False when the cached scan already covered every currently-effective kind")
+    server86.write_app_config(edits={"extra_author_scan_kinds": "424242"})
+    check(server86._authors_cache_kinds_stale({"mode": "full", "scan_kinds": _stale_before}) is True,
+          "kinds_stale is True once a kind is added that the cached full scan predates")
+    check(server86._authors_cache_kinds_stale({"mode": "full", "scan_kinds": _stale_before + [424242]}) is False,
+          "kinds_stale goes back to False once the cache's own scan_kinds already includes the new addition")
+    server86.write_app_config(edits={"extra_author_scan_kinds": ""})
+
     # Estimate: event count is exact; storage is proportional to db_bytes.
     _orig_count = server86.run_strfry_count
     _orig_report = server86.get_report_status
@@ -1504,7 +1565,7 @@ check(pubkeys == ["a" * 64] and reason == "spam" and mode == "replace" and err i
 _, _, _, err = server86.validate_reason_request({"pubkeys": ["not-hex"], "reason": "x", "mode": "replace"})
 check(err is not None, "validate_reason_request rejects a malformed pubkey")
 
-_, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "x" * (server86.REASON_MAX_LEN + 1), "mode": "replace"})
+_, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "x" * (server86.get_reason_max_len() + 1), "mode": "replace"})
 check(err is not None, "validate_reason_request rejects a reason longer than REASON_MAX_LEN")
 
 _, _, _, err = server86.validate_reason_request({"pubkeys": ["a" * 64], "reason": "x", "mode": "delete"})
@@ -1927,7 +1988,7 @@ day_result = server86.compute_profile_day(day_pubkey, 86400, 172800)
 check(len(scan_calls) == 1
       and scan_calls[0]["authors"] == [day_pubkey]
       and scan_calls[0]["since"] == 86400 and scan_calls[0]["until"] == 172800
-      and scan_calls[0]["limit"] == server86.PROFILE_DAY_EVENTS_MAX,
+      and scan_calls[0]["limit"] == server86.get_profile_day_events_max(),
       "compute_profile_day scans with the exact [since, until) window and the PROFILE_DAY_EVENTS_MAX limit")
 check([ev["created_at"] for ev in day_result["previews"]] == [300, 200, 100],
       "compute_profile_day sorts previews newest-first regardless of strfry's own return order")
@@ -1936,7 +1997,7 @@ check(len(day_result["previews"][1]["content"]) == 280,
 check(day_result["truncated"] is False, "compute_profile_day: truncated is False when under PROFILE_DAY_EVENTS_MAX")
 
 server86.run_strfry_scan = lambda filt, timeout=None: [
-    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.PROFILE_DAY_EVENTS_MAX)
+    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.get_profile_day_events_max())
 ]
 day_result_full = server86.compute_profile_day(day_pubkey, 86400, 172800)
 check(day_result_full["truncated"] is True,
@@ -1985,7 +2046,7 @@ check(len(new_scan_calls) == 1
       and new_scan_calls[0]["authors"] == [day_pubkey]
       and new_scan_calls[0]["since"] == 500
       and "until" not in new_scan_calls[0]
-      and new_scan_calls[0]["limit"] == server86.PROFILE_EVENT_LIMIT,
+      and new_scan_calls[0]["limit"] == server86.get_profile_event_limit(),
       "compute_profile_new_events scans with since (no until) and the PROFILE_EVENT_LIMIT bound")
 check([ev["created_at"] for ev in new_result["previews"]] == [600, 550, 500],
       "compute_profile_new_events sorts previews newest-first regardless of strfry's own return order")
@@ -1995,7 +2056,7 @@ check(new_result["truncated"] is False,
       "compute_profile_new_events: truncated is False when under PROFILE_EVENT_LIMIT")
 
 server86.run_strfry_scan = lambda filt, timeout=None: [
-    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.PROFILE_EVENT_LIMIT)
+    {"kind": 1, "created_at": i, "content": ""} for i in range(server86.get_profile_event_limit())
 ]
 new_result_full = server86.compute_profile_new_events(day_pubkey, 500)
 check(new_result_full["truncated"] is True,
@@ -2049,12 +2110,12 @@ _, _, err = server86.validate_pubkeys_lookup_request({"pubkeys": ["not-hex"], "d
 check(err is not None, "validate_pubkeys_lookup_request rejects a malformed pubkey rather than skipping it")
 
 _, _, err = server86.validate_pubkeys_lookup_request(
-    {"pubkeys": ["a" * 64] * (server86.DOMAIN_LOOKUP_MAX + 1), "domain": "example.com"})
+    {"pubkeys": ["a" * 64] * (server86.get_domain_lookup_max() + 1), "domain": "example.com"})
 check(err is not None, "validate_pubkeys_lookup_request rejects a body over DOMAIN_LOOKUP_MAX outright, never truncates")
 
 pubkeys_at_max, _, err = server86.validate_pubkeys_lookup_request(
-    {"pubkeys": ["a" * 64] * server86.DOMAIN_LOOKUP_MAX, "domain": "example.com"})
-check(err is None and len(pubkeys_at_max) == server86.DOMAIN_LOOKUP_MAX,
+    {"pubkeys": ["a" * 64] * server86.get_domain_lookup_max(), "domain": "example.com"})
+check(err is None and len(pubkeys_at_max) == server86.get_domain_lookup_max(),
       "validate_pubkeys_lookup_request accepts a body at exactly DOMAIN_LOOKUP_MAX")
 
 _, _, err = server86.validate_pubkeys_lookup_request({"pubkeys": ["a" * 64], "domain": ""})
@@ -2351,28 +2412,90 @@ check("exceeded" in _silent.get("outcome", ""),
       "a silent strfry stall is reported as a budget overrun, not as a normal return")
 check(_silent.get("elapsed", 99) < 10,
       "the budget fires near its deadline rather than whenever output happens to arrive")
+
+# timeout_ok=True: the SAME real deadline mechanism against the SAME silent
+# child, but opted into returning (count, timed_out) instead of raising —
+# proven against a real subprocess, not a mock, since this is exactly the
+# scenario AUTHOR_SCAN_DEADLINE now has to survive as the only bound left
+# on the full author/recipient/subscriber scans.
+_silent_ok = {}
+
+
+def _run_silent_ok():
+    _t0 = _time.monotonic()
+    _silent_ok["result"] = server86.run_strfry_scan_streaming({}, lambda e: None, timeout=1, timeout_ok=True)
+    _silent_ok["elapsed"] = _time.monotonic() - _t0
+
+
+_silent_ok_thread = _threading_silent.Thread(target=_run_silent_ok, daemon=True)
+_silent_ok_thread.start()
+_silent_ok_thread.join(timeout=15)
+check(not _silent_ok_thread.is_alive(),
+      "timeout_ok=True still hits the same wall-clock budget against a real silent child")
+check(_silent_ok.get("result") == (0, True),
+      "timeout_ok=True returns (count, timed_out) instead of raising on the same deadline")
+
 server86.require_strfry_bin = _orig_bin
 server86.require_strfry_conf = _orig_conf_fn
 server86.get_relay_cwd = _orig_cwd_fn
 server86.subprocess.Popen = _orig_popen_real
 
 # 'failed' is not 'result', for the other two async scans too (authors,
-# recipients) — same rule as the walk above: a scan that hit its deadline
-# preserves the PREVIOUS cache byte-identical (aside from `error`) and
-# never stamps a new scanned_at.
+# recipients) — same rule as the walk above, but ONLY for a genuine
+# subprocess failure now (non-zero exit, missing binary): a deadline is no
+# longer one of these, since AUTHOR_SCAN_FULL_LIMIT/RECIPIENT_SCAN_LIMIT
+# were removed and run_strfry_scan_streaming(timeout_ok=True) turns a
+# deadline into a completed "ran out of time" result instead (tested
+# below). A hard failure still preserves the PREVIOUS cache byte-identical
+# (aside from `error`) and never stamps a new scanned_at.
+def _streaming_hard_failure(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
+    raise RuntimeError("strfry scan exited 1: mdb_env_open: Out of memory")
+
+
 server86._authors_cache.clear()
 server86._authors_cache.update({**server86._empty_authors_result(), "scanned_at": 555, "events_read": 42})
-_prev_authors_snapshot = dict(server86._authors_cache)
-server86.run_strfry_scan_streaming = _streaming_timeout
+server86.run_strfry_scan_streaming = _streaming_hard_failure
 authors_fail_status = server86.start_authors_scan("recent")
 check(authors_fail_status["status"] == "running", "POST /api/authors/scan starts the job and returns 202 running immediately")
 _time.sleep(0.3)
 check(server86._authors_cache["scanned_at"] == 555 and server86._authors_cache["events_read"] == 42,
-      "a failed author scan preserves the PREVIOUS cache byte-identical, never a partial")
+      "a genuinely failed author scan preserves the PREVIOUS cache byte-identical, never a partial")
 check(server86._authors_cache.get("error") is not None,
-      "a failed author scan attaches an error (not a warning) to the authors cache, and no rendered result claims to be this attempt's")
+      "a genuinely failed author scan attaches an error (not a warning) to the authors cache, and no rendered result claims to be this attempt's")
 check(server86._authors_job.get("partial_authors") is None,
-      "a failed author scan clears partial_authors — mid-scan rows never become the result")
+      "a genuinely failed author scan clears partial_authors — mid-scan rows never become the result")
+server86.run_strfry_scan_streaming = _orig_streaming
+
+# A DEADLINE hit is now a COMPLETED result, not a failure — this is the
+# behavior that makes it safe to have removed the count cap at all.
+# run_strfry_scan_streaming(timeout_ok=True) returns (count, True) instead
+# of raising, and compute_authors treats that the same way a saturated
+# bounded scan used to be treated: a fresh scanned_at, no `error`,
+# `saturated`/`timed_out` True, and a `warning` that says exactly how far
+# it got instead of a bare "SATURATED" label.
+def _streaming_authors_deadline(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
+    check(timeout_ok is True,
+          "compute_authors opts into timeout_ok so a deadline is not treated as a failure")
+    on_event({"pubkey": "1" * 64, "created_at": 100, "kind": 1})
+    return 1, True
+
+
+server86._authors_cache.clear()
+server86._authors_cache.update({**server86._empty_authors_result(), "scanned_at": 555, "events_read": 42})
+server86.run_strfry_scan_streaming = _streaming_authors_deadline
+server86.run_strfry_scan = lambda filter_obj, timeout=10: []  # empty reports pass
+deadline_status = server86.start_authors_scan("recent")
+check(deadline_status["status"] == "running",
+      "POST /api/authors/scan (deadline case) starts the job and returns 202 running immediately")
+_time.sleep(0.3)
+check(server86._authors_cache["scanned_at"] != 555,
+      "a deadline-hit author scan IS a completed result — it stamps a fresh scanned_at, unlike a genuine failure")
+check(server86._authors_cache.get("error") is None,
+      "a deadline-hit author scan is not an error — it's a saturated result, the same shape a count-capped scan used to be")
+check(server86._authors_cache.get("saturated") is True and server86._authors_cache.get("timed_out") is True,
+      "a deadline-hit author scan reports saturated/timed_out True")
+check("ran out of time" in (server86._authors_cache.get("warning") or ""),
+      "a deadline-hit author scan's warning says it ran out of time, not just SATURATED")
 server86.run_strfry_scan_streaming = _orig_streaming
 
 # Mid-scan partial_authors: the Users table streams top authors without
@@ -2387,14 +2510,14 @@ _partial_events = [
 ]
 
 
-def _streaming_partial(filter_obj, on_event, timeout, on_progress=None):
+def _streaming_partial(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
     for i, ev in enumerate(_partial_events):
         on_event(ev)
         if on_progress is not None and (i + 1) % 5 == 0:
             on_progress(i + 1)
     if on_progress is not None:
         on_progress(len(_partial_events))
-    return len(_partial_events)
+    return len(_partial_events), False
 
 
 server86._authors_cache.clear()
@@ -2455,11 +2578,11 @@ _single_pk = "e" * 64
 _multi_pk = "f" * 64
 
 
-def _streaming_singleton(filter_obj, on_event, timeout, on_progress=None):
+def _streaming_singleton(filter_obj, on_event, timeout, on_progress=None, timeout_ok=False):
     on_event({"pubkey": _single_pk, "created_at": 100, "kind": 1})
     on_event({"pubkey": _multi_pk, "created_at": 100, "kind": 1})
     on_event({"pubkey": _multi_pk, "created_at": 200, "kind": 1})
-    return 3
+    return 3, False
 
 
 _orig_resolve_for_singleton = server86.resolve_profiles
@@ -2515,17 +2638,21 @@ server86.namecache.set_local = _orig_set_local
 server86.namecache.get_many = _orig_namecache_get_many
 server86.run_strfry_scan = _orig_run_scan_for_names
 
+# Same split as authors above: a genuine failure still fails the job;
+# a deadline is now a completed "ran out of time" result instead.
 server86._recipients_cache.clear()
 server86._recipients_cache.update({**server86._empty_recipients_result(), "scanned_at": 777, "events_read": 9})
-server86.run_strfry_scan_streaming = _streaming_timeout
+server86.run_strfry_count = lambda filter_obj, timeout=None: 9
+server86.run_strfry_scan_streaming = _streaming_hard_failure
 recipients_fail_status = server86.start_recipients_scan()
 check(recipients_fail_status["status"] == "running", "POST /api/recipients starts the job and returns 202 running immediately")
 _time.sleep(0.3)
 check(server86._recipients_cache["scanned_at"] == 777 and server86._recipients_cache["events_read"] == 9,
-      "a failed recipients scan preserves the PREVIOUS cache byte-identical, never a partial")
+      "a genuinely failed recipients scan preserves the PREVIOUS cache byte-identical, never a partial")
 check(server86._recipients_cache.get("error") is not None,
-      "a failed recipients scan attaches an error (not a warning) to the recipients cache")
+      "a genuinely failed recipients scan attaches an error (not a warning) to the recipients cache")
 server86.run_strfry_scan_streaming = _orig_streaming
+server86.run_strfry_count = _orig_run_strfry_count
 server86._active_scan["name"] = None
 
 
@@ -2919,14 +3046,18 @@ else:
                 return int(lines[-1])
 
             total = count({})
-            allowlisted = count({"kinds": list(server86.AUTHOR_SCAN_KINDS)})
+            # Effective, not the source constant — an operator's config.json
+            # additions (extra_author_scan_kinds) widen coverage, and this
+            # check must audit what actually runs, not the shipped default.
+            allowlisted = count({"kinds": list(server86.get_effective_author_scan_kinds())})
             giftwraps = count({"kinds": [1059]})
             non_giftwrap = total - giftwraps
             gap = non_giftwrap - allowlisted
             gap_pct = (gap / non_giftwrap * 100) if non_giftwrap else 0.0
             ok = gap_pct <= 2.0
-            check(ok, f"AUTHOR_SCAN_KINDS gap check ({gap} missing of {non_giftwrap} non-giftwrap events, {gap_pct:.2f}%)",
-                  None if ok else "allowlist is stale — extend AUTHOR_SCAN_KINDS (see CLAUDE.md 'Auditing the allowlist')")
+            check(ok, f"effective author-scan allowlist gap check ({gap} missing of {non_giftwrap} non-giftwrap events, {gap_pct:.2f}%)",
+                  None if ok else "allowlist is stale — extend AUTHOR_SCAN_KINDS, or add the missing kind via "
+                                   "config.json's extra_author_scan_kinds from Settings")
     except Exception as e:
         check(False, "AUTHOR_SCAN_KINDS gap check", f"error running against live db: {type(e).__name__}: {e}")
 
@@ -3010,7 +3141,7 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(path, 'utf8'), sandbox, { filename: path });
 
-// --- caps hold: RENDER_MAX-style truncation (s86TruncateForRender) -------
+// --- caps hold: RENDER_PAGE_MAX-style truncation (s86TruncateForRender) --
 const rows = Array.from({ length: 12481 }, (_, i) => i);
 const trunc = sandbox.s86TruncateForRender(rows, 500);
 check(trunc.shown.length === 500 && trunc.truncatedCount === 11981 && trunc.totalCount === 12481,
