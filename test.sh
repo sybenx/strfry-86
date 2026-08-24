@@ -6,9 +6,54 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 FAILURES=0
+# Every check this suite runs, PASS or FAIL — bash-level (pass()/fail()) and
+# every embedded Python/node subprocess's own PASS:/FAIL: lines, counted
+# back into this same total after each subprocess returns (see CHECKS+=
+# below each *_OUTPUT capture). This is the number a truncated or crashed
+# run cannot fake: a script that dies partway through prints fewer PASS:/
+# FAIL: lines, which is exactly what the EXPECTED_MIN floor below and the
+# EXIT trap further down are watching for.
+CHECKS=0
+# Floor on CHECKS for a run to be trusted. Only ever raise this (when a
+# deliberate new test is added) — never lower it. A run that executes fewer
+# checks than this, for ANY reason (a crash, an early exit, a silently
+# skipped section), fails loudly instead of quietly reporting whatever
+# subset happened to complete as "ALL TESTS PASSED".
+EXPECTED_MIN=444
+# Set to 1 only by the real final-tally block at the bottom of this file.
+# The EXIT trap below uses this to detect "the script stopped running
+# before it ever tallied its results" — a truncation that a plain FAILURES
+# count can't see, because a script that dies mid-run never gets the
+# chance to report anything as failed at all.
+TALLY_REACHED=0
 
-pass() { echo "PASS: $1"; }
-fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
+pass() { echo "PASS: $1"; CHECKS=$((CHECKS + 1)); }
+fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); CHECKS=$((CHECKS + 1)); }
+
+# Fires on ANY exit from this script — normal, `set -u` aborting on an
+# unbound variable, or an external kill/timeout (anything short of
+# SIGKILL). If the real tally block at the bottom never ran, this is the
+# ONLY line that will say so; nothing above it can be trusted to have run
+# to completion. Printed to stdout (not stderr) so it survives however the
+# caller captures output, and worded so it cannot be mistaken for a normal
+# PASS/FAIL line or summarized as anything but an aborted run.
+_test_exit_trap() {
+    # ${TESTDIR:-} — this trap can fire before TESTDIR (set further down)
+    # ever exists, e.g. an abort during the very first sections above it.
+    if [ -n "${TESTDIR:-}" ]; then
+        rm -rf "$TESTDIR"
+    fi
+    if [ "$TALLY_REACHED" -ne 1 ]; then
+        echo
+        echo "###########################################################"
+        echo "# TESTSUITE ABORTED — exited before the final tally ran.  #"
+        echo "# This run is INCOMPLETE. It is NOT a pass, NOT a known   #"
+        echo "# failure count — something crashed, hung, or was killed #"
+        echo "# partway through. Checks executed before the abort: $CHECKS"
+        echo "###########################################################"
+    fi
+}
+trap _test_exit_trap EXIT
 
 # --- manifest + bundle freshness --------------------------------------------
 
@@ -96,7 +141,9 @@ rm -f "$CHECK_BUNDLE_SCRIPT"
 # --- plugin86.py sandbox ----------------------------------------------------
 
 TESTDIR="$(mktemp -d)"
-trap 'rm -rf "$TESTDIR"' EXIT
+# Cleanup lives in _test_exit_trap (top of file, already registered on
+# EXIT) — a second `trap ... EXIT` here would silently replace it, since
+# bash keeps only the last handler registered per signal.
 
 cp plugin86.py "$TESTDIR/"
 cp -r lib86 "$TESTDIR/"
@@ -541,10 +588,12 @@ for ok, name, detail in results:
         print(line)
 PYEOF
 
-CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT")"
+CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
 echo "$CRYPTO_OUTPUT"
 CRYPTO_FAIL_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^FAIL: ')"
+CRYPTO_PASS_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + CRYPTO_FAIL_COUNT))
+CHECKS=$((CHECKS + CRYPTO_FAIL_COUNT + CRYPTO_PASS_COUNT))
 rm -f "$CRYPTO_TEST_SCRIPT"
 
 # --- async author-scan bounds (server86.py) ---------------------------------
@@ -2833,10 +2882,12 @@ for ok, name, detail in results:
         print(line)
 PYEOF
 
-BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT")"
+BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
 echo "$BOUNDS_OUTPUT"
 BOUNDS_FAIL_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^FAIL: ')"
+BOUNDS_PASS_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + BOUNDS_FAIL_COUNT))
+CHECKS=$((CHECKS + BOUNDS_FAIL_COUNT + BOUNDS_PASS_COUNT))
 rm -f "$BOUNDS_TEST_SCRIPT"
 
 # --- client-side rendering rules (common86.js), executed for real --------
@@ -2979,7 +3030,9 @@ JSEOF
     JS_OUTPUT="$(node "$JS_TEST_SCRIPT" "$REPO_ROOT/common86.js" 2>&1)"
     echo "$JS_OUTPUT"
     JS_FAIL_COUNT="$(echo "$JS_OUTPUT" | grep -c '^FAIL: ')"
+    JS_PASS_COUNT="$(echo "$JS_OUTPUT" | grep -c '^PASS: ')"
     FAILURES=$((FAILURES + JS_FAIL_COUNT))
+    CHECKS=$((CHECKS + JS_FAIL_COUNT + JS_PASS_COUNT))
 else
     echo "SKIP: client-side rendering rules (node not found)"
 fi
@@ -3427,7 +3480,9 @@ PYEOF
 UPDATER_OUTPUT="$(python3 "$UPDATER_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
 echo "$UPDATER_OUTPUT"
 UPDATER_FAIL_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^FAIL: ')"
+UPDATER_PASS_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
+CHECKS=$((CHECKS + UPDATER_FAIL_COUNT + UPDATER_PASS_COUNT))
 
 # --- the scan sections have no control bound to a page-assembled set -----
 # The invariant moved with the panels: Report's rule was that the page which
@@ -3437,10 +3492,9 @@ FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
 # this project is built with document.createElement in common86.js or in the
 # pages that legitimately own a selectable list (users, bans, domain).
 if grep -q 'type="checkbox"' "$REPO_ROOT/stats.html"; then
-    FAILURES=$((FAILURES + 1))
-    echo 'FAIL: the scan sections contain no control bound to a page-assembled set (found a literal checkbox in stats.html source)'
+    fail "the scan sections contain no control bound to a page-assembled set (found a literal checkbox in stats.html source)"
 else
-    echo 'PASS: the scan sections contain no control bound to a page-assembled set (no literal checkbox in stats.html source)'
+    pass "the scan sections contain no control bound to a page-assembled set (no literal checkbox in stats.html source)"
 fi
 
 # --- the removed pages are actually removed ------------------------------
@@ -3449,18 +3503,32 @@ fi
 # by mistake.
 for _stale in report.html authors.html userlist.html; do
     if [ -e "$REPO_ROOT/$_stale" ]; then
-        FAILURES=$((FAILURES + 1))
-        echo "FAIL: $_stale was merged away but still exists on disk"
+        fail "$_stale was merged away but still exists on disk"
     else
-        echo "PASS: $_stale is gone, not left behind as a second copy"
+        pass "$_stale is gone, not left behind as a second copy"
     fi
 done
 
+# Coverage floor: fewer executed checks than EXPECTED_MIN means something
+# aborted, hung and got killed, or was silently skipped — never quietly
+# reported as a clean pass just because nothing that DID run happened to
+# fail. This can only rise over time (see EXPECTED_MIN's own comment).
+if [ "$CHECKS" -lt "$EXPECTED_MIN" ]; then
+    echo
+    echo "###########################################################"
+    echo "# COVERAGE SHORTFALL — only $CHECKS check(s) ran; expected at least $EXPECTED_MIN."
+    echo "# Something aborted, hung, or was silently skipped. This is"
+    echo "# NOT a normal failure count — treat it as a broken run."
+    echo "###########################################################"
+    FAILURES=$((FAILURES + 1))
+fi
+
+TALLY_REACHED=1
 echo
 if [ "$FAILURES" -eq 0 ]; then
-    echo "ALL TESTS PASSED"
+    echo "ALL TESTS PASSED ($CHECKS checks executed)"
     exit 0
 else
-    echo "$FAILURES TEST(S) FAILED"
+    echo "$FAILURES TEST(S) FAILED ($CHECKS checks executed)"
     exit 1
 fi
