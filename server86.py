@@ -181,6 +181,15 @@ KIND_ALARM_SHARE = 0.005        # ONE unlisted kind this big is the actionable a
 CONSOLE_VERBS = ("scan", "info", "export")  # --count/read-only; all else refused
 CONSOLE_STDOUT_MAX = 256 * 1024  # hard cap on captured console stdout (then kill)
 CONSOLE_STDERR_MAX = 64 * 1024   # hard cap on captured console stderr
+# The HTTP response's own tail slice — distinct from the two caps above.
+# CONSOLE_STDOUT_MAX/CONSOLE_STDERR_MAX bound what run_console_command ever
+# holds in memory; these bound what actually goes out over the wire to the
+# console pane, same tail-favoring shape, just sized for a browser pane
+# instead of a memory budget. Every response names its own total/shown byte
+# counts (RENDER_MAX's "omitted tail" pattern) so a slice here is never
+# silent the way it used to be.
+CONSOLE_RESPONSE_STDOUT_MAX = 32 * 1024
+CONSOLE_RESPONSE_STDERR_MAX = 8 * 1024
 # --- memory ceilings -------------------------------------------------------
 # Soft: refuse NEW heavy jobs when current RSS is already this high (leave
 # headroom for the job itself). CACHE_LIST_MAX is the safety valve on
@@ -1950,18 +1959,47 @@ def release_console_slot():
             _active_scan["name"] = None
 
 
+def _console_result(ok, error, argv, stdout="", stderr="", exit_code=None,
+                     truncated=False, killed_for_memory=False,
+                     stdout_total_bytes=None, stderr_total_bytes=None):
+    """Shared shape for every run_console_command return path, so a caller
+    (the UI) never has to guess which fields a given failure mode left out.
+    stdout_total_bytes/stderr_total_bytes default to the shown length itself
+    (nothing was cut) — pass the real pre-slice length when it was."""
+    return {
+        "ok": ok,
+        "error": error,
+        "argv": argv,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_total_bytes": stdout_total_bytes if stdout_total_bytes is not None else len(stdout),
+        "stdout_shown_bytes": len(stdout),
+        "stderr_total_bytes": stderr_total_bytes if stderr_total_bytes is not None else len(stderr),
+        "stderr_shown_bytes": len(stderr),
+        "exit_code": exit_code,
+        "truncated": truncated,
+        "killed_for_memory": killed_for_memory,
+    }
+
+
 def run_console_command(raw):
     """Run one CONSOLE_VERBS-allowlisted strfry command; return a
     JSON-serialisable result.
 
     Stdout/stderr are streamed with hard byte caps (CONSOLE_STDOUT_MAX /
-    CONSOLE_STDERR_MAX). Hitting either cap kills the child — bare `export`
-    or an unbounded `scan` must never buffer the whole LMDB into this
-    process. The response still truncates further for the UI pane."""
+    CONSOLE_STDERR_MAX) — hitting either kills the child, because bare
+    `export` or an unbounded `scan` must never buffer the whole LMDB into
+    this process. That capture is real output, not a failure: `ok` tracks
+    only whether the process itself exited cleanly, `truncated` tracks
+    separately whether the response is missing bytes (either because the
+    capture above got killed, or because CONSOLE_RESPONSE_STDOUT_MAX/
+    CONSOLE_RESPONSE_STDERR_MAX sliced an ordinary large-but-successful
+    result down for the pane) — the two used to be conflated into one `ok`,
+    which painted a killed-for-memory `export` the same red as a typo'd
+    filter."""
     argv, err = validate_console_command(raw)
     if err:
-        return {"ok": False, "error": err, "argv": None, "stdout": "", "stderr": "",
-                "exit_code": None, "truncated": False}
+        return _console_result(False, err, None)
     try:
         strfry_bin = require_strfry_bin()
         conf = require_strfry_conf()
@@ -2008,45 +2046,47 @@ def run_console_command(raw):
                 pass
             t_out.join(timeout=2)
             t_err.join(timeout=2)
-            return {
-                "ok": False, "error": f"timed out after {CONSOLE_TIMEOUT}s",
-                "argv": argv, "stdout": "", "stderr": "",
-                "exit_code": None, "truncated": False,
-            }
+            return _console_result(
+                False, f"timed out after {CONSOLE_TIMEOUT}s", argv,
+            )
         t_out.join(timeout=2)
         t_err.join(timeout=2)
         out_chunks, _out_n, out_capped = pumps["out"]
         err_chunks, _err_n, err_capped = pumps["err"]
         stdout = b"".join(out_chunks).decode("utf-8", errors="replace")
         stderr = b"".join(err_chunks).decode("utf-8", errors="replace")
-        truncated = out_capped or err_capped
-        if truncated:
-            note = (
-                f"\n… truncated at {CONSOLE_STDOUT_MAX // 1024}KB stdout / "
-                f"{CONSOLE_STDERR_MAX // 1024}KB stderr (process killed to protect memory)"
-            )
-            stdout = stdout + note
+        killed_for_memory = out_capped or err_capped
         exit_code = proc.returncode
-        # A kill for the cap yields a non-zero exit; still report the captured
-        # head as the answer, with truncated=true so the UI can say so.
-        ok = (exit_code == 0) and not truncated
+        # A kill for hitting the memory cap is not a command failure — it is
+        # a size limit, and the bytes captured before the kill are real. Only
+        # a genuine non-zero exit that ISN'T that kill counts as `failed`.
+        failed = (exit_code != 0) and not killed_for_memory
+        stdout_total, stderr_total = len(stdout), len(stderr)
+        stdout_shown = stdout[-CONSOLE_RESPONSE_STDOUT_MAX:]
+        stderr_shown = stderr[-CONSOLE_RESPONSE_STDERR_MAX:]
+        # `truncated` covers both ways the pane can end up short of the full
+        # capture: the memory-cap kill above, and this response's own tail
+        # slice on an otherwise-successful large result. Either way the
+        # shown/total byte counts travel with it so the UI states a real
+        # number instead of a silent cut.
+        truncated = (
+            killed_for_memory
+            or len(stdout_shown) < stdout_total
+            or len(stderr_shown) < stderr_total
+        )
         error = None
-        if truncated:
-            error = "output exceeded memory cap — showing the first bytes only"
-        elif exit_code != 0:
+        if failed:
             error = f"exit {exit_code}"
-        return {
-            "ok": ok,
-            "error": error,
-            "argv": argv,
-            "stdout": stdout[-8000:],
-            "stderr": stderr[-4000:],
-            "exit_code": exit_code,
-            "truncated": truncated,
-        }
+        return _console_result(
+            not failed, error, argv,
+            stdout=stdout_shown, stderr=stderr_shown, exit_code=exit_code,
+            truncated=truncated, killed_for_memory=killed_for_memory,
+            stdout_total_bytes=stdout_total, stderr_total_bytes=stderr_total,
+        )
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:600], "argv": argv,
-                "stdout": "", "stderr": "", "exit_code": None, "truncated": False}
+        return _console_result(
+            False, f"{type(e).__name__}: {e}"[:600], argv,
+        )
 
 
 def run_strfry_count(filter_obj, timeout=SCAN_TIMEOUT):

@@ -235,17 +235,27 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere;                /* commands o
       border:1px solid var(--term-edge); border-radius:14px; }
 pre#console-log, pre#decision-log { min-height:12em; max-height:26em; overflow:auto; }
 /* A log line is one line. Wrapping a key across two rows makes a tail
-   unreadable, so this panel scrolls sideways inside its own box — which the
-   no-horizontal-scroll rule is about the PAGE, not about a terminal. */
-pre#decision-log { white-space:pre; overflow-wrap:normal; }
+   unreadable, so both panels scroll sideways inside their own box instead —
+   which the no-horizontal-scroll rule is about the PAGE, not a terminal.
+   console-log needs this as much as decision-log: every `scan` line carries
+   a 64-char id/pubkey and a 128-char sig. */
+pre#console-log, pre#decision-log { white-space:pre; overflow-wrap:normal; }
 pre#console-log:empty::before { content:"strfry console — read-only verbs only";
                                 color:oklch(.6 .01 60); }
 pre .good { color:oklch(.78 .1 145); }
 pre .bad { color:oklch(.72 .16 25); }
 pre .dim { color:oklch(.6 .01 60); }
+pre .warn { color:oklch(.78 .14 80); }
 /* Console answer (stdout): the one number that matters after a scan --count.
-   Bold + good so it does not share weight with dimmed loguru leftovers. */
+   Bold + good so it does not share weight with dimmed loguru leftovers.
+   Truncated-but-real output (the memory cap killed the process, or the
+   response tail-sliced an otherwise-successful large result) is bold+warn
+   instead of bold+good — it did not fail, so it must not read as an error,
+   but it is incomplete, so it must not read as a clean answer either. */
 pre .console-answer { font-weight:700; }
+pre#console-log details.console-raw { margin:.3em 0 0; }
+pre#console-log details.console-raw summary { cursor:pointer; color:oklch(.6 .01 60); }
+pre#console-log details.console-raw summary:hover { color:var(--term-fg); }
 .console-row { display:flex; align-items:center; gap:.5em; margin:.6rem 0; }
 .console-row .prompt { font-family:var(--mono); color:var(--good); }
 .console-row input { flex:1; }
@@ -297,8 +307,9 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
      shrink below its intrinsic size, and an <input> carries the width of its
      default ~20-character size attribute. That floor propagated out through
      .console-row to the grid column and pushed the whole PAGE into sideways
-     scroll — the one thing rendering rule 5 forbids. (pre#decision-log still
-     scrolls sideways inside its own box; that is a terminal, not the page.) */
+     scroll — the one thing rendering rule 5 forbids. (pre#console-log and
+     pre#decision-log still scroll sideways inside their own box each; that
+     is a terminal, not the page.) */
   .console-row input { min-width:0; }
   .console-grid > * { min-width:0; }
   .field-row { grid-template-columns:1fr; gap:.2em; }
@@ -1142,8 +1153,11 @@ function renderDecisionLog(events) {
 // --- console ---------------------------------------------------------------
 // strfry prints useful answers on stdout and a loguru chatter on stderr
 // (CONFIG: Loading…, atexit, the column header). Dumping both and scrolling
-// to the bottom buries `1047820` under a page of INFO lines. On success we
-// keep the answer, drop pure loguru INFO, and scroll the answer into view.
+// to the bottom buries `1047820` under a page of INFO lines — worst on a
+// failure, where the one line that explains it (e.g. "strfry error: ...")
+// sits between six lines of that same boilerplate. So the noise filter runs
+// on every result, not just success; the untouched text is one click away
+// in a details toggle rather than gone.
 
 function appendConsole(text, className) {
   if (consoleLog.childNodes.length) {
@@ -1162,6 +1176,24 @@ function appendConsole(text, className) {
   return node;
 }
 
+function appendConsoleRaw(text) {
+  if (consoleLog.childNodes.length) {
+    consoleLog.appendChild(document.createTextNode('\n'));
+  }
+  var details = document.createElement('details');
+  details.className = 'console-raw';
+  var summary = document.createElement('summary');
+  var lines = text.split('\n').length;
+  summary.textContent = 'raw stderr (' + lines + ' line' + (lines === 1 ? '' : 's') + ')';
+  details.appendChild(summary);
+  var body = document.createElement('span');
+  body.className = 'dim';
+  body.textContent = text;
+  details.appendChild(body);
+  consoleLog.appendChild(details);
+  return details;
+}
+
 function isLoguruNoiseLine(line) {
   // loguru's own column header + each INFO/DEBUG record. WARN/ERROR stay.
   if (/^date\s+time\s+/.test(line)) {
@@ -1177,13 +1209,9 @@ function isLoguruNoiseLine(line) {
   return false;
 }
 
-function filterConsoleStderr(stderr, ok) {
+function filterConsoleStderr(stderr) {
   if (!stderr) {
     return '';
-  }
-  // Failures keep the full stderr — that is where the reason lives.
-  if (!ok) {
-    return stderr.replace(/\s+$/, '');
   }
   return stderr.split('\n').filter(function (ln) {
     return ln.trim() && !isLoguruNoiseLine(ln);
@@ -1240,27 +1268,52 @@ function runConsole(command) {
     .then(function (result) {
       var body = result.body || {};
       var ok = !!body.ok;
+      var truncated = !!body.truncated;
       var focus = null;
       if (body.error && !ok) {
         focus = appendConsole('refused/error: ' + body.error, 'bad');
       }
       var stdout = (body.stdout || '').replace(/\s+$/, '');
       if (stdout) {
-        // The answer — bold/green so it is not the same weight as chatter.
-        focus = appendConsole(stdout, 'console-answer good');
+        // ok+truncated (e.g. a bare `export` killed for the memory cap) is
+        // real output, not a failure, so it must not paint the same red as
+        // a broken command — but it is not the whole answer either, so it
+        // does not get the clean green of a complete one.
+        var stdoutClass = !ok ? 'bad' : (truncated ? 'console-answer warn' : 'console-answer good');
+        focus = appendConsole(stdout, stdoutClass);
       }
-      var stderr = filterConsoleStderr(body.stderr || '', ok);
+      if (truncated) {
+        var shown = body.stdout_shown_bytes, total = body.stdout_total_bytes;
+        var note = (shown != null && total != null && total > shown)
+          ? 'showing last ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' bytes'
+          : 'output truncated';
+        if (body.killed_for_memory) {
+          note += ' — process killed to protect memory';
+        }
+        appendConsole(note, 'warn');
+      }
+      var rawStderr = (body.stderr || '').replace(/\s+$/, '');
+      var stderr = filterConsoleStderr(rawStderr);
       if (stderr) {
         var errNode = appendConsole(stderr, ok ? 'dim' : 'bad');
         if (!focus) {
           focus = errNode;
         }
       }
-      // exit 0 is noise next to a successful count; non-zero is the signal.
+      // Only a failure gets the raw-stderr toggle: on success the filtered
+      // loguru noise was never worth keeping (that's the whole point of the
+      // filter), but on failure the filter may have hidden a line that
+      // mattered, so the untouched text stays reachable instead of gone.
+      if (!ok && rawStderr && rawStderr !== stderr) {
+        appendConsoleRaw(rawStderr);
+      }
+      // exit 0 is noise next to a successful count; non-zero is the signal
+      // — but a memory-cap kill's SIGKILL exit code is not a command
+      // failure (ok is still true there), so it stays out of this branch.
       if (body.exit_code != null && !ok) {
         appendConsole('(exit ' + body.exit_code + ')', 'bad');
       }
-      if (!stdout && !stderr && ok) {
+      if (!stdout && !stderr && ok && !truncated) {
         focus = appendConsole('(no output)', 'dim');
       }
       scrollConsoleTo(focus);
