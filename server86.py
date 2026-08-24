@@ -2473,25 +2473,108 @@ def get_domain_bans():
 
 
 # --- strfry.conf ------------------------------------------------------------
-# Parsed by scanning lines, never by reserialising. Every edit rewrites the
-# value token on one line and leaves the entire rest of the file — comments,
-# blank lines, ordering, indentation, anything this parser does not model —
-# byte-identical. A config file the operator hand-tuned must survive a visit
-# to the Settings page unchanged except for what they changed.
+# Tokenized and parsed into a tree, never reserialised. Every edit splices
+# only the value token's own offsets and leaves the entire rest of the file —
+# comments, blank lines, ordering, indentation, anything this parser does not
+# model — byte-identical. A config file the operator hand-tuned must survive
+# a visit to the Settings page unchanged except for what they changed.
+#
+# This used to be a line-scan (block name and brace required on the same
+# line, one regex per line). That went blind on Allman-style blocks
+# (`writePolicy` then `{` on its own following line) and on a block opened
+# and closed on one line (`writePolicy { plugin = "" }`) — both real shapes
+# strfry.conf actually appears in. strfry-86-updater.py's own conf editor
+# had the identical blindness and was fixed the same way: tokenize the whole
+# file once, offsets included, and only ever splice the original text at
+# those offsets. The updater cannot import this code (on a fresh install
+# lib86 does not exist yet, and this module is heavier still), so this is a
+# second, independent implementation of the same tokenizer/parser shape —
+# `tests/` runs both across the same fixture set and asserts byte-identical
+# output, so drift between the two copies fails a test instead of surfacing
+# as two admin surfaces disagreeing about the same file.
 
-# The value group tries a complete double-quoted string BEFORE the bare-token
-# branch, so a `#` inside quotes stays part of the value instead of being read
-# as the start of a comment. Without that alternation `description = "Relay for
-# #bitcoin fans"` parsed as the value `"Relay for`, and rewriting that field
-# re-appended the salvaged `#…` tail after the new value — emitting
-# `icon = "https://new/i.png"#frag"` into the operator's live relay config,
-# which only a brace check guards and nothing here restarts to reveal.
-_CONF_ASSIGN = re.compile(
-    r'^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)'
-    r'("(?:[^"\\]|\\.)*"|[^#]*?)'
-    r'(\s*(?:#.*)?)$'
+
+class ConfParseError(Exception):
+    pass
+
+
+_CONF_TOKEN_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*"'   # quoted string (escapes not interpreted, kept raw)
+    r'|[{}=]'              # structural characters
+    r'|[^\s{}=#"]+'        # bareword: identifier, number, true/false, ...
 )
-_CONF_BLOCK_OPEN = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
+
+
+def _tokenize_conf(text):
+    """(token, start, end) triples over strfry.conf-shaped text. Whitespace
+    is skipped; '#' outside a quoted string starts a comment that runs to
+    end-of-line. A '#' or brace INSIDE a quoted string is not structural —
+    the quoted-string alternative in _CONF_TOKEN_RE is tried first and
+    consumes the whole literal, braces and all."""
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == "#":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        m = _CONF_TOKEN_RE.match(text, i)
+        if not m:
+            raise ConfParseError(f"unrecognized character {c!r} at offset {i}")
+        tokens.append((m.group(0), m.start(), m.end()))
+        i = m.end()
+    return tokens
+
+
+def _parse_conf_tree(tokens):
+    """Recursive-descent parse into a nested dict: each key maps to either
+    ('block', subtree, open_end, close_start) or ('value', raw_token, start,
+    end). Raises ConfParseError on anything that doesn't fit the
+    key=value / key{...} grammar, including a block that never closes."""
+    idx = 0
+
+    def parse_block(top_level):
+        nonlocal idx
+        node = {}
+        while idx < len(tokens):
+            tok, start, end = tokens[idx]
+            if tok == "}":
+                if top_level:
+                    raise ConfParseError(f"unexpected '}}' at offset {start}")
+                idx += 1
+                return node
+            key = tok
+            idx += 1
+            if idx >= len(tokens):
+                raise ConfParseError(f"unexpected end of file after '{key}'")
+            nxt, nstart, nend = tokens[idx]
+            if nxt == "{":
+                open_end = nend
+                idx += 1
+                child = parse_block(False)
+                close_start = tokens[idx - 1][1]  # the '}' just consumed
+                node[key] = ("block", child, open_end, close_start)
+            elif nxt == "=":
+                idx += 1
+                if idx >= len(tokens):
+                    raise ConfParseError(f"unexpected end of file after '{key} ='")
+                vtok, vstart, vend = tokens[idx]
+                idx += 1
+                node[key] = ("value", vtok, vstart, vend)
+            else:
+                raise ConfParseError(f"unexpected token {nxt!r} after '{key}'")
+        if not top_level:
+            raise ConfParseError("unterminated block — missing '}'")
+        return node
+
+    root = parse_block(top_level=True)
+    if idx != len(tokens):
+        raise ConfParseError("trailing tokens after top-level parse")
+    return root
 
 
 def _conf_value_type(raw):
@@ -2512,63 +2595,55 @@ def _conf_unquote(raw):
     return raw
 
 
+def _walk_conf_tree(node, prefix):
+    fields = []
+    for key, entry in node.items():
+        path = ".".join(prefix + [key])
+        section = ".".join(prefix) or "general"
+        if entry[0] == "block":
+            fields.extend(_walk_conf_tree(entry[1], prefix + [key]))
+        else:
+            _, vtok, vstart, vend = entry
+            fields.append({
+                "path": path,
+                "section": section,
+                "key": key,
+                "value": _conf_unquote(vtok),
+                "type": _conf_value_type(vtok),
+                "vstart": vstart,
+                "vend": vend,
+            })
+    return fields
+
+
 def parse_strfry_conf(text):
     """Return (fields, balanced). `fields` is every scalar assignment in
-    file order, each with its dotted path, section, value, type and line
-    index. `balanced` is False when braces do not close — the one structural
-    check worth making before allowing a write."""
-    fields = []
-    stack = []
-    depth_ok = True
-    for i, line in enumerate(text.split("\n")):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        opened = _CONF_BLOCK_OPEN.match(line)
-        if opened:
-            stack.append(opened.group(1))
-            continue
-        if stripped == "}" or stripped.startswith("}"):
-            if not stack:
-                depth_ok = False
-            else:
-                stack.pop()
-            continue
-        m = _CONF_ASSIGN.match(line)
-        if not m:
-            continue
-        key, raw = m.group(2), m.group(4).rstrip(";").strip()
-        if raw.endswith("{"):
-            stack.append(key)
-            continue
-        if not raw:
-            continue
-        fields.append({
-            "path": ".".join(stack + [key]),
-            "section": ".".join(stack) or "general",
-            "key": key,
-            "value": _conf_unquote(raw),
-            "type": _conf_value_type(raw),
-            "line": i,
-        })
-    return fields, depth_ok and not stack
+    file order, each with its dotted path, section, value and type.
+    `balanced` is False when the file doesn't tokenize/parse cleanly (this
+    is the one structural check worth making before allowing a write) — in
+    that case `fields` is empty, since a partial tree from broken input is
+    not safe to offer for structured editing."""
+    try:
+        tree = _parse_conf_tree(_tokenize_conf(text))
+    except ConfParseError:
+        return [], False
+    return _walk_conf_tree(tree, []), True
 
 
 def apply_strfry_conf_edits(text, edits):
-    """Rewrite only the value token of the lines named by `edits`
+    """Rewrite only the value token named by each path in `edits`
     ({path: new_value}). Returns (new_text, changed_paths)."""
-    fields, _ = parse_strfry_conf(text)
+    fields, balanced = parse_strfry_conf(text)
+    if not balanced:
+        return text, []
     by_path = {f["path"]: f for f in fields}
-    lines = text.split("\n")
+    splices = []
     changed = []
     for path, new_value in edits.items():
         field = by_path.get(path)
         if field is None:
             continue
         if str(field["value"]) == str(new_value):
-            continue
-        m = _CONF_ASSIGN.match(lines[field["line"]])
-        if not m:
             continue
         if field["type"] == "string":
             rendered = '"' + str(new_value).replace('"', '\\"') + '"'
@@ -2579,10 +2654,12 @@ def apply_strfry_conf_edits(text, edits):
                 rendered = str(int(str(new_value).strip()))
             except ValueError:
                 continue
-        trailing = m.group(4)[len(m.group(4).rstrip(";").strip()):]
-        lines[field["line"]] = m.group(1) + m.group(2) + m.group(3) + rendered + trailing + m.group(5)
+        splices.append((field["vstart"], field["vend"], rendered))
         changed.append(path)
-    return "\n".join(lines), changed
+    new_text = text
+    for start, end, rendered in sorted(splices, key=lambda s: s[0], reverse=True):
+        new_text = new_text[:start] + rendered + new_text[end:]
+    return new_text, changed
 
 
 def read_strfry_conf():
@@ -2684,15 +2761,138 @@ CONF_FIELD_HELP = {
         "(default 300; live broadcast still requires a brief write)",
 }
 
-# Warnings render in red on the Settings page. writePolicy.plugin is the path
-# the running relay uses to call into plugin86 — changing it is how operators
-# accidentally turn off bans and the decision log while everything still
-# "looks configured".
+# Two tiers of settings-page risk, keyed by conf/config field path (matching
+# parse_strfry_conf()'s "path" / CONFIG_EDITABLE_FIELDS' key) or, for the
+# handful of things that aren't a field at all (the raw editors, the
+# gift-wrap purge and compact buttons), one of the "__..__" action ids below.
+# One table so there is one place to add the next entry — the page never
+# hardcodes a warning string itself, it only renders what this table hands it.
+#
+# tier 1 (red outline + statement + confirm-before-acting): damage that is
+# hard to walk back — takes the admin UI or the relay off the network, points
+# a live process at the wrong database, or deletes data on its own next tick.
+# Each tier-1 text says whether the damage shows up immediately or only after
+# a restart, because that's exactly the gap that turns a typo into a surprise
+# hours later.
+#
+# tier 2 (amber statement, no confirm): a plain sentence, changed value takes
+# effect without derailing anything already running.
 CONF_FIELD_WARNING = {
-    "relay.writePolicy.plugin":
-        "Do not change this path. strfry-86 depends on writePolicy.plugin "
-        "pointing at plugin86.py — changing it disables ban enforcement and "
-        "the decision log.",
+    "relay.writePolicy.plugin": {
+        "tier": 1,
+        "text": (
+            "Do not change this path — strfry-86 depends on writePolicy.plugin "
+            "pointing at plugin86.py, and changing it disables ban enforcement and "
+            "the decision log immediately, since strfry re-reads this file live "
+            "with no restart needed."
+        ),
+    },
+    "relay.writePolicy.timeoutSeconds": {
+        "tier": 1,
+        "text": (
+            "Too low a value makes strfry treat a slow plugin86.py decision as a "
+            "timeout and fail open, immediately and with no restart, since strfry "
+            "re-reads this file live."
+        ),
+    },
+    "db": {
+        "tier": 1,
+        "text": (
+            "A wrong path points strfry at a different (or empty) database — not "
+            "visible until the relay's next restart, when it starts serving that "
+            "dataset instead."
+        ),
+    },
+    "relay.bind": {
+        "tier": 1,
+        "text": (
+            "A wrong bind address can make the relay itself unreachable — not "
+            "visible until the relay's next restart."
+        ),
+    },
+    "relay.port": {
+        "tier": 1,
+        "text": (
+            "A wrong port can make the relay itself unreachable — not visible "
+            "until the relay's next restart."
+        ),
+    },
+    "port": {
+        "tier": 1,
+        "text": (
+            "A wrong port makes the admin UI unreachable at its old address — "
+            "not visible until the next start, when nothing answers there."
+        ),
+    },
+    "bind": {
+        "tier": 1,
+        "text": (
+            "A wrong bind address makes the admin UI unreachable — not visible "
+            "until the next start, when nothing is listening where you expect."
+        ),
+    },
+    "public_origin": {
+        "tier": 1,
+        "text": (
+            "A wrong origin makes every NIP-98 request fail immediately while "
+            "the login button still appears to work — every save, ban, or scan "
+            "quietly 401s."
+        ),
+    },
+    "strfry_conf_path": {
+        "tier": 1,
+        "text": (
+            "A wrong path points every scan and delete at a different database "
+            "immediately, with no error — Users, Stats, and Settings just start "
+            "showing that database's data."
+        ),
+    },
+    "giftwrap_retention_days": {
+        "tier": 1,
+        "text": (
+            "Lowering this deletes kind-1059 gift wraps older than the new "
+            "window — not visible until the next hourly retention loop runs, "
+            "by which point the data is already gone."
+        ),
+    },
+    "relay_url": {
+        "tier": 2,
+        "text": "Wrong value makes subscriber scans look for this relay's own subscriptions on the wrong relay.",
+    },
+    "events.ephemeralEventsLifetimeSeconds": {
+        "tier": 2,
+        "text": "Raising this keeps ephemeral (kind 20000–29999) events on disk longer before RelayCron deletes them.",
+    },
+    "relay.info.pubkey": {
+        "tier": 2,
+        "text": "Changes the relay's published NIP-11 admin identity — clients or directories that pinned the old value will see a mismatch.",
+    },
+    "__raw_relay__": {
+        "tier": 1,
+        "text": (
+            "Raw edits bypass every per-field check above — a typo can silently "
+            "change a field you didn't mean to touch, and nothing catches it "
+            "until save or the relay's next restart."
+        ),
+    },
+    "__raw_app__": {
+        "tier": 1,
+        "text": (
+            "Raw edits bypass every per-field check above except the "
+            "admin_pubkey_hex guard — a subtly wrong value saves without warning."
+        ),
+    },
+    "__giftwrap_purge__": {
+        "tier": 1,
+        "text": "Deletes matching gift wraps immediately and permanently — there is no undo in this UI.",
+    },
+    "__db_compact__": {
+        "tier": 1,
+        "text": (
+            "Writes a full copy of the database immediately, needing free disk "
+            "roughly the size of the copy, and can run long on a large relay."
+        ),
+    },
 }
 
 
@@ -2736,9 +2936,10 @@ def get_settings_payload():
         help_text = CONF_FIELD_HELP.get(f["path"])
         if help_text:
             f["help"] = help_text
-        warning = CONF_FIELD_WARNING.get(f["path"])
-        if warning:
-            f["warning"] = warning
+        risk = CONF_FIELD_WARNING.get(f["path"])
+        if risk:
+            f["tier"] = risk["tier"]
+            f["warning"] = risk["text"]
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             cfg_data = json.load(fh)
@@ -2755,6 +2956,10 @@ def get_settings_payload():
             "help": help_text, "type": ftype,
             "value": value,
         }
+        risk = CONF_FIELD_WARNING.get(key)
+        if risk:
+            field["tier"] = risk["tier"]
+            field["warning"] = risk["text"]
         if ftype == "range":
             field["min"] = GIFTWRAP_RETENTION_MIN
             field["max"] = GIFTWRAP_RETENTION_MAX
@@ -2770,11 +2975,13 @@ def get_settings_payload():
             # running relay. Happy-path source narration stays off the page.
             "warning": conf_status.get("error") if conf_status.get("exists") else None,
             "writable": (_path_writable(conf_path) if conf_status.get("exists") else None),
+            "raw_warning": CONF_FIELD_WARNING["__raw_relay__"]["text"],
         },
         "app": {
             "path": CONFIG_PATH, "fields": app_fields, "raw": _config_raw(),
             "error": None, "balanced": True,
             "writable": _path_writable(CONFIG_PATH),
+            "raw_warning": CONF_FIELD_WARNING["__raw_app__"]["text"],
         },
         # The admin-only copy of purge/compact status, carrying the failure
         # text the public poll endpoints withhold. The Settings page is the
@@ -2782,6 +2989,8 @@ def get_settings_payload():
         "purge": get_giftwrap_purge_status(include_detail=True),
         "ephemeral_purge": get_ephemeral_purge_status(include_detail=True),
         "compact": get_db_compact_status(include_detail=True),
+        "giftwrap_purge_warning": CONF_FIELD_WARNING["__giftwrap_purge__"]["text"],
+        "db_compact_warning": CONF_FIELD_WARNING["__db_compact__"]["text"],
     }
 
 

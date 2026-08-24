@@ -139,6 +139,17 @@ dl.tiles .note.bad { color:var(--accent); }
    --accent is the project's "bad" colour; weight makes it read before the
    muted help line under it. */
 .field-control .note.bad { color:var(--accent); font-weight:600; }
+/* Tier-2 risk note: less severe than .note.bad — a plain sentence in the
+   project's existing amber token, no confirm gate attached to it. */
+.field-control .note.warn { color:var(--warn); font-weight:600; }
+/* Tier-1 destructive control: a red outline on the field's own box, on top
+   of the red risk statement above it, so the danger reads even before the
+   text does. */
+.field-control input.danger,
+.field-control textarea.danger,
+.field-control button.danger {
+  border-color:var(--accent); box-shadow:0 0 0 1px var(--accent);
+}
 /* Compact progress: the "N of ~M" size figure is the one number that matters
    mid-run, so it steps out of the muted note colour into full ink + bold. */
 .field-control .note .figure { color:var(--ink); font-weight:700;

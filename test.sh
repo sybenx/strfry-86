@@ -1332,6 +1332,65 @@ finally:
     shutil.rmtree(_conf_dir, ignore_errors=True)
 
 
+# --- Settings page: two-tier field risk warnings, sourced from one table --
+# CONF_FIELD_WARNING is the single place a warning is defined; the payload
+# built for the page must carry tier + text for every field CLAUDE.md calls
+# out as tier 1 or tier 2, plus the raw-editor and purge/compact action text.
+_WARN_CONF = """relay {
+    bind = "0.0.0.0"
+    port = 7777
+
+    info {
+        pubkey = ""
+    }
+
+    writePolicy {
+        plugin = "./plugin86.py"
+        timeoutSeconds = 10
+    }
+}
+db = "./strfry-db/"
+"""
+_warn_dir = tempfile.mkdtemp()
+_warn_conf_file = os.path.join(_warn_dir, "strfry.conf")
+_orig_cfg_for_warn = server86.CONFIG_PATH
+server86.CONFIG_PATH = os.path.join(_warn_dir, "config.json")
+try:
+    with open(_warn_conf_file, "w") as _fh:
+        _fh.write(_WARN_CONF)
+    with open(server86.CONFIG_PATH, "w") as _fh:
+        json.dump({"strfry_conf_path": _warn_conf_file, "admin_pubkey_hex": "bb" * 32}, _fh)
+    _payload = server86.get_settings_payload()
+    _relay_by_path = {f["path"]: f for f in _payload["relay"]["fields"]}
+    _app_by_path = {f["path"]: f for f in _payload["app"]["fields"]}
+
+    _tier1_conf_paths = ["db", "relay.bind", "relay.port",
+                          "relay.writePolicy.plugin", "relay.writePolicy.timeoutSeconds"]
+    check(all(_relay_by_path[p]["tier"] == 1 and _relay_by_path[p]["warning"] for p in _tier1_conf_paths),
+          "every tier-1 strfry.conf field carries tier 1 and a non-empty warning")
+    check(_relay_by_path["relay.info.pubkey"]["tier"] == 2
+          and _relay_by_path["relay.info.pubkey"]["warning"],
+          "relay.info.pubkey carries tier 2, not tier 1")
+    check("relay.info.name" not in _relay_by_path or "tier" not in _relay_by_path.get("relay.info.name", {}),
+          "an unlisted field carries no tier at all")
+
+    _tier1_app_paths = ["port", "bind", "public_origin", "strfry_conf_path", "giftwrap_retention_days"]
+    check(all(_app_by_path[p]["tier"] == 1 and _app_by_path[p]["warning"] for p in _tier1_app_paths),
+          "every tier-1 config.json field carries tier 1 and a non-empty warning")
+    check(_app_by_path["relay_url"]["tier"] == 2 and _app_by_path["relay_url"]["warning"],
+          "config.json's relay_url carries tier 2, not tier 1")
+    check("contact_appeal" not in _app_by_path or "tier" not in _app_by_path.get("contact_appeal", {}),
+          "an untiered config.json field (contact_appeal) carries no tier")
+
+    check(bool(_payload["relay"]["raw_warning"]) and bool(_payload["app"]["raw_warning"]),
+          "both raw editors carry a tier-1 warning from the same table")
+    check(bool(_payload["giftwrap_purge_warning"]) and bool(_payload["db_compact_warning"]),
+          "the purge and compact actions carry a tier-1 warning from the same table")
+finally:
+    server86.CONFIG_PATH = _orig_cfg_for_warn
+    shutil.rmtree(_warn_dir, ignore_errors=True)
+
+
 # --- config.json: a raw save can never lock the operator out -------------
 _cfg_dir = tempfile.mkdtemp()
 _orig_cfg_path = server86.CONFIG_PATH
@@ -3064,6 +3123,9 @@ spec = importlib.util.spec_from_file_location(
 updater = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(updater)
 
+sys.path.insert(0, repo_root)
+import server86  # noqa: E402
+
 ADMIN_HEX = "a" * 64
 
 
@@ -3282,10 +3344,51 @@ def _reparse(path):
     return fields, True
 
 
-def scenario_conf_same_line_block(tmpdir):
+# One fixture set, shared by every conf-shape test below AND by the
+# server86-vs-updater tokenizer parity check further down — never a second,
+# separately-invented set of conf snippets to test the same shape twice.
+_CROSS_IMPL_CONF_FIXTURES = {
     # writePolicy { plugin = "" } entirely on one line — whole-line
     # replacement used to eat this block's own closing brace.
-    path = _write_conf(tmpdir, 'relay {\n    writePolicy { plugin = "" }\n}\n')
+    "same_line_block": 'relay {\n    writePolicy { plugin = "" }\n}\n',
+    # '{' alone on the line after 'writePolicy' — the old same-line-only
+    # regex missed this and appended a second, top-level writePolicy block
+    # instead of using the real one.
+    "allman_braces": 'relay {\n    writePolicy\n    {\n        plugin = ""\n    }\n}\n',
+    # writePolicy {} — open and close brace adjacent, the old block_end ==
+    # block_start case inserted the plugin line OUTSIDE the block.
+    "one_line_empty_block": 'relay {\n    writePolicy {}\n}\n',
+    # relay{} exists, writePolicy{} does not.
+    "no_write_policy_block": 'relay {\n    port = 7777\n}\n',
+    # A block that never closes must fail cleanly, not crash the run.
+    "unterminated_block": 'relay {\n    writePolicy {\n        plugin = ""\n',
+    # A '{' or '}' inside a '#' comment must not affect block-depth tracking.
+    "brace_in_comment": (
+        'relay {\n    # a stray { brace and a } brace in a comment\n'
+        '    writePolicy {\n        plugin = ""\n    }\n}\n'
+    ),
+    # A '#' or brace inside a quoted VALUE elsewhere in the file must not be
+    # read as a comment or as structure.
+    "hash_and_quotes": (
+        'relay {\n'
+        '    info {\n'
+        '        description = "Relay for #bitcoin fans {test}"\n'
+        '    }\n'
+        '    writePolicy {\n        plugin = ""\n    }\n'
+        '}\n'
+    ),
+    # dockurr/strfry's own shipped default (see KNOWN_DEFAULT_PLUGINS).
+    "dockurr_default": (
+        'relay {\n    writePolicy {\n        plugin = "/app/write-policy.py"\n'
+        '        timeoutSeconds = 10\n    }\n}\n'
+    ),
+    # CRLF line endings — an operator's file may not use bare \n at all.
+    "crlf": 'relay {\r\n    writePolicy {\r\n        plugin = ""\r\n    }\r\n}\r\n',
+}
+
+
+def scenario_conf_same_line_block(tmpdir):
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["same_line_block"])
     status, used = updater.edit_strfry_conf()
     fields, balanced = _reparse(path)
     check(status == "set" and balanced,
@@ -3295,11 +3398,7 @@ def scenario_conf_same_line_block(tmpdir):
 
 
 def scenario_conf_allman_braces(tmpdir):
-    # '{' alone on the line after 'writePolicy' — the old same-line-only
-    # regex missed this and appended a second, top-level writePolicy block
-    # instead of using the real one.
-    path = _write_conf(
-        tmpdir, 'relay {\n    writePolicy\n    {\n        plugin = ""\n    }\n}\n')
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["allman_braces"])
     status, used = updater.edit_strfry_conf()
     body = open(path).read()
     fields, balanced = _reparse(path)
@@ -3311,9 +3410,7 @@ def scenario_conf_allman_braces(tmpdir):
 
 
 def scenario_conf_one_line_empty_block(tmpdir):
-    # writePolicy {} — open and close brace adjacent, the old block_end ==
-    # block_start case inserted the plugin line OUTSIDE the block.
-    path = _write_conf(tmpdir, 'relay {\n    writePolicy {}\n}\n')
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["one_line_empty_block"])
     status, used = updater.edit_strfry_conf()
     fields, balanced = _reparse(path)
     check(status == "set" and balanced,
@@ -3323,10 +3420,10 @@ def scenario_conf_one_line_empty_block(tmpdir):
 
 
 def scenario_conf_no_write_policy_block(tmpdir):
-    # relay{} exists, writePolicy{} does not — must be inserted INSIDE
-    # relay{}, never as a second top-level block (strfry only ever reads
-    # relay.writePolicy.plugin — a top-level key of that name is a no-op).
-    path = _write_conf(tmpdir, 'relay {\n    port = 7777\n}\n')
+    # writePolicy{} must be inserted INSIDE relay{}, never as a second
+    # top-level block (strfry only ever reads relay.writePolicy.plugin — a
+    # top-level key of that name is a no-op).
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["no_write_policy_block"])
     status, used = updater.edit_strfry_conf()
     fields, balanced = _reparse(path)
     check(status == "set" and balanced,
@@ -3336,8 +3433,7 @@ def scenario_conf_no_write_policy_block(tmpdir):
 
 
 def scenario_conf_unterminated_block(tmpdir):
-    # A block that never closes must fail cleanly, not crash the run.
-    path = _write_conf(tmpdir, 'relay {\n    writePolicy {\n        plugin = ""\n')
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["unterminated_block"])
     before = open(path).read()
     status, used = updater.edit_strfry_conf()
     after = open(path).read()
@@ -3347,11 +3443,7 @@ def scenario_conf_unterminated_block(tmpdir):
 
 
 def scenario_conf_brace_in_comment(tmpdir):
-    # A '{' or '}' inside a '#' comment must not affect block-depth tracking.
-    path = _write_conf(
-        tmpdir,
-        'relay {\n    # a stray { brace and a } brace in a comment\n'
-        '    writePolicy {\n        plugin = ""\n    }\n}\n')
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["brace_in_comment"])
     status, used = updater.edit_strfry_conf()
     fields, balanced = _reparse(path)
     check(status == "set" and balanced,
@@ -3361,16 +3453,7 @@ def scenario_conf_brace_in_comment(tmpdir):
 
 
 def scenario_conf_hash_and_quotes_in_values(tmpdir):
-    # A '#' or brace inside a quoted VALUE elsewhere in the file must not be
-    # read as a comment or as structure, and must survive the edit intact.
-    path = _write_conf(
-        tmpdir,
-        'relay {\n'
-        '    info {\n'
-        '        description = "Relay for #bitcoin fans {test}"\n'
-        '    }\n'
-        '    writePolicy {\n        plugin = ""\n    }\n'
-        '}\n')
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["hash_and_quotes"])
     status, used = updater.edit_strfry_conf()
     body = open(path).read()
     check(status == "set", "quoted # and braces in an unrelated value: plugin still gets set")
@@ -3379,13 +3462,10 @@ def scenario_conf_hash_and_quotes_in_values(tmpdir):
 
 
 def scenario_conf_dockurr_default_replaced(tmpdir):
-    # dockurr/strfry's own shipped default (see KNOWN_DEFAULT_PLUGINS) — the
-    # old refuse-to-overwrite behaviour left the documented one-line install
-    # against that image silently unmoderated, reporting success.
-    path = _write_conf(
-        tmpdir,
-        'relay {\n    writePolicy {\n        plugin = "/app/write-policy.py"\n'
-        '        timeoutSeconds = 10\n    }\n}\n')
+    # The old refuse-to-overwrite behaviour left the documented one-line
+    # install against dockurr/strfry's default image silently unmoderated,
+    # reporting success.
+    path = _write_conf(tmpdir, _CROSS_IMPL_CONF_FIXTURES["dockurr_default"])
     status, used = updater.edit_strfry_conf()
     fields, balanced = _reparse(path)
     check(status == "set",
@@ -3407,6 +3487,99 @@ def scenario_conf_genuine_foreign_plugin_still_refused(tmpdir):
     check(status == "existing plugin left untouched",
           "a genuinely foreign (non-default) plugin value is still refused, not overwritten")
     check(before == after, "refusing a foreign plugin value writes nothing")
+
+
+# --- server86.py vs strfry-86-updater.py: two independent conf tokenizers -
+# --- must never silently drift ---------------------------------------------
+# server86.py's Settings-page editor and the updater's edit_strfry_conf() are
+# forced duplicates — the updater can't import server86.py (or lib86) on a
+# fresh install, before either exists on disk — so each carries its own
+# tokenize/parse/splice implementation of the exact same strfry.conf grammar.
+# A one-off "looks the same" review does not stay true across every future
+# edit to either copy. This runs BOTH across every fixture in
+# _CROSS_IMPL_CONF_FIXTURES (defined above, shared with the scenario_conf_*
+# tests) and asserts they agree — parsed structure, parse/refuse outcome, and
+# spliced bytes wherever a like-for-like edit applies. A real disagreement
+# here is a finding to report, not a fixture to adjust until it passes.
+
+
+def _updater_conf_fields(text):
+    """(dotted-path -> unquoted value) via the updater's own tokenizer/
+    parser, or None if it doesn't parse at all — mirrors server86's
+    parse_strfry_conf(text) return shape (fields dict, or None for
+    unbalanced/malformed) so the two are directly comparable."""
+    try:
+        tree = updater._parse_conf_tree(updater._tokenize_conf(text))
+    except updater.ConfParseError:
+        return None
+    fields = {}
+
+    def walk(node, prefix):
+        for k, v in node.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if v[0] == "block":
+                walk(v[1], p)
+            else:
+                fields[p] = updater._conf_unquote(v[1])
+
+    walk(tree, "")
+    return fields
+
+
+def _server86_conf_fields(text):
+    fields, balanced = server86.parse_strfry_conf(text)
+    if not balanced:
+        return None
+    return {f["path"]: f["value"] for f in fields}
+
+
+def scenario_conf_tokenizers_agree_byte_for_byte(tmpdir):
+    new_plugin_quoted = '"' + updater.PLUGIN_PATH + '"'
+    for name, fixture in _CROSS_IMPL_CONF_FIXTURES.items():
+        updater_fields = _updater_conf_fields(fixture)
+        server_fields = _server86_conf_fields(fixture)
+
+        # Malformed input (the unterminated block): both must refuse to
+        # parse it at all — an identical refusal, not one silently
+        # recovering a partial structure the other rejects outright.
+        check((updater_fields is None) == (server_fields is None),
+              f"updater and server86 agree on whether the '{name}' shape parses at all")
+        if updater_fields is None:
+            continue
+
+        check(updater_fields == server_fields,
+              f"updater and server86 extract identical dotted-path/value pairs "
+              f"for the '{name}' shape")
+
+        if "relay.writePolicy.plugin" not in updater_fields:
+            # No existing plugin VALUE to splice (one_line_empty_block,
+            # no_write_policy_block) — updater.edit_strfry_conf() inserts a
+            # brand-new writePolicy{} block here, a higher-level install-time
+            # behaviour server86's Settings-page editor deliberately does not
+            # have (it edits fields the operator's file already has; it
+            # never invents new ones — see apply_strfry_conf_edits()). That
+            # is a documented scope difference, not a tokenizer disagreement,
+            # so there is nothing to splice-compare for this shape.
+            check(server86.apply_strfry_conf_edits(
+                      fixture, {"relay.writePolicy.plugin": updater.PLUGIN_PATH})[1] == [],
+                  f"server86 correctly declines to invent a missing "
+                  f"relay.writePolicy.plugin for the '{name}' shape")
+            continue
+
+        # An existing value: both must splice it identically, byte for byte.
+        tree = updater._parse_conf_tree(updater._tokenize_conf(fixture))
+        plugin_entry = tree["relay"][1]["writePolicy"][1]["plugin"]
+        vstart, vend = plugin_entry[2], plugin_entry[3]
+        updater_out = fixture[:vstart] + new_plugin_quoted + fixture[vend:]
+
+        server_out, changed = server86.apply_strfry_conf_edits(
+            fixture, {"relay.writePolicy.plugin": updater.PLUGIN_PATH})
+
+        check(changed == ["relay.writePolicy.plugin"],
+              f"server86's conf editor recognises relay.writePolicy.plugin in the '{name}' shape")
+        check(updater_out == server_out,
+              f"updater and server86's independent conf tokenizers splice byte-identical "
+              f"output for the '{name}' shape")
 
 
 # --- find_server86_pids(): matches the real process, not any argv that ----
@@ -3474,6 +3647,7 @@ with_tmp_install_dir(scenario_conf_brace_in_comment)
 with_tmp_install_dir(scenario_conf_hash_and_quotes_in_values)
 with_tmp_install_dir(scenario_conf_dockurr_default_replaced)
 with_tmp_install_dir(scenario_conf_genuine_foreign_plugin_still_refused)
+with_tmp_install_dir(scenario_conf_tokenizers_agree_byte_for_byte)
 with_tmp_install_dir(scenario_find_server86_pids_exact_match_only)
 with_tmp_install_dir(scenario_server86_port_bound_check)
 PYEOF

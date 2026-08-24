@@ -139,6 +139,17 @@ dl.tiles .note.bad { color:var(--accent); }
    --accent is the project's "bad" colour; weight makes it read before the
    muted help line under it. */
 .field-control .note.bad { color:var(--accent); font-weight:600; }
+/* Tier-2 risk note: less severe than .note.bad — a plain sentence in the
+   project's existing amber token, no confirm gate attached to it. */
+.field-control .note.warn { color:var(--warn); font-weight:600; }
+/* Tier-1 destructive control: a red outline on the field's own box, on top
+   of the red risk statement above it, so the danger reads even before the
+   text does. */
+.field-control input.danger,
+.field-control textarea.danger,
+.field-control button.danger {
+  border-color:var(--accent); box-shadow:0 0 0 1px var(--accent);
+}
 /* Compact progress: the "N of ~M" size figure is the one number that matters
    mid-run, so it steps out of the muted note colour into full ink + bold. */
 .field-control .note .figure { color:var(--ink); font-weight:700;
@@ -621,11 +632,28 @@ function buildFieldRow(field, onDirty) {
   }
   control.id = id;
   control.setAttribute('data-path', field.path);
+  control.setAttribute('data-tier', field.tier || '');
   control.addEventListener('input', onDirty);
   control.addEventListener('change', onDirty);
+  if (field.tier === 1) {
+    control.classList.add('danger');
+  }
 
   var right = s86El('div', null, 'field-control');
+  // Tier-1 risk statement sits ABOVE the input, so the danger is read before
+  // the value is — tier-2 stays below, alongside help text.
+  if (field.warning && field.tier === 1) {
+    right.appendChild(s86El('p', field.warning, 'note bad'));
+  }
   if (field.type === 'range') {
+    if (payload.giftwrap_purge_warning) {
+      right.appendChild(s86El('p', payload.giftwrap_purge_warning, 'note bad'));
+      purgeBtn.classList.add('danger');
+    }
+    if (payload.db_compact_warning) {
+      right.appendChild(s86El('p', payload.db_compact_warning, 'note bad'));
+      compactBtn.classList.add('danger');
+    }
     var sliderRow = s86El('div', null, 'toolbar');
     sliderRow.appendChild(control);
     sliderRow.appendChild(valueReadout);
@@ -642,8 +670,8 @@ function buildFieldRow(field, onDirty) {
   } else {
     right.appendChild(control);
   }
-  if (field.warning) {
-    right.appendChild(s86El('p', field.warning, 'note bad'));
+  if (field.warning && field.tier !== 1) {
+    right.appendChild(s86El('p', field.warning, 'note warn'));
   }
   if (field.help) {
     right.appendChild(s86El('p', field.help, 'note'));
@@ -1155,11 +1183,17 @@ function buildSection(container, target, title, data) {
   }
   container.appendChild(structured);
 
+  if (data.raw_warning) {
+    rawWrap.appendChild(s86El('p', data.raw_warning, 'note bad'));
+  }
   var textarea = document.createElement('textarea');
   textarea.rows = 22;
   textarea.value = data.raw || '';
   textarea.spellcheck = false;
   textarea.setAttribute('aria-label', 'raw contents of ' + (data.path || title));
+  if (data.raw_warning) {
+    textarea.classList.add('danger');
+  }
   textarea.addEventListener('input', function () {
     saveBtn.disabled = textarea.value === (data.raw || '');
     statusLine.textContent = saveBtn.disabled ? '' : 'unsaved changes';
@@ -1186,14 +1220,24 @@ function buildSection(container, target, title, data) {
     }
     var usingRaw = rawWrap.style.display !== 'none';
     var body = { target: target };
+    var tier1Warnings = [];
     if (usingRaw) {
       body.raw = textarea.value;
+      if (data.raw_warning) {
+        tier1Warnings.push(data.raw_warning);
+      }
     } else {
       var edits = {};
       controls.forEach(function (c) {
         var path = c.getAttribute('data-path');
         if (controlValue(c) !== original[path]) {
           edits[path] = controlValue(c);
+          if (c.getAttribute('data-tier') === '1') {
+            var f = (data.fields || []).filter(function (x) { return x.path === path; })[0];
+            if (f && f.warning) {
+              tier1Warnings.push(f.warning);
+            }
+          }
         }
       });
       if (Object.keys(edits).length === 0) {
@@ -1201,6 +1245,12 @@ function buildSection(container, target, title, data) {
         return;
       }
       body.edits = edits;
+    }
+    if (tier1Warnings.length && !window.confirm(
+      'This save touches at least one high-risk setting:\n\n'
+      + tier1Warnings.join('\n\n') + '\n\nSave anyway?'
+    )) {
+      return;
     }
     saveBtn.disabled = true;
     statusLine.textContent = 'saving…';

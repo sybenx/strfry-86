@@ -1662,28 +1662,55 @@ function s86PollStatus(fetchFn, applyFn, onError) {
 var S86_GIFTWRAP_PURGE_DEFAULT_DAYS = 90;
 var S86_SUBSCRIBER_CACHE_STALE_SECONDS = 7 * 24 * 3600;
 var S86_GIFTWRAP_PURGE_CHUNK_SIZE = 200;
-// A guess, nothing more — the Docker image's mount point, true only for that
-// one deployment shape. s86ResolveStrfryConfFlag() below overwrites this with
-// server86's own resolved path (the same one /api/settings shows on the
-// Settings page) as soon as an admin session can ask for it; every command
-// generated before that answer lands is built from this placeholder, so a
-// source build or a relocated conf sends the operator a command that reads
-// the wrong database — or none — with no hint that it's wrong.
-var S86_STRFRY_CONFIG_FLAG = '--config /config/strfry.conf';
+// No default, no guess — confirmed against a real deployment that a wrong
+// --config doesn't just risk "the wrong database", it can fail outright
+// ("No such file or directory") on shapes where the Docker mount point
+// this used to hardcode doesn't exist at all. There is no placeholder safe
+// enough to show before the real path is confirmed, so command rendering
+// stays gated on S86_STRFRY_CONFIG_STATE below until it resolves one way
+// or the other.
+var S86_STRFRY_CONFIG_FLAG = null;
+var S86_STRFRY_CONFIG_STATE = 'pending';  // 'pending' | 'confirmed' | 'unavailable'
+var S86_STRFRY_CONFIG_LISTENERS = [];
+
+function s86StrfryConfSettled() {
+  var listeners = S86_STRFRY_CONFIG_LISTENERS;
+  S86_STRFRY_CONFIG_LISTENERS = [];
+  listeners.forEach(function (cb) { cb(); });
+}
 
 // Admin-only (the path is filesystem detail GET /api/metrics deliberately
 // withholds from the public). Call once a page knows it is logged in as
-// admin; commands are rendered lazily off field input, so this only needs
-// to win the race against the operator actually typing something, not
-// against page load.
+// admin. bans.html/domain.html/users.html build their command generator at
+// page load, before this is even called, and profile.html fires this in
+// parallel with its own (slower) profile fetch — either way a generator can
+// already be on screen when this settles, so every live instance registers
+// via s86OnStrfryConfResolved() below and re-renders then, rather than each
+// one racing this call on its own.
 function s86ResolveStrfryConfFlag() {
   return s86SignAndPost('/api/strfry-conf-path', {})
     .then(function (result) {
       if (result.ok && result.body && result.body.exists && result.body.path) {
         S86_STRFRY_CONFIG_FLAG = '--config ' + result.body.path;
+        S86_STRFRY_CONFIG_STATE = 'confirmed';
+      } else {
+        S86_STRFRY_CONFIG_STATE = 'unavailable';
       }
     })
-    .catch(function () {});
+    .catch(function () {
+      S86_STRFRY_CONFIG_STATE = 'unavailable';
+    })
+    .then(s86StrfryConfSettled);
+}
+
+// cb() fires once — synchronously if the path is already settled, otherwise
+// the next time s86ResolveStrfryConfFlag() settles.
+function s86OnStrfryConfResolved(cb) {
+  if (S86_STRFRY_CONFIG_STATE === 'pending') {
+    S86_STRFRY_CONFIG_LISTENERS.push(cb);
+  } else {
+    cb();
+  }
 }
 var S86_KNOWN_KINDS_LIST = [
   [0, 'profile'], [1, 'note'], [5, 'deletion'], [6, 'repost'], [7, 'reaction'],
@@ -1928,6 +1955,11 @@ var S86_COMMAND_INTENTS = [
 
 function s86BuildCommandGenerator(options) {
   options = options || {};
+  // Set only from /profile. Resolved once, up front: every pubkey-taking
+  // intent stays scoped to it (see buildFields()'s currentPubkeyValue),
+  // and giftwrap_purge — the one intent with no pubkey field of its own —
+  // switches to a recipient-scoped filter instead of staying relay-wide.
+  var scopedPubkeyHex = options.pubkey ? s86PubkeyInputToHex(options.pubkey) : null;
 
   var container = document.createElement('div');
   var details = document.createElement('details');
@@ -2008,15 +2040,31 @@ function s86BuildCommandGenerator(options) {
   });
 
   var fieldInputs = {};
+  // Survives buildFields() rebuilding fieldInputs from scratch on every
+  // select change — without this, switching the intent dropdown silently
+  // clears whatever pubkey was typed (or prefilled from /profile), since
+  // each rebuild used to start every pubkey field blank.
+  var currentPubkeyValue = options.pubkey || '';
 
   function currentIntent() {
     return S86_COMMAND_INTENTS.filter(function (i) { return i.key === select.value; })[0];
   }
 
+  // giftwrap_purge has no pubkey field of its own — once scoped (see
+  // scopedPubkeyHex above), its "exempt subscribers" checkbox stops making
+  // sense (there is exactly one recipient in play, not a relay-wide set to
+  // chunk against), so it's the one field list that varies by context.
+  function fieldsForIntent(intent) {
+    if (intent.key === 'giftwrap_purge' && scopedPubkeyHex) {
+      return intent.fields.filter(function (f) { return f.key !== 'exempt'; });
+    }
+    return intent.fields;
+  }
+
   function buildFields(intent) {
     fieldsEl.textContent = '';
     fieldInputs = {};
-    intent.fields.forEach(function (f) {
+    fieldsForIntent(intent).forEach(function (f) {
       var p = document.createElement('p');
       p.appendChild(s86El('span', f.label));
 
@@ -2031,13 +2079,19 @@ function s86BuildCommandGenerator(options) {
           input.placeholder = 'e.g. 1';
         } else if (f.type === 'pubkey') {
           input.placeholder = 'npub or hex';
+          input.value = currentPubkeyValue;
         } else if (f.type === 'days') {
           input.placeholder = String(S86_GIFTWRAP_PURGE_DEFAULT_DAYS);
         } else if (f.type === 'days_optional') {
           input.placeholder = 'blank = all time';
         }
       }
-      input.addEventListener(f.type === 'checkbox' ? 'change' : 'input', render);
+      input.addEventListener(f.type === 'checkbox' ? 'change' : 'input', function () {
+        if (f.key === 'pubkey') {
+          currentPubkeyValue = input.value;
+        }
+        render();
+      });
       fieldInputs[f.key] = input;
       p.appendChild(input);
       fieldsEl.appendChild(p);
@@ -2098,6 +2152,15 @@ function s86BuildCommandGenerator(options) {
     }
     var days = daysCheck.value;
     var cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+
+    if (scopedPubkeyHex) {
+      extraEl.appendChild(s86El('p',
+        'scoped to gift wraps addressed to this pubkey only, older than ' + days
+        + ' days — the relay-wide retention purge lives on the Settings page.'));
+      setCommands(countThenDeleteItems({ kinds: [1059], until: cutoff, '#p': [scopedPubkeyHex] }));
+      return;
+    }
+
     var blanketItems = countThenDeleteItems({ kinds: [1059], until: cutoff });
 
     if (!fieldInputs.exempt.checked) {
@@ -2209,6 +2272,14 @@ function s86BuildCommandGenerator(options) {
 
   function render() {
     extraEl.textContent = '';
+    // Every command box below embeds S86_STRFRY_CONFIG_FLAG — never render
+    // one until it's a confirmed real path, not the old hardcoded guess.
+    if (S86_STRFRY_CONFIG_STATE !== 'confirmed') {
+      setMessage(S86_STRFRY_CONFIG_STATE === 'unavailable'
+        ? 'strfry config path could not be confirmed — commands withheld rather than risk pointing at the wrong database. Reload while logged in as admin to retry.'
+        : 'confirming strfry config path…');
+      return;
+    }
     var intent = currentIntent();
     if (intent.key === 'delete_by_author') {
       renderDeleteByAuthor();
@@ -2227,10 +2298,13 @@ function s86BuildCommandGenerator(options) {
   });
 
   buildFields(currentIntent());
-  if (options.pubkey && fieldInputs.pubkey) {
-    fieldInputs.pubkey.value = options.pubkey;
-  }
   render();
+  // Re-render once the real --config path is known (or known-unavailable):
+  // bans/domain/users build this generator before s86ResolveStrfryConfFlag()
+  // is even called, and profile.html races it against a slower profile
+  // fetch — either way, whatever's on screen right now was drawn from the
+  // gate above and needs a real redraw once the answer lands.
+  s86OnStrfryConfResolved(render);
 
   container.appendChild(details);
   return container;
