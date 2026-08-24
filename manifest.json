@@ -13,9 +13,9 @@
   "lib86/namecache.py": "8107a6c3fdf8671fb6abb47864dcec2ce6f0aa47442ee59b4f9c4d3a7f303de7",
   "plugin86.py": "175597deb5eabab02669bad2dfd6eecc649e61cfc056230c6d8569f2cbad5b55",
   "profile.html": "6cb5862cc30a4ebe12f9b49ec4122c737942e1b96dd02dad7a85ea7360e77f37",
-  "server86.py": "728cb820a441299cbd0daa42cdc90a9bdbeb07eb931abca02ff088378d38b869",
+  "server86.py": "b8ee71e1e14b00af07ae8c5b2ded138609d560f67fb0df1ac05eec9d734e1712",
   "settings.html": "dd092afe1621c0fb913100a7e9a34f84c98adc3bf3678b361fc0c0914a008551",
-  "stats.html": "225ac207eb6088a0367d367d4be8be554b40c7dc585623143f34c106bfa14808",
+  "stats.html": "0ba9463538fde700fcfe980bd0ed04099b3c10fa43f36d433d2d54f3ac68a7f0",
   "strfry-86-updater.py": "c65d58a2993852f4cbbd059928470f6a912484de56867baec69b9b7df56709e7",
   "users.html": "9e2be2e453938def6c676a0106ae6616c0258bdbba0fbdd17301a8f9b8667193"
 }

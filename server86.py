@@ -1916,16 +1916,12 @@ def acquire_console_slot():
     holding it, and — only if none does — again after sampling RSS, with
     the running-job check repeated in case one started meanwhile."""
     def _running_refusal(running):
-        return {
-            "ok": False,
-            "error": (
-                f"refused: {running} is running — wait for it "
-                f"to finish before using the console"
-            ),
-            "blocked_by": running,
-            "argv": None, "stdout": "", "stderr": "",
-            "exit_code": None, "truncated": False,
-        }
+        return _console_result(
+            False,
+            f"refused: {running} is running — wait for it "
+            f"to finish before using the console",
+            None, blocked_by=running,
+        )
 
     with _scan_lock:
         running = _active_scan["name"]
@@ -1938,17 +1934,13 @@ def acquire_console_slot():
         if running is not None:
             return _running_refusal(running)
         if rss is not None and rss >= MEMORY_SOFT_BYTES:
-            return {
-                "ok": False,
-                "error": (
-                    f"refused: process RSS {rss // (1024 * 1024)}MB is at "
-                    f"or above the {MEMORY_SOFT_BYTES // (1024 * 1024)}MB "
-                    f"soft cap"
-                ),
-                "blocked_by": "memory",
-                "argv": None, "stdout": "", "stderr": "",
-                "exit_code": None, "truncated": False,
-            }
+            return _console_result(
+                False,
+                f"refused: process RSS {rss // (1024 * 1024)}MB is at "
+                f"or above the {MEMORY_SOFT_BYTES // (1024 * 1024)}MB "
+                f"soft cap",
+                None, blocked_by="memory",
+            )
         _active_scan["name"] = "console"
     return None
 
@@ -1959,13 +1951,35 @@ def release_console_slot():
             _active_scan["name"] = None
 
 
+def get_console_status():
+    """Who (if anyone) currently holds the shared job lock, from the
+    console's point of view. Same self-excluding shape as
+    get_giftwrap_purge_status/get_ephemeral_purge_status/get_db_compact_status
+    — those three each hide their own name so their panel doesn't report
+    itself as its own blocker; this one hides "console" for the same reason.
+    Cheap and unauthenticated (a lock-name read, no subprocess) specifically
+    so the Stats page can poll "is anything blocking me right now" without
+    re-signing and re-running a command every few seconds, and without the
+    client having to separately track every job name that can hold this
+    lock — POST /api/console's own 409 already names the real one; this is
+    just how the panel keeps asking after that, including for jobs nothing
+    on this page ever started (the hourly gift-wrap retention purge)."""
+    with _scan_lock:
+        running = _active_scan["name"]
+    return {"blocked_by": running if running not in (None, "console") else None}
+
+
 def _console_result(ok, error, argv, stdout="", stderr="", exit_code=None,
                      truncated=False, killed_for_memory=False,
-                     stdout_total_bytes=None, stderr_total_bytes=None):
-    """Shared shape for every run_console_command return path, so a caller
-    (the UI) never has to guess which fields a given failure mode left out.
-    stdout_total_bytes/stderr_total_bytes default to the shown length itself
-    (nothing was cut) — pass the real pre-slice length when it was."""
+                     stdout_total_bytes=None, stderr_total_bytes=None,
+                     blocked_by=None):
+    """Shared shape for every run_console_command/acquire_console_slot
+    return path, so a caller (the UI) never has to guess which fields a
+    given failure mode left out. stdout_total_bytes/stderr_total_bytes
+    default to the shown length itself (nothing was cut) — pass the real
+    pre-slice length when it was. blocked_by is set only when the global
+    job lock refused this call outright — the same field GET /api/console
+    reports on its own, so the UI reads one field name either way."""
     return {
         "ok": ok,
         "error": error,
@@ -1979,6 +1993,7 @@ def _console_result(ok, error, argv, stdout="", stderr="", exit_code=None,
         "exit_code": exit_code,
         "truncated": truncated,
         "killed_for_memory": killed_for_memory,
+        "blocked_by": blocked_by,
     }
 
 
@@ -5243,6 +5258,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/db-compact":
             # Same public-poll / redacted-error shape as gift-wrap purge.
             self._send_json(200, get_db_compact_status())
+            return
+
+        if path == "/api/console":
+            # Lock-holder read only — no subprocess, nothing to redact.
+            # Lets the Stats page poll "is anything blocking the console"
+            # without re-signing/re-running a command every few seconds.
+            self._send_json(200, get_console_status())
             return
 
         if path == "/api/domain-bans":

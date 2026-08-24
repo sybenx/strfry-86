@@ -956,7 +956,6 @@ function applyReportStatus(data) {
   lastReportData = data;
   totalsPanel.applyStatus(reportJobStatusFor(data, 'totals'), data.totals);
   walkPanel.applyStatus(reportJobStatusFor(data, 'walk'), data.walk);
-  noteConsoleJob('report', data);
 }
 
 function fetchReport() {
@@ -1106,11 +1105,9 @@ function fetchRecipients() { return fetch('/api/recipients').then(function (res)
 function fetchSubscribers() { return fetch('/api/subscribers').then(function (res) { return res.json(); }); }
 function applyRecipientsStatus(data) {
   recipientsPanel.applyStatus(data, data);
-  noteConsoleJob('recipients', data);
 }
 function applySubscribersStatus(data) {
   subscribersPanel.applyStatus(data, data);
-  noteConsoleJob('subscribers', data);
 }
 
 function startSimpleJob(postEndpoint, fetchFn, applyFn) {
@@ -1229,26 +1226,60 @@ function scrollConsoleTo(node) {
   consoleLog.scrollTop = consoleLog.scrollHeight;
 }
 
-// Console shares the server global job lock. Disable Run while any scan
-// panel reports running/blocked so the operator is not surprised by a 409.
-var consoleBusyJobs = { report: false, recipients: false, subscribers: false };
+// Console shares the server's global job lock with nine other job names —
+// including some, like the hourly gift-wrap retention purge, that nothing
+// on THIS page ever starts. Tracking that lock in the client used to mean
+// listing every job that could hold it; three of nine got listed, so the
+// other six 409'd with the button still showing enabled. The server always
+// knows who actually holds it, so the client tracks nothing: a click either
+// goes through or names its blocker via the 409 (GET /api/console below),
+// and once blocked, the gate just asks again every few seconds until the
+// answer is no. The one cost is the first click, which is a live probe
+// instead of a pre-emptive disable — every one after that explains itself.
+var consoleBlockedBy = null;
+var consolePollTimer = null;
 
 function updateConsoleGate() {
-  var busy = consoleBusyJobs.report || consoleBusyJobs.recipients || consoleBusyJobs.subscribers;
+  var busy = !!consoleBlockedBy;
   if (consoleRun) {
     consoleRun.disabled = busy || !isAdmin;
   }
   if (consoleInput) {
     consoleInput.disabled = busy || !isAdmin;
     consoleInput.title = busy
-      ? 'waiting on a scan or purge to finish'
+      ? (consoleBlockedBy + ' is running — wait for it to finish')
       : '';
   }
 }
 
-function noteConsoleJob(key, data) {
-  consoleBusyJobs[key] = !!(data && (data.status === 'running' || data.blocked_by));
-  updateConsoleGate();
+function pollConsoleLock() {
+  consolePollTimer = null;
+  fetch('/api/console')
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      consoleBlockedBy = (data && data.blocked_by) || null;
+      updateConsoleGate();
+      if (consoleBlockedBy) {
+        consolePollTimer = setTimeout(pollConsoleLock, 3000);
+      }
+    })
+    .catch(function () {
+      consolePollTimer = setTimeout(pollConsoleLock, 3000);
+    });
+}
+
+// `blockedBy` is a real job name -> the lock is held; poll GET /api/console
+// until it clears. The "memory" refusal from acquire_console_slot is not a
+// lock and nothing will ever clear it on this endpoint's own schedule, so
+// it just gets reported once and the gate stays open for a manual retry.
+function noteConsoleBlocked(blockedBy) {
+  if (blockedBy && blockedBy !== 'memory') {
+    consoleBlockedBy = blockedBy;
+    updateConsoleGate();
+    if (!consolePollTimer) {
+      consolePollTimer = setTimeout(pollConsoleLock, 3000);
+    }
+  }
 }
 
 function runConsole(command) {
@@ -1256,7 +1287,7 @@ function runConsole(command) {
     return;
   }
   if (consoleRun && consoleRun.disabled) {
-    appendConsole('refused: a scan or purge is running — wait for it to finish', 'bad');
+    appendConsole('refused: ' + (consoleBlockedBy || 'another job') + ' is running — wait for it to finish', 'bad');
     return;
   }
   var cmd = (command != null ? command : consoleInput.value).trim();
@@ -1270,6 +1301,9 @@ function runConsole(command) {
       var ok = !!body.ok;
       var truncated = !!body.truncated;
       var focus = null;
+      if (body.blocked_by) {
+        noteConsoleBlocked(body.blocked_by);
+      }
       if (body.error && !ok) {
         focus = appendConsole('refused/error: ' + body.error, 'bad');
       }
