@@ -579,9 +579,11 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
         <span class="prompt" aria-hidden="true">❯</span>
         <input id="console-input" type="text" placeholder="scan --count {}" aria-label="strfry console command">
         <button id="console-run" type="button">Run</button>
+        <button id="console-clear" type="button">Clear</button>
       </div>
       <div id="quick-cmds" class="chips"></div>
       <p class="muted">Read-only verbs only: <code>scan</code>, <code>info</code>, <code>export</code>. Everything else is refused, and the console never runs <code>delete</code> or <code>compact</code> — purges and database compact go through the guarded forms on Settings.</p>
+      <p class="muted"><code>export</code> dumps the entire database with no filter of its own — on any relay bigger than a test fixture it will hit this pane's own output cap before it finishes. It belongs in a real terminal, redirected to a file (<code>strfry export &gt; backup.jsonl</code>), not run from here.</p>
     </section>
   </div>
 </div>
@@ -601,6 +603,11 @@ var QUICK_COMMANDS = [
   'scan --count {"kinds":[1]}',
   'scan --count {"kinds":[1059]}'
 ];
+// Every other log-shaped panel here is bounded (decision log to
+// DECISION_LOG_LINES, audit to AUDIT_LOG_MAX) — console-log used to grow
+// for the life of the tab. This caps it to the last N commands; Clear
+// empties it outright.
+var CONSOLE_LOG_MAX = 30;
 var METRICS_INTERVAL = 15000;
 var DECISION_LOG_LINES = 40;
 
@@ -624,6 +631,7 @@ var logDot = document.getElementById('log-dot');
 var consoleLog = document.getElementById('console-log');
 var consoleInput = document.getElementById('console-input');
 var consoleRun = document.getElementById('console-run');
+var consoleClear = document.getElementById('console-clear');
 var quickCmds = document.getElementById('quick-cmds');
 
 function setStatus(text) { statusEl.textContent = text; }
@@ -1191,6 +1199,29 @@ function appendConsoleRaw(text) {
   return details;
 }
 
+// consoleLogEntryStarts holds one node reference per command run — the
+// prompt-line node appendConsole() returns for '❯ <cmd>' — marking where
+// that command's block begins. Trimming just drops whole DOM nodes from
+// the front up to the oldest surviving mark, no re-render, no backing
+// array of parsed history to keep in sync.
+var consoleLogEntryStarts = [];
+
+function markConsoleEntryStart(node) {
+  consoleLogEntryStarts.push(node);
+  while (consoleLogEntryStarts.length > CONSOLE_LOG_MAX) {
+    consoleLogEntryStarts.shift();
+    var cutBefore = consoleLogEntryStarts[0];
+    while (consoleLog.firstChild && consoleLog.firstChild !== cutBefore) {
+      consoleLog.removeChild(consoleLog.firstChild);
+    }
+  }
+}
+
+function clearConsole() {
+  consoleLog.textContent = '';
+  consoleLogEntryStarts = [];
+}
+
 function isLoguruNoiseLine(line) {
   // loguru's own column header + each INFO/DEBUG record. WARN/ERROR stay.
   if (/^date\s+time\s+/.test(line)) {
@@ -1294,7 +1325,7 @@ function runConsole(command) {
   if (!cmd) {
     return;
   }
-  appendConsole('❯ ' + cmd);
+  markConsoleEntryStart(appendConsole('❯ ' + cmd));
   s86SignAndPost('/api/console', { command: cmd })
     .then(function (result) {
       var body = result.body || {};
@@ -1376,6 +1407,7 @@ consoleInput.addEventListener('keydown', function (evt) {
     runConsole();
   }
 });
+consoleClear.addEventListener('click', function () { clearConsole(); });
 
 // --- login ------------------------------------------------------------------
 
