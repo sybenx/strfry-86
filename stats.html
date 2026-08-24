@@ -567,6 +567,7 @@ header#s86 button#theme-btn { border-color:var(--rule); padding:.45em .7em; }
 
   <hr>
   <h2>Console</h2>
+  <p class="muted">This admin page is a sidecar strfry only spawns lazily, on the relay's first write after container start — not merely because strfry itself is up. After a <code>docker restart</code> or host reboot, this page stays down until an event actually arrives, unless the optional <code>ensure-server86.sh</code> healthcheck hook from the README is wired into your container (it keeps this page up independent of relay traffic).</p>
   <div class="console-grid">
     <section>
       <h3><span id="log-dot" class="dot-inline"></span> write policy — plugin86 decisions</h3>

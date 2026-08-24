@@ -2879,6 +2879,17 @@ REASON_UNDO_MAX_MAX = 500
 AUDIT_LOG_MAX_DEFAULT = 500
 AUDIT_LOG_MAX_MIN = 100
 AUDIT_LOG_MAX_MAX = 20000
+# plugin86.py's per-event timeout on a chained downstream write-policy
+# plugin (config.json's next_plugin). This is the value the Settings page
+# shows and lets an operator change; plugin86.py's own
+# NEXT_PLUGIN_TIMEOUT_DEFAULT is only its fallback when config.json doesn't
+# set one — the two must match. Ceiling is deliberately low: a downstream
+# timeout longer than strfry.conf's own relay.writePolicy.timeoutSeconds
+# (10s in this repo's template) is moot, since strfry will already have
+# timed out plugin86 itself and failed open before this timeout could fire.
+NEXT_PLUGIN_TIMEOUT_DEFAULT = 2
+NEXT_PLUGIN_TIMEOUT_MIN = 1
+NEXT_PLUGIN_TIMEOUT_MAX = 30
 
 CONFIG_EDITABLE_FIELDS = {
     # config.json keys the Settings page may write. admin_pubkey_hex is
@@ -2933,6 +2944,23 @@ CONFIG_EDITABLE_FIELDS = {
                                  "only widen coverage, never remove a shipped kind. Adding a kind here "
                                  "does not retroactively cover the CURRENT author-scan cache; rerun a "
                                  "full scan to include it."),
+    "next_plugin": ("string", "Chained downstream plugin",
+                    "optional command line for a second write-policy plugin — every event "
+                    "plugin86 would ACCEPT is forwarded to it and its verdict relayed "
+                    "verbatim; an event plugin86 itself REJECTS never reaches it. A "
+                    "downstream that hangs, dies, or replies malformed falls back to "
+                    "plugin86's own verdict and stops forwarding for the rest of that "
+                    "process's life. Blank disables chaining. Takes effect the next time "
+                    "plugin86.py restarts (strfry re-execs it on file-change, or on the "
+                    "relay's own restart) — not on save."),
+    "next_plugin_timeout": ("int", "Chained plugin timeout (seconds)",
+                             f"how long plugin86 waits for the downstream's reply to one event "
+                             f"before treating it as hung and falling back (default "
+                             f"{NEXT_PLUGIN_TIMEOUT_DEFAULT}s). Keep this below strfry.conf's own "
+                             f"relay.writePolicy.timeoutSeconds — a downstream still within ITS "
+                             f"own budget but past strfry's is moot, since strfry will already "
+                             f"have timed out plugin86 and failed open. Takes effect the next time "
+                             f"plugin86.py restarts, not on save."),
 }
 
 # min/max for the CONFIGURABLE int fields above, keyed by CONFIG_EDITABLE_FIELDS
@@ -2950,6 +2978,7 @@ CONFIG_INT_BOUNDS = {
     "reason_max_len": (REASON_MAX_LEN_MIN, REASON_MAX_LEN_MAX),
     "reason_undo_max": (REASON_UNDO_MAX_MIN, REASON_UNDO_MAX_MAX),
     "audit_log_max": (AUDIT_LOG_MAX_MIN, AUDIT_LOG_MAX_MAX),
+    "next_plugin_timeout": (NEXT_PLUGIN_TIMEOUT_MIN, NEXT_PLUGIN_TIMEOUT_MAX),
 }
 
 
@@ -3196,6 +3225,11 @@ def get_audit_log_max():
     return _get_config_int("audit_log_max", AUDIT_LOG_MAX_DEFAULT, AUDIT_LOG_MAX_MIN, AUDIT_LOG_MAX_MAX)
 
 
+def get_next_plugin_timeout():
+    return _get_config_int("next_plugin_timeout", NEXT_PLUGIN_TIMEOUT_DEFAULT,
+                            NEXT_PLUGIN_TIMEOUT_MIN, NEXT_PLUGIN_TIMEOUT_MAX)
+
+
 def get_extra_author_scan_kinds():
     """Operator-added kinds from config.json's `extra_author_scan_kinds` —
     a list of non-negative ints, missing/invalid/empty -> (). Never
@@ -3243,6 +3277,7 @@ CONFIG_INT_GETTERS = {
     "reason_max_len": get_reason_max_len,
     "reason_undo_max": get_reason_undo_max,
     "audit_log_max": get_audit_log_max,
+    "next_plugin_timeout": get_next_plugin_timeout,
 }
 
 

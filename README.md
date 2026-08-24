@@ -65,6 +65,25 @@ services:
 
 `127.0.0.1:8686:8686` keeps it reachable only from the host itself — put it behind your tailnet or a reverse proxy (with TLS) if you want to reach it from elsewhere. Don't bind it to `0.0.0.0` on the host without something in front of it.
 
+### Keep the admin page up across restarts
+
+strfry only spawns plugin86.py — and, through it, the admin page — lazily, on the relay's first write after container start (confirmed against a real container: this really is a "first event," not "process is up"). On a busy relay that's a non-issue; on a quiet one, `docker restart` or a host reboot can leave the admin page down indefinitely, until *something* actually publishes to the relay. Wire the included `ensure-server86.sh` into your container's own `HEALTHCHECK` — Docker's exec is the one thing guaranteed to run on a fixed interval regardless of relay traffic — and it closes that gap independent of events entirely:
+
+```yaml
+services:
+  strfry:
+    ports:
+      - "127.0.0.1:8686:8686"
+    healthcheck:
+      test: ["CMD", "sh", "/config/strfry86/ensure-server86.sh",
+             "/app/strfry", "--config=/etc/strfry.conf", "scan", "--count", "{}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+```
+
+Replace the trailing `/app/strfry --config=/etc/strfry.conf scan --count {}` with whatever your own image's `HEALTHCHECK` already runs (or leave it as shown — that's `dockurr/strfry`'s own default, and a harmless read either way). The wrapper's exit code is always that wrapped command's own, unmodified — it can never report "healthy" on its own account, and can never get the relay depooled over a problem that isn't the relay's; the only thing it adds is trying to bring the admin page back up as an unrelated side effect. Skip this if you don't use Docker's `HEALTHCHECK` at all — the admin page still comes back on the next event, and on every updater run (which restarts it directly, synchronously).
+
 ## Add the relay as a write relay
 
 For reports to actually reach Eighty-Six, add this relay to your write relays in jumble.social (or whatever client you report from) — otherwise your NIP-56 reports go somewhere else and nothing gets banned.
@@ -130,6 +149,10 @@ The updater finds `strfry.conf` the same way the admin UI does: an explicit `str
 A backup is written next to that file as `strfry.conf.bak-<unix-timestamp>` **only when the run actually changes the file** (sets `writePolicy.plugin`). Already-configured and refused-overwrite runs write nothing. The updater keeps the 3 newest backups and the 1 newest applied bundle, pruning older ones after each successful run. Files you've renamed by hand are never touched.
 
 If `writePolicy.plugin` is already set to something else, the updater normally leaves it alone and warns rather than clobbering a deliberate choice — with one exception: `dockurr/strfry`'s own shipped default (`/app/write-policy.py`, a no-op) is recognized and replaced outright, backed up first like any other change. Without that, the documented one-line install against that image would complete and print success while moderation stayed silently off.
+
+## Chaining another write-policy plugin
+
+strfry only has one `writePolicy.plugin` slot, so running Eighty-Six and some other plugin (a spam filter, a rate limiter, anything that speaks strfry's own plugin protocol) used to mean picking one — the updater would refuse to overwrite an existing value and just warn. plugin86.py can now chain to that other plugin instead: when it finds `writePolicy.plugin` already set to something else, the updater offers (interactively) to record it as `next_plugin` in `config.json`. Every event Eighty-Six itself would *accept* is then forwarded to that downstream process and its verdict relayed verbatim; an event Eighty-Six *rejects* (a banned pubkey, for instance) short-circuits and never reaches it. If the downstream hangs, dies, or replies with something malformed, plugin86.py falls back to its own verdict, logs it once, and stops forwarding for the rest of that run — it never retries and never blocks the relay's write path waiting on it. The decision log (Stats & Console) records which stage actually made each call. `next_plugin` and its per-event timeout (`next_plugin_timeout`, default 2s) are both editable on the Settings page; both take effect the next time plugin86.py restarts, not immediately on save.
 
 ## Trust model
 

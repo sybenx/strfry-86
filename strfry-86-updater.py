@@ -673,6 +673,23 @@ def ensure_config():
     return ", ".join(added) + " added"
 
 
+def set_next_plugin_config(value):
+    """Merge next_plugin into the existing config.json — never a full
+    rewrite from a stale in-memory copy, since ensure_config() may have
+    already changed other keys earlier in this same run."""
+    try:
+        with open(CONFIG_JSON_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return False, f"{type(e).__name__}: {e}"
+    cfg["next_plugin"] = value
+    try:
+        _write_config(cfg)
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, None
+
+
 # --------------------------------------------------------------------------
 # strfry.conf edit
 #
@@ -847,10 +864,37 @@ def edit_strfry_conf():
     replacing_default = plugin_value in KNOWN_DEFAULT_PLUGINS
     if plugin_value not in (None, "") and not replacing_default:
         print(
-            f"WARNING: strfry.conf writePolicy.plugin is already set to "
-            f"'{plugin_value}' — NOT overwriting. Configure manually if you "
-            f"want strfry-86's plugin86.py to take over."
+            f"strfry.conf writePolicy.plugin is already set to '{plugin_value}' — NOT overwriting it."
         )
+        # This used to be a dead end: run strfry-86 or your other plugin,
+        # never both, since strfry only has the one plugin slot. plugin86.py
+        # can now chain to a downstream plugin on its own stdin/stdout, so
+        # offer to wire the existing value in as that downstream rather than
+        # just leaving it disconnected — interactive only, same as every
+        # other prompt in this file, so an unattended run stays a no-op.
+        if sys.stdin.isatty():
+            answer = input(
+                f"Chain it after plugin86.py instead? Every event plugin86 accepts "
+                f"will be forwarded to it and its verdict used; an event plugin86 "
+                f"itself rejects will never reach it. [Y/n] "
+            ).strip().lower()
+            if answer in ("", "y", "yes"):
+                ok, err = set_next_plugin_config(plugin_value)
+                if ok:
+                    print(
+                        f"config.json: next_plugin set to {plugin_value!r} — plugin86.py "
+                        f"will chain to it the next time it restarts."
+                    )
+                else:
+                    print(f"WARNING: failed to record next_plugin in config.json: {err}")
+            else:
+                print("Leaving it unconfigured — plugin86.py will not chain to it.")
+        else:
+            print(
+                "Not chaining (non-interactive run). Set next_plugin manually in "
+                "config.json, or re-run the updater interactively, if you want "
+                "strfry-86 to forward accepted events to it."
+            )
         return "existing plugin left untouched", conf_path
 
     new_plugin_value = f'"{PLUGIN_PATH}"'

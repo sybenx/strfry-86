@@ -19,36 +19,57 @@ line back per line — this is strfry's own plugin protocol, implemented on this
 `plugin86.py`'s `for line in sys.stdin:` loop
 ([plugin86.py:227](plugin86.py#L227), docstring [plugin86.py:1-7](plugin86.py#L1-L7)).
 
-**Undetermined from this repo**: whether strfry spawns that plugin subprocess *eagerly*
-at relay startup, or *lazily* on the first inbound event. This matters concretely
-because `plugin86.py` is what spawns (and hourly-respawns) `server86.py` — the answer
-decides whether the admin UI ever comes back on its own after a restart of a relay that
-then sits quiet with no events. The nearest evidence from this side is the updater's
-`restart_server86()` docstring ([strfry-86-updater.py:810-822](strfry-86-updater.py#L810-L822)):
-
-> "Delegating the respawn to plugin86 (which only checks once per hour, or on the next
-> event) could leave the admin page down indefinitely on a quiet relay after every
-> update — and on a brand new install, nothing has ever spawned it at all until the
-> relay's first event — so this does it here, synchronously, with a visible outcome
-> every run."
-
-That comment explains the *updater's own workaround* (it restarts `server86.py` itself,
-unconditionally, every run) — it does not settle strfry's actual plugin-spawn timing.
-The real answer lives in strfry's own source, outside this repo.
+**Confirmed against a real container (2026-08-23), not just inferred**: strfry spawns
+that plugin subprocess *lazily*, on the first inbound event — never eagerly at relay
+startup. Verified by pointing a real `dockurr/strfry` container's `writePolicy.plugin`
+at a probe script that logs its own start time, restarting the container, and observing
+no such process for as long as no event is published; the marker only appears the
+moment a signed event is actually sent over the websocket. This matters concretely
+because `plugin86.py` is what spawns (and, as of the same date, continuously
+liveness-probes) `server86.py` — a quiet relay's admin page genuinely does not come
+back on its own after a `docker restart` or host reboot until *something* publishes to
+it, confirming the updater's own `restart_server86()` docstring
+([strfry-86-updater.py:987-996](strfry-86-updater.py#L987-L996)), which was previously
+the only (indirect) evidence for this. README's "Keep the admin page up across
+restarts" section and the optional `ensure-server86.sh` Docker `HEALTHCHECK` wrapper
+close that gap for operators who wire it in, independent of relay traffic entirely;
+Stats & Console states the caveat in-page for operators who don't.
 
 **plugin86.py** — strfry's hot-path write-policy plugin.
-- Reads `config.json` (admin pubkey, [plugin86.py:119-130](plugin86.py#L119-L130)) and
-  `blacklist.json` (ban check, [plugin86.py:173](plugin86.py#L173)) via `lib86.blacklist`.
-- Writes `decisions.jsonl` / `decisions.jsonl.1`
-  ([plugin86.py:38-116](plugin86.py#L38-L116)).
-- Independently spawns, and hourly-respawns, `server86.py` as a detached subprocess
-  (`spawn_server()`, [plugin86.py:144-156](plugin86.py#L144-L156); loop check at
-  [plugin86.py:223-230](plugin86.py#L223-L230), `SERVER_RESPAWN_INTERVAL = 3600.0`) —
-  with **no PID check** before spawning; it relies entirely on `server86.py`'s own
-  singleton-by-port-bind behavior to make a redundant spawn a no-op.
+- Reads `config.json` (admin pubkey, port/bind, `next_plugin`/`next_plugin_timeout` —
+  `load_config()`/`admin_pubkey_from_config()`, [plugin86.py:174-191](plugin86.py#L174-L191))
+  and `blacklist.json` (ban check, [plugin86.py:368](plugin86.py#L368)) via
+  `lib86.blacklist`.
+- Writes `decisions.jsonl` / `decisions.jsonl.1`, each record now also carrying a
+  `stage` field (`"plugin86"` or `"next_plugin"` — see below)
+  ([plugin86.py:73-171](plugin86.py#L73-L171)).
+- Runs a daemon liveness-probe thread for the life of the process
+  (`_server_liveness_loop`, [plugin86.py:247-256](plugin86.py#L247-L256),
+  `SERVER_LIVENESS_PROBE_INTERVAL = 5.0`) that spawns `server86.py` only when a
+  non-blocking TCP connect to the configured admin port fails
+  (`admin_port_bound()`/`ensure_server_running()`,
+  [plugin86.py:219-244](plugin86.py#L219-L244)) — replacing a blind, unconditional
+  `Popen` checked only once per hour and only inside the stdin loop. Also reachable
+  standalone via `python3 plugin86.py --ensure-server86`
+  ([plugin86.py:511-522](plugin86.py#L511-L522)), a one-shot probe/spawn meant to be
+  invoked from outside the stdin loop entirely (see `ensure-server86.sh`). Still **no
+  PID check** before spawning — relies on `server86.py`'s own singleton-by-port-bind
+  behavior to make a redundant spawn a no-op, same as before.
+- Optionally chains a second write-policy plugin (`config.json`'s `next_plugin`,
+  spawned once at startup and kept alive for the process lifetime,
+  [plugin86.py:282-350](plugin86.py#L282-L350)): every event plugin86 itself would
+  ACCEPT is forwarded to it verbatim and its verdict relayed; a plugin86 REJECT
+  short-circuits and is never forwarded. A hang, dead process, or malformed/mismatched
+  reply (`next_plugin_timeout`, config-editable, default 2s) disables forwarding
+  permanently for the rest of the process's life and logs once — the same
+  never-retry, never-block discipline `record_decision()`'s own failure path already
+  uses. The updater's "existing plugin left untouched" branch
+  ([strfry-86-updater.py:848-878](strfry-86-updater.py#L848-L878)) now offers,
+  interactively, to record that existing value as `next_plugin` instead of just
+  warning.
 - Must never crash the stdin loop (docstring [plugin86.py:6-7](plugin86.py#L6-L7)) —
   every internal exception is caught and substituted with a default accept
-  ([plugin86.py:248-250](plugin86.py#L248-L250)); see §7 for the logging-failure
+  ([plugin86.py:484-486](plugin86.py#L484-L486)); see §7 for the logging-failure
   behavior, which is stricter (permanent disable, not fail-open).
 
 **This is how bans originate in normal use.** `process_event()`
@@ -553,6 +574,7 @@ size/length fields).
 | `audit_log_max` | 500 | [2866](server86.py#L2866) | `get_audit_log_max()` [3176](server86.py#L3176) — the one entry with a floor (`AUDIT_LOG_MAX_MIN`=100), not just a default: this is the only undo authority in the project, so a value set too low destroys undo capability for actions already taken, not just a view |
 | `giftwrap_retention_days` | 30 (min 7, max 30) | [2812-2814](server86.py#L2812-L2814) | `get_giftwrap_retention_days()` [3120](server86.py#L3120) — pre-existing, unchanged by this rework |
 | `extra_author_scan_kinds` | `[]` (a `"kind_list"` type — comma-separated non-negative ints, not an int itself, no `CONFIG_INT_BOUNDS` entry) | [2930-2935](server86.py#L2930-L2935) | `get_extra_author_scan_kinds()` [3199](server86.py#L3199); `get_effective_author_scan_kinds()` [3222](server86.py#L3222) unions it with `AUTHOR_SCAN_KINDS` — never a replacement, an operator can only widen coverage |
+| `next_plugin_timeout` | 2s (min 1, max 30) | near `NEXT_PLUGIN_TIMEOUT_DEFAULT`, server86.py | `get_next_plugin_timeout()` — display/edit only; plugin86.py reads `config.json` itself and applies this timeout, server86.py never enforces it directly. `next_plugin` itself (the downstream command) is a plain `"string"` field, not in this int table |
 
 **Removed in the 2026-08-23 cap rework** (see PROJECT-MAP §7's newest note for detail):
 `AUTHOR_SCAN_FULL_LIMIT`, `RECIPIENT_SCAN_LIMIT`, `SUBSCRIBER_SCAN_LIMIT` (all three
@@ -568,7 +590,8 @@ cap), and `FIGURE_HEAD_MAX` (dead code in this file; the load-bearing copy was a
 | `DECISION_LOG_PREV_PATH` | `decisions.jsonl.1` | [39](plugin86.py#L39) | [68](plugin86.py#L68), [106](plugin86.py#L106) |
 | `DECISION_LOG_MAX_LINES` | 2,000 | [40](plugin86.py#L40) | [66](plugin86.py#L66), [104](plugin86.py#L104) |
 | `DECISION_CONTENT_PREVIEW` | 160 chars | [41](plugin86.py#L41) | [99](plugin86.py#L99) |
-| `SERVER_RESPAWN_INTERVAL` | 3600.0s | [23](plugin86.py#L23) | [229](plugin86.py#L229) |
+| `SERVER_LIVENESS_PROBE_INTERVAL` | 5.0s | [48](plugin86.py#L48) | [256](plugin86.py#L256) — replaces the old `SERVER_RESPAWN_INTERVAL`/3600s blind-Popen check |
+| `NEXT_PLUGIN_TIMEOUT_DEFAULT` | 2.0s | [58](plugin86.py#L58) | [444](plugin86.py#L444) — fallback only; `config.json`'s `next_plugin_timeout` (CONFIGURABLE, server86.py) wins when set, and the two defaults must match |
 
 ### common86.js — a separate, independently-hardcoded set
 

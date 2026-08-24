@@ -31,10 +31,19 @@ control.
 Three processes live in this repo; strfry itself does not.
 
 - **strfry** runs `plugin86.py` as its `writePolicy.plugin` subprocess: one JSON event
-  in per line on stdin, one accept/reject JSON line out per line.
+  in per line on stdin, one accept/reject JSON line out per line. Confirmed against a
+  real container: strfry spawns it lazily, on the first inbound event — never eagerly
+  at relay startup, so a quiet relay's admin page stays down after a restart until
+  something is actually published (`ensure-server86.sh` closes that gap; see README).
 - **`plugin86.py`** is that plugin — the auto-ban path above, plus a decision log
-  (`decisions.jsonl`, rotated to `.1`) for every accept/reject. It also spawns, and
-  hourly-respawns, `server86.py` as a detached subprocess.
+  (`decisions.jsonl`, rotated to `.1`) for every accept/reject, each record naming
+  which stage made the call. A background thread probes and, only if the admin port
+  isn't already bound, spawns `server86.py` on a short interval — not a blind
+  unconditional respawn on a long one. `plugin86.py` can also chain a second
+  write-policy plugin (`config.json`'s `next_plugin`): every event it would itself
+  ACCEPT is forwarded and the downstream's verdict relayed verbatim; a REJECT never
+  reaches it, and a hung/dead/malformed downstream falls back to plugin86's own
+  verdict permanently, never blocking strfry's write path.
 - **`server86.py`** is the admin HTTP server (default port 8686). It reads/writes the
   JSON state files, reads `decisions.jsonl` (never writes it), and shells out to
   `strfry scan`/`count`/`delete`/`compact`/`export` on demand.
@@ -83,6 +92,8 @@ Three processes live in this repo; strfry itself does not.
 - `server86.py` — admin HTTP server: routing, auth, scans, job machinery, pages/API.
 - `plugin86.py` — write-policy plugin: auto-ban, decision log, server86 spawn.
 - `strfry-86-updater.py` — manual installer/updater.
+- `ensure-server86.sh` — optional Docker `HEALTHCHECK` wrapper; keeps server86.py alive
+  independent of relay traffic (see README, "Keep the admin page up across restarts").
 - `lib86/` — shared library (ban list, BIP-340 verify, name cache), used by more than
   one of the processes above.
 - `common86.js` — shared client code: page chrome, nav, search, theme toggle, record

@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=444
+EXPECTED_MIN=456
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -354,6 +354,270 @@ LINE="$(mkevent e10 "$ADMIN_HEX" 1984 "[[\"p\",\"$TARGET_HEX\"]]" "old report" "
 OUT="$(run_plugin "$LINE")"
 if check_action "$OUT" accept; then pass "stale admin 1984 report still accepted as an event"; else fail "stale report should still be accepted, got: $OUT"; fi
 if is_banned_in_file "$TARGET_HEX"; then fail "a stale (outside REPORT_FRESHNESS_WINDOW) admin report must NOT resurrect a ban"; else pass "stale report replay does not apply the auto-ban side effect"; fi
+
+# --- plugin86.py liveness probe: dead port spawns, live port doesn't -------
+# The background probe (admin_port_bound / ensure_server_running,
+# reachable standalone via `plugin86.py --ensure-server86`) replaces a
+# blind, unconditional Popen — it must actually gate on port state, not
+# just always spawn regardless. This stub stands in for server86.py just
+# long enough to observe whether a spawn was attempted; it never binds a
+# port itself, since a stub that did would make the "already up" case
+# indistinguishable from "never checked".
+
+cat > "$TESTDIR/server86.py" <<'PYEOF'
+import time
+with open("spawn-marker.log", "a") as f:
+    f.write(f"spawned at {time.time()}\n")
+PYEOF
+
+cat > "$TESTDIR/free_port.py" <<'PYEOF'
+import socket
+
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PYEOF
+
+cat > "$TESTDIR/hold_port.py" <<'PYEOF'
+import socket
+import sys
+import time
+
+# Actually accept (and drop) connections, rather than just bind+listen —
+# a probe that never gets accepted sits in the backlog queue forever, and
+# with a small backlog a SECOND probe (the real check, after the "is it up
+# yet" polling loop's own probe) can get refused even though the socket is
+# genuinely live. A real HTTP server drains its accept queue continuously;
+# this mirrors that instead of being a bound-but-inert socket.
+port = int(sys.argv[1])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+s.settimeout(0.5)
+deadline = time.time() + 30
+while time.time() < deadline:
+    try:
+        conn, _ = s.accept()
+        conn.close()
+    except socket.timeout:
+        pass
+PYEOF
+
+cat > "$TESTDIR/port_open.py" <<'PYEOF'
+import socket
+import sys
+
+port = int(sys.argv[1])
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(("127.0.0.1", port))
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+PYEOF
+
+find_free_port() { python3 "$TESTDIR/free_port.py"; }
+
+# dead port -> a spawn is attempted
+DEAD_PORT="$(find_free_port)"
+rm -f "$TESTDIR/spawn-marker.log"
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "port": $DEAD_PORT, "bind": "127.0.0.1"}
+EOF
+(cd "$TESTDIR" && python3 plugin86.py --ensure-server86)
+sleep 0.5
+if [ -f "$TESTDIR/spawn-marker.log" ]; then
+    pass "liveness probe: a dead port triggers a spawn"
+else
+    fail "liveness probe: a dead port should have triggered a spawn"
+fi
+
+# live port -> no spawn is attempted
+LIVE_PORT="$(find_free_port)"
+python3 "$TESTDIR/hold_port.py" "$LIVE_PORT" &
+HOLD_PID=$!
+for _ in $(seq 1 50); do
+    python3 "$TESTDIR/port_open.py" "$LIVE_PORT" && break
+    sleep 0.1
+done
+rm -f "$TESTDIR/spawn-marker.log"
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "port": $LIVE_PORT, "bind": "127.0.0.1"}
+EOF
+(cd "$TESTDIR" && python3 plugin86.py --ensure-server86)
+sleep 0.5
+kill "$HOLD_PID" 2>/dev/null
+wait "$HOLD_PID" 2>/dev/null
+if [ -f "$TESTDIR/spawn-marker.log" ]; then
+    fail "liveness probe: a live port should NOT have triggered a spawn"
+else
+    pass "liveness probe: a live port does not trigger a spawn"
+fi
+
+rm -f "$TESTDIR/server86.py"
+
+# --- plugin86.py chained downstream plugin (config.json's next_plugin) -----
+# server86.py stays absent for these (as for every other plugin86 sandbox
+# test above) — chaining never touches it.
+
+cat > "$TESTDIR/downstream_marker.py" <<'PYEOF'
+# Used by "a rejected event never reaches the downstream": if invoked, it
+# records that fact. Self-timeboxed so it never lingers as an orphan if
+# it's correctly never engaged (the case this test expects).
+import json
+import select
+import sys
+
+ready, _, _ = select.select([sys.stdin], [], [], 2)
+if not ready:
+    sys.exit(0)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(0)
+with open("downstream-invoked.log", "a") as f:
+    f.write("invoked\n")
+msg = json.loads(line)
+event_id = msg.get("event", {}).get("id")
+print(json.dumps({"id": event_id, "action": "accept"}))
+sys.stdout.flush()
+PYEOF
+
+cat > "$TESTDIR/downstream_reject.py" <<'PYEOF'
+import json
+import sys
+
+line = sys.stdin.readline()
+msg = json.loads(line)
+event_id = msg.get("event", {}).get("id")
+print(json.dumps({"id": event_id, "action": "reject", "msg": "downstream says no"}))
+sys.stdout.flush()
+PYEOF
+
+cat > "$TESTDIR/downstream_hang.py" <<'PYEOF'
+import sys
+import time
+
+sys.stdin.readline()
+time.sleep(3600)
+PYEOF
+
+cat > "$TESTDIR/read_decision_stage.py" <<'PYEOF'
+import json
+import sys
+
+path, offset_from_end = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    lines = f.readlines()
+print(json.loads(lines[-offset_from_end]).get("stage"))
+PYEOF
+
+# GNU `timeout` isn't available on every platform this suite runs on (e.g.
+# stock macOS) — subprocess.run's own `timeout` gives the same "never let a
+# genuinely broken fallback hang the whole test suite" guarantee portably.
+cat > "$TESTDIR/run_multi.py" <<'PYEOF'
+import subprocess
+import sys
+
+plugin_path, line_a, line_b = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    result = subprocess.run(
+        ["python3", plugin_path],
+        input=line_a + "\n" + line_b + "\n",
+        capture_output=True, text=True, timeout=15,
+    )
+    sys.stdout.write(result.stdout)
+except subprocess.TimeoutExpired:
+    sys.stderr.write("run_multi.py: plugin86.py did not exit within 15s\n")
+    sys.exit(1)
+PYEOF
+
+run_plugin_multi() {
+    python3 "$TESTDIR/run_multi.py" "$TESTDIR/plugin86.py" "$1" "$2"
+}
+
+read_decision_stage() {
+    python3 "$TESTDIR/read_decision_stage.py" "$TESTDIR/decisions.jsonl" "$1"
+}
+
+# 1. a REJECTED event never reaches the downstream at all.
+echo '{}' > "$TESTDIR/blacklist.json"
+python3 - "$BANNED_HEX" "$TESTDIR/blacklist.json" <<'PYEOF'
+import json, sys
+pubkey, path = sys.argv[1], sys.argv[2]
+json.dump({pubkey: {"banned_at": 1, "report_event_id": "r1", "reason": "spam"}}, open(path, "w"))
+PYEOF
+rm -f "$TESTDIR/downstream-invoked.log" "$TESTDIR/decisions.jsonl" "$TESTDIR/decisions.jsonl.1"
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "next_plugin": "python3 $TESTDIR/downstream_marker.py", "next_plugin_timeout": 2}
+EOF
+LINE="$(mkevent chain1 "$BANNED_HEX" 1 '[]' x 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" reject; then pass "chaining: plugin86's own reject still works with next_plugin configured"; else fail "banned author should still be rejected, got: $OUT"; fi
+if [ -f "$TESTDIR/downstream-invoked.log" ]; then
+    fail "chaining: a plugin86 REJECT must never reach the downstream, but it did"
+else
+    pass "chaining: a plugin86 REJECT never reaches the downstream"
+fi
+
+# 2. a downstream REJECT is relayed verbatim, and the decision log names
+# next_plugin as the stage that made the call.
+echo '{}' > "$TESTDIR/blacklist.json"
+rm -f "$TESTDIR/decisions.jsonl" "$TESTDIR/decisions.jsonl.1"
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "next_plugin": "python3 $TESTDIR/downstream_reject.py", "next_plugin_timeout": 2}
+EOF
+LINE="$(mkevent chain2 "$OTHER_HEX" 1 '[]' hello 1700000000)"
+OUT="$(run_plugin "$LINE")"
+if check_action "$OUT" reject; then pass "chaining: a downstream reject is relayed as strfry's own verdict"; else fail "downstream reject should have been relayed, got: $OUT"; fi
+case "$OUT" in
+    *"downstream says no"*) pass "chaining: the downstream's own msg is relayed verbatim" ;;
+    *) fail "chaining: expected the downstream's msg in the reply, got: $OUT" ;;
+esac
+if [ "$(read_decision_stage 1)" = "next_plugin" ]; then
+    pass "chaining: decision log names next_plugin as the stage that made the call"
+else
+    fail "chaining: decision log should name next_plugin as the stage, got: $(read_decision_stage 1)"
+fi
+
+# 3. a HUNG downstream falls back to plugin86's own verdict rather than
+# blocking, and forwarding stays disabled for the rest of the process —
+# proven two ways: the decision log's stage for a SECOND event in the same
+# process is still "plugin86" (never retried), and total wall time stays
+# near one timeout period rather than two (the second event would have
+# hung again if it had actually been forwarded).
+echo '{}' > "$TESTDIR/blacklist.json"
+rm -f "$TESTDIR/decisions.jsonl" "$TESTDIR/decisions.jsonl.1"
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "next_plugin": "python3 $TESTDIR/downstream_hang.py", "next_plugin_timeout": 2}
+EOF
+LINE_A="$(mkevent chain3a "$OTHER_HEX" 1 '[]' first 1700000000)"
+LINE_B="$(mkevent chain3b "$OTHER_HEX" 1 '[]' second 1700000000)"
+SECONDS=0
+OUT2="$(run_plugin_multi "$LINE_A" "$LINE_B")"
+ELAPSED=$SECONDS
+OUT_A="$(echo "$OUT2" | sed -n '1p')"
+OUT_B="$(echo "$OUT2" | sed -n '2p')"
+if check_action "$OUT_A" accept; then pass "chaining: a hung downstream falls back to plugin86's own verdict"; else fail "hung downstream should fall back to accept, got: $OUT_A"; fi
+if check_action "$OUT_B" accept; then pass "chaining: the event after a hang is still decided (plugin86's own verdict)"; else fail "got: $OUT_B"; fi
+if [ "$(read_decision_stage 2)" = "plugin86" ]; then pass "chaining: the hung event's own stage is plugin86 (fallback), not next_plugin"; else fail "got: $(read_decision_stage 2)"; fi
+if [ "$(read_decision_stage 1)" = "plugin86" ]; then
+    pass "chaining: forwarding stays disabled for a later event too (never retried)"
+else
+    fail "chaining: the second event's stage should still be plugin86 (disabled), got: $(read_decision_stage 1)"
+fi
+if [ "$ELAPSED" -lt 3 ]; then
+    pass "chaining: total wall time (~one timeout) shows the 2nd event was never also forwarded"
+else
+    fail "chaining: total wall time (${ELAPSED}s) suggests the 2nd event was forwarded and hung too"
+fi
+
+# restore the config.json used by the tests above this point
+cat > "$TESTDIR/config.json" <<EOF
+{"admin_pubkey_hex": "$ADMIN_HEX", "port": 8686, "bind": "0.0.0.0"}
+EOF
 
 # --- crypto tests (non-negotiable — this is the whole authorization system) -
 #

@@ -29,6 +29,7 @@ DEPLOYABLE_FILES = [
     "strfry-86-updater.py",
     "plugin86.py",
     "server86.py",
+    "ensure-server86.sh",
     "home.html",
     "stats.html",
     "users.html",
