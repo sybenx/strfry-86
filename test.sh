@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=614
+EXPECTED_MIN=694
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -790,6 +790,10 @@ results = []  # (ok, name, detail)
 
 def check(ok, name, detail=None):
     results.append((ok, name, detail))
+    line = ("PASS: " if ok else "FAIL: ") + name
+    if not ok and detail:
+        line += f" ({detail})"
+    print(line, flush=True)
 
 
 # --- BIP-340 reference vectors (tests/bip340-vectors.csv, vendored verbatim)
@@ -1020,23 +1024,24 @@ check(result is True, "bech32 rejects truncated npub", None if result is True el
 
 
 # --- report ------------------------------------------------------------
-
-for ok, name, detail in results:
-    if ok:
-        print(f"PASS: {name}")
-    else:
-        line = f"FAIL: {name}"
-        if detail:
-            line += f" ({detail})"
-        print(line)
+# check() above already printed every PASS:/FAIL: line as it happened —
+# nothing left to flush here. That's deliberate: this script used to defer
+# all printing to a loop over `results` right here, which meant a crash
+# anywhere above lost every result gathered so far, not just the checks
+# after the crash. Immediate printing is what lets the exit-code guard
+# below see accurate partial output instead of nothing at all.
 PYEOF
 
 CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT" "$TESTDIR" 2>&1)"
+CRYPTO_EXIT=$?
 echo "$CRYPTO_OUTPUT"
 CRYPTO_FAIL_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^FAIL: ')"
 CRYPTO_PASS_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + CRYPTO_FAIL_COUNT))
 CHECKS=$((CHECKS + CRYPTO_FAIL_COUNT + CRYPTO_PASS_COUNT))
+if [ "$CRYPTO_EXIT" -ne 0 ]; then
+    fail "crypto test script exited $CRYPTO_EXIT — it crashed instead of finishing; any checks after the crash point never ran and are NOT covered by the PASS/FAIL counts above"
+fi
 rm -f "$CRYPTO_TEST_SCRIPT"
 
 # --- async author-scan bounds (server86.py) ---------------------------------
@@ -1063,6 +1068,10 @@ results = []
 
 def check(ok, name, detail=None):
     results.append((ok, name, detail))
+    line = ("PASS: " if ok else "FAIL: ") + name
+    if not ok and detail:
+        line += f" ({detail})"
+    print(line, flush=True)
 
 
 # --- validate_authors_scan_mode -----------------------------------------
@@ -4013,22 +4022,22 @@ else:
         check(False, "AUTHOR_SCAN_KINDS gap check", f"error running against live db: {type(e).__name__}: {e}")
 
 
-for ok, name, detail in results:
-    if ok:
-        print(f"PASS: {name}")
-    else:
-        line = f"FAIL: {name}"
-        if detail:
-            line += f" ({detail})"
-        print(line)
+# check() above already printed every PASS:/FAIL: line as it happened —
+# see the comment on the crypto script's own report section for why that
+# matters: a crash anywhere in this ~3000-line script used to silently
+# discard every result gathered so far, not just the checks after it.
 PYEOF
 
 BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT" "$TESTDIR" 2>&1)"
+BOUNDS_EXIT=$?
 echo "$BOUNDS_OUTPUT"
 BOUNDS_FAIL_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^FAIL: ')"
 BOUNDS_PASS_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + BOUNDS_FAIL_COUNT))
 CHECKS=$((CHECKS + BOUNDS_FAIL_COUNT + BOUNDS_PASS_COUNT))
+if [ "$BOUNDS_EXIT" -ne 0 ]; then
+    fail "bounds test script exited $BOUNDS_EXIT — it crashed instead of finishing; any checks after the crash point never ran and are NOT covered by the PASS/FAIL counts above"
+fi
 rm -f "$BOUNDS_TEST_SCRIPT"
 
 # --- client-side rendering rules (common86.js), executed for real --------
@@ -4045,7 +4054,11 @@ const fs = require('fs');
 const vm = require('vm');
 const path = process.argv[2];
 const results = [];
-function check(cond, name) { results.push([!!cond, name]); }
+function check(cond, name) {
+  const ok = !!cond;
+  results.push([ok, name]);
+  console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
+}
 
 // A minimal DOM shim covering exactly what s86BuildRecordLine,
 // s86BuildKeyValueTable, and s86BuildRankedFigureTable use:
@@ -4158,22 +4171,19 @@ check(sandbox.s86BuildRecordLine.length === 3,
       's86PollStatus keeps polling while blocked_by is set — a blocked panel un-freezes when the blocker finishes');
     check(seen[seen.length - 1] === null,
       's86PollStatus stops only once the job is both idle AND unblocked');
-    for (const [ok, name] of results.slice(-2)) {
-      console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
-    }
   });
-}
-
-for (const [ok, name] of results) {
-  console.log((ok ? 'PASS: ' : 'FAIL: ') + name);
 }
 JSEOF
     JS_OUTPUT="$(node "$JS_TEST_SCRIPT" "$REPO_ROOT/common86.js" 2>&1)"
+    JS_EXIT=$?
     echo "$JS_OUTPUT"
     JS_FAIL_COUNT="$(echo "$JS_OUTPUT" | grep -c '^FAIL: ')"
     JS_PASS_COUNT="$(echo "$JS_OUTPUT" | grep -c '^PASS: ')"
     FAILURES=$((FAILURES + JS_FAIL_COUNT))
     CHECKS=$((CHECKS + JS_FAIL_COUNT + JS_PASS_COUNT))
+    if [ "$JS_EXIT" -ne 0 ]; then
+        fail "JS render test script exited $JS_EXIT — it crashed instead of finishing; any checks after the crash point never ran and are NOT covered by the PASS/FAIL counts above"
+    fi
 else
     echo "SKIP: client-side rendering rules (node not found)"
 fi
@@ -4211,8 +4221,11 @@ import server86  # noqa: E402
 ADMIN_HEX = "a" * 64
 
 
-def check(cond, name):
-    print(("PASS: " if cond else "FAIL: ") + name)
+def check(cond, name, detail=None):
+    line = ("PASS: " if cond else "FAIL: ") + name
+    if not cond and detail:
+        line += f" ({detail})"
+    print(line)
 
 
 def with_tmp_install_dir(fn):
@@ -4231,6 +4244,21 @@ def with_tmp_install_dir(fn):
         updater.INSTALL_DIR = orig_install_dir
         updater.CONFIG_JSON_PATH = orig_config_path
         updater.STRFRY_CONF_PATH = orig_conf_path
+
+
+def run_scenario(fn):
+    # Each scenario is independently restartable — a bug in one (or in a
+    # check() call inside it) must not silently cancel every scenario after
+    # it in the list below. Before this wrapper, an uncaught exception in
+    # scenario N ended the whole script, so scenarios N+1..last never ran
+    # and their checks vanished from the count without a single FAIL to
+    # show for it.
+    try:
+        with_tmp_install_dir(fn)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        check(False, f"scenario {fn.__name__} crashed: {type(e).__name__}: {e}")
 
 
 def scenario_fresh(tmpdir):
@@ -4765,33 +4793,37 @@ def scenario_server86_port_bound_check(tmpdir):
     updater.CONFIG_JSON_PATH = orig_cfg
 
 
-with_tmp_install_dir(scenario_fresh)
-with_tmp_install_dir(scenario_canonical_urls_suggested_from_conf)
-with_tmp_install_dir(scenario_missing_contact_only)
-with_tmp_install_dir(scenario_missing_both)
-with_tmp_install_dir(scenario_nothing_missing)
-with_tmp_install_dir(scenario_noninteractive)
-with_tmp_install_dir(scenario_conf_discovery_and_backup)
-with_tmp_install_dir(scenario_conf_override_from_config_json)
-with_tmp_install_dir(scenario_conf_same_line_block)
-with_tmp_install_dir(scenario_conf_allman_braces)
-with_tmp_install_dir(scenario_conf_one_line_empty_block)
-with_tmp_install_dir(scenario_conf_no_write_policy_block)
-with_tmp_install_dir(scenario_conf_unterminated_block)
-with_tmp_install_dir(scenario_conf_brace_in_comment)
-with_tmp_install_dir(scenario_conf_hash_and_quotes_in_values)
-with_tmp_install_dir(scenario_conf_dockurr_default_replaced)
-with_tmp_install_dir(scenario_conf_genuine_foreign_plugin_still_refused)
-with_tmp_install_dir(scenario_conf_tokenizers_agree_byte_for_byte)
-with_tmp_install_dir(scenario_find_server86_pids_exact_match_only)
-with_tmp_install_dir(scenario_server86_port_bound_check)
+run_scenario(scenario_fresh)
+run_scenario(scenario_canonical_urls_suggested_from_conf)
+run_scenario(scenario_missing_contact_only)
+run_scenario(scenario_missing_both)
+run_scenario(scenario_nothing_missing)
+run_scenario(scenario_noninteractive)
+run_scenario(scenario_conf_discovery_and_backup)
+run_scenario(scenario_conf_override_from_config_json)
+run_scenario(scenario_conf_same_line_block)
+run_scenario(scenario_conf_allman_braces)
+run_scenario(scenario_conf_one_line_empty_block)
+run_scenario(scenario_conf_no_write_policy_block)
+run_scenario(scenario_conf_unterminated_block)
+run_scenario(scenario_conf_brace_in_comment)
+run_scenario(scenario_conf_hash_and_quotes_in_values)
+run_scenario(scenario_conf_dockurr_default_replaced)
+run_scenario(scenario_conf_genuine_foreign_plugin_still_refused)
+run_scenario(scenario_conf_tokenizers_agree_byte_for_byte)
+run_scenario(scenario_find_server86_pids_exact_match_only)
+run_scenario(scenario_server86_port_bound_check)
 PYEOF
 UPDATER_OUTPUT="$(python3 "$UPDATER_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
+UPDATER_EXIT=$?
 echo "$UPDATER_OUTPUT"
 UPDATER_FAIL_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^FAIL: ')"
 UPDATER_PASS_COUNT="$(echo "$UPDATER_OUTPUT" | grep -c '^PASS: ')"
 FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
 CHECKS=$((CHECKS + UPDATER_FAIL_COUNT + UPDATER_PASS_COUNT))
+if [ "$UPDATER_EXIT" -ne 0 ]; then
+    fail "updater test script exited $UPDATER_EXIT — a crash reached outside any single scenario's run_scenario() isolation; checks after the crash point never ran and are NOT covered by the PASS/FAIL counts above"
+fi
 
 # --- the scan sections have no control bound to a page-assembled set -----
 # The invariant moved with the panels: Report's rule was that the page which
