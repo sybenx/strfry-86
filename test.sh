@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=611
+EXPECTED_MIN=614
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -496,11 +496,32 @@ print(json.dumps({"id": event_id, "action": "reject", "msg": "downstream says no
 sys.stdout.flush()
 PYEOF
 
+# Hangs without ever replying, and records every line it was handed. The
+# recording is what lets the chaining test below assert "the second event was
+# never forwarded" directly, instead of inferring it from elapsed seconds.
+#
+# The reader must be its own thread: a plain readline()-then-sleep would leave
+# a second forwarded line sitting unread in the pipe buffer, so the file would
+# say "one line" whether or not plugin86 had actually forwarded twice — the
+# measurement would quietly confirm whatever it was asked to confirm. This
+# still never writes a reply, so plugin86 sees the same hang as before.
 cat > "$TESTDIR/downstream_hang.py" <<'PYEOF'
+import os
 import sys
+import threading
 import time
 
-sys.stdin.readline()
+HITS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downstream_hits")
+
+
+def reader():
+    for line in sys.stdin:
+        if line.strip():
+            with open(HITS, "a") as f:
+                f.write(line if line.endswith("\n") else line + "\n")
+
+
+threading.Thread(target=reader, daemon=True).start()
 time.sleep(3600)
 PYEOF
 
@@ -583,21 +604,32 @@ else
 fi
 
 # 3. a HUNG downstream falls back to plugin86's own verdict rather than
-# blocking, and forwarding stays disabled for the rest of the process —
-# proven two ways: the decision log's stage for a SECOND event in the same
-# process is still "plugin86" (never retried), and total wall time stays
-# near one timeout period rather than two (the second event would have
-# hung again if it had actually been forwarded).
+# blocking, and forwarding stays disabled for the rest of the process.
+#
+# The decision log alone CANNOT prove that second half: an event that was
+# forwarded and hung again falls back to plugin86's own verdict too, so its
+# stage reads "plugin86" either way. This used to be settled by asserting
+# total wall time stayed under 3s — near one timeout period rather than two —
+# which was a proxy for the real question and a flaky one: it left less than a
+# second of headroom over a 2s timeout plus interpreter startup, so a loaded
+# machine could fail it while the code was behaving perfectly. A suite that
+# can fail spuriously is a suite whose green runs stop meaning anything.
+#
+# So ask the downstream instead. It records every line it is handed, and the
+# assertion is that it was handed exactly one — the first event, never the
+# second. That is deterministic, immune to load, and strictly stronger than
+# the clock in both directions: it also catches a regression where the first
+# event stopped being forwarded at all, which the old check would have sailed
+# through (faster, even) while the whole scenario quietly stopped testing
+# anything.
 echo '{}' > "$TESTDIR/blacklist.json"
-rm -f "$TESTDIR/decisions.jsonl" "$TESTDIR/decisions.jsonl.1"
+rm -f "$TESTDIR/decisions.jsonl" "$TESTDIR/decisions.jsonl.1" "$TESTDIR/downstream_hits"
 cat > "$TESTDIR/config.json" <<EOF
 {"admin_pubkey_hex": "$ADMIN_HEX", "next_plugin": "python3 $TESTDIR/downstream_hang.py", "next_plugin_timeout": 2}
 EOF
 LINE_A="$(mkevent chain3a "$OTHER_HEX" 1 '[]' first 1700000000)"
 LINE_B="$(mkevent chain3b "$OTHER_HEX" 1 '[]' second 1700000000)"
-SECONDS=0
 OUT2="$(run_plugin_multi "$LINE_A" "$LINE_B")"
-ELAPSED=$SECONDS
 OUT_A="$(echo "$OUT2" | sed -n '1p')"
 OUT_B="$(echo "$OUT2" | sed -n '2p')"
 if check_action "$OUT_A" accept; then pass "chaining: a hung downstream falls back to plugin86's own verdict"; else fail "hung downstream should fall back to accept, got: $OUT_A"; fi
@@ -608,10 +640,60 @@ if [ "$(read_decision_stage 1)" = "plugin86" ]; then
 else
     fail "chaining: the second event's stage should still be plugin86 (disabled), got: $(read_decision_stage 1)"
 fi
-if [ "$ELAPSED" -lt 3 ]; then
-    pass "chaining: total wall time (~one timeout) shows the 2nd event was never also forwarded"
+HITS=0
+if [ -f "$TESTDIR/downstream_hits" ]; then
+    HITS="$(grep -c . "$TESTDIR/downstream_hits")"
+fi
+if [ "$HITS" -eq 1 ]; then
+    pass "chaining: the hung downstream was handed exactly ONE event — the 2nd was never forwarded"
 else
-    fail "chaining: total wall time (${ELAPSED}s) suggests the 2nd event was forwarded and hung too"
+    fail "chaining: the hung downstream was handed $HITS event(s), expected exactly 1 (0 means the first event was never forwarded either, and this scenario tests nothing; 2+ means forwarding was retried after being disabled)"
+fi
+case "$(cat "$TESTDIR/downstream_hits" 2>/dev/null)" in
+    *chain3a*) pass "chaining: the one forwarded event was the FIRST one, before forwarding was disabled" ;;
+    *) fail "chaining: expected chain3a in the downstream's received lines, got: $(cat "$TESTDIR/downstream_hits" 2>/dev/null)" ;;
+esac
+case "$(cat "$TESTDIR/downstream_hits" 2>/dev/null)" in
+    *chain3b*) fail "chaining: the 2nd event reached the downstream — forwarding was retried after a hang disabled it" ;;
+    *) pass "chaining: the 2nd event never reached the downstream at all" ;;
+esac
+
+# 4. the CONFIGURED next_plugin_timeout is the one actually used.
+#
+# This was covered only incidentally, and only by the stopwatch removed above:
+# a regression that ignored config.json and fell back to some other default
+# would have shown up as an elapsed time that no longer matched. Worth keeping,
+# not worth keeping by clock — so assert the parse directly. Note the scenario
+# above cannot cover this on its own: it configures 2, and
+# NEXT_PLUGIN_TIMEOUT_DEFAULT is also 2, so "read from config" and "fell back
+# to the default" are indistinguishable there. Hence a value that is not the
+# default below.
+TIMEOUT_PARSE="$(python3 - "$REPO_ROOT" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import plugin86
+
+D = plugin86.NEXT_PLUGIN_TIMEOUT_DEFAULT
+cases = [
+    ({"next_plugin_timeout": 7}, 7.0),        # not the default: proves config is READ
+    ({"next_plugin_timeout": "5"}, 5.0),      # strfry.conf-style string value
+    ({"next_plugin_timeout": 0.5}, 0.5),      # sub-second is legal
+    ({"next_plugin_timeout": 0}, D),          # zero would disable the bound entirely
+    ({"next_plugin_timeout": -1}, D),
+    ({"next_plugin_timeout": "abc"}, D),
+    ({"next_plugin_timeout": None}, D),
+    ({}, D),
+]
+bad = [(cfg, want, plugin86.next_plugin_timeout_from_config(cfg))
+       for cfg, want in cases
+       if plugin86.next_plugin_timeout_from_config(cfg) != want]
+print("OK" if not bad else "BAD " + repr(bad))
+PYEOF
+)"
+if [ "$TIMEOUT_PARSE" = "OK" ]; then
+    pass "chaining: next_plugin_timeout comes from config.json, with the default substituted for a missing, zero, negative or non-numeric value"
+else
+    fail "chaining: next_plugin_timeout parsing is wrong — $TIMEOUT_PARSE"
 fi
 
 # restore the config.json used by the tests above this point
