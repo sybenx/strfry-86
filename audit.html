@@ -564,7 +564,10 @@ var ACTION_LABELS = {
   ban: 'ban.pubkey',
   unban: 'unban.pubkey',
   reason: 'ban.reason',
-  settings: 'config.update'
+  settings: 'config.update',
+  giftwrap_purge: 'purge.giftwrap',
+  ephemeral_purge: 'purge.ephemeral',
+  db_compact: 'db.compact'
 };
 
 var adminPubkey = null;
@@ -609,9 +612,12 @@ function setSort(field, dir) {
   renderRecords(lastRecords);
 }
 
+// A domain-scoped ban/unban is identified by its own `domain` field, not by
+// the shape of `via` — `via` is a fixed enum naming WHO acted (dashboard,
+// nip86, plugin, undo) and no longer carries detail to parse.
 function actionLabel(r) {
-  if (r.type === 'ban' && r.domain) {
-    return 'ban.domain';
+  if (r.domain && (r.type === 'ban' || r.type === 'unban')) {
+    return r.type + '.domain';
   }
   return ACTION_LABELS[r.type] || (r.type || 'action');
 }
@@ -624,7 +630,18 @@ function describeRecord(r) {
       : ('Banned ' + n + ' pubkey(s)');
   }
   if (r.type === 'unban') {
-    return 'Unbanned ' + n + ' pubkey(s)';
+    return r.domain
+      ? ('Unbanned ' + r.domain + ' — ' + n + ' pubkey(s) on its roster')
+      : ('Unbanned ' + n + ' pubkey(s)');
+  }
+  if (r.type === 'giftwrap_purge') {
+    return 'Purged gift wraps older than ' + (r.days != null ? r.days + ' day(s)' : 'the retention window');
+  }
+  if (r.type === 'ephemeral_purge') {
+    return 'Purged stored ephemeral events';
+  }
+  if (r.type === 'db_compact') {
+    return 'Compacted the relay database';
   }
   if (r.type === 'reason') {
     return 'Set reason on ' + (r.count || n) + ' ban(s)';
@@ -651,6 +668,14 @@ function buildDetailCell(r) {
   td.appendChild(document.createTextNode(describeRecord(r)));
   if (r.via) {
     td.appendChild(s86El('span', ' (' + r.via + ')', 'muted'));
+  }
+  // Informational only, and never treated as identity: the User-Agent is
+  // recorded verbatim on NIP-86 actions and is trivially spoofable. It is
+  // here because it distinguishes "my phone" from "nak on my laptop".
+  if (r.user_agent) {
+    var ua = s86El('span', ' ' + r.user_agent, 'muted');
+    ua.title = 'client-reported User-Agent — informational, not verified';
+    td.appendChild(ua);
   }
   if (r.pubkeys && r.pubkeys.length) {
     var keys = r.pubkeys.slice(0, 3).map(s86ShortKey).join(', ')

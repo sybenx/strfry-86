@@ -110,6 +110,62 @@ Names are resolved first from the local relay database. For a banned user whose 
 
 Logged in as admin, the ban list page also shows a ban form: paste one or more npubs or hex pubkeys (space or comma separated), an optional reason, and click "Ban". This is the same trust root as reporting — authorized per-request with NIP-98, no sessions.
 
+## Moderating from your phone (NIP-86)
+
+Eighty-Six answers [NIP-86](https://github.com/nostr-protocol/nips/blob/master/86.md), the
+relay-management RPC, so a client like Amethyst can ban and unban on this relay without a
+browser. Four methods are implemented: `supportedmethods`, `banpubkey`, `unbanpubkey` and
+`listbannedpubkeys`. A ban made this way lands in the same `blacklist.json`, with the same
+shape, as one made from the ban page or by an admin kind-1984 report — there is no second
+list — and shows up on `/audit` marked `(nip86)`.
+
+**Amethyst has no field for the endpoint.** It derives it from the relay's own socket URL
+by swapping the scheme: `wss://relay.example.com/` becomes `https://relay.example.com/`,
+same host, port and path. So a phone can only reach this through whatever already fronts
+your relay on 443 — your reverse proxy — never through `:8686` directly.
+
+Set `canonical_urls` in `config.json` (Settings → Eighty-Six) to the URLs a signed auth
+event may name. It is asked once by the updater and never guessed: nothing here can know
+your public URL, and a plausible wrong value makes every request fail with what looks like
+a signing bug on the phone. **Leave it empty and the endpoint is off** — there is no
+separate switch. Hold both spellings:
+
+```json
+"canonical_urls": ["https://relay.example.com/", "http://127.0.0.1:8686/"]
+```
+
+The public one is what a phone signs for; the local one is what `nak` and any development
+testing use. Scheme and a trailing slash don't have to match; host, path and any
+non-default port do.
+
+Route it in your proxy on the **Content-Type**, not the path — the request arrives at the
+relay's own URL, so the media type is the only thing that distinguishes it from an ordinary
+websocket upgrade or a page load. Match it as a prefix so a client or proxy that appends
+`; charset=utf-8` still lands here:
+
+```
+@nip86 {
+    method POST
+    header Content-Type application/nostr+json+rpc*
+}
+handle @nip86 {
+    reverse_proxy 127.0.0.1:8686
+}
+```
+
+Every **rejected** auth attempt is appended to `nip86-auth.jsonl` (rotated to `.1`, two
+segments kept) naming which check failed and the one value that fixes it — the configured
+and received `u` tags side by side, the expected and received body hashes, the measured
+clock skew. That file is the answer to "why won't Amethyst connect"; the error the phone
+shows is deliberately terse, so that an unauthenticated caller can't read your
+configuration back out of it. A valid signature from a pubkey that isn't the admin returns
+403 rather than 401, which is what makes Amethyst show the real reason instead of a generic
+"unauthorized".
+
+Clock skew is tolerated ±120s by default (`nip86_auth_max_skew`, Settings). Repeated
+*failed* authorizations are rate-limited process-wide; a request that succeeds costs
+nothing, so ordinary use never trips it.
+
 ## Bulk-editing ban reasons
 
 Reports from jumble (and most clients) never carry a reason — jumble sends the report *type* (spam, nudity, malware, etc.) but an empty content field, so a kind-1984-triggered ban's `reason` is blank by default. To build your own taxonomy: filter the ban list to the pubkeys you want, "Select visible", type a reason in the row below the selected count, and click "Replace reason" (overwrites) or "Append to reason" (joins onto whatever's there with " — "). **The reason is public** — it renders on the ban list for logged-out visitors, same as everything else there — and the control says so next to the input. Each bulk edit leaves one record line ("set reason on N bans") with Undo, same as a ban or unban; above 50 pubkeys in one edit, the snapshot needed for Undo isn't kept and the line says "undo unavailable" instead of offering an undo that could only restore some of them.
@@ -155,5 +211,12 @@ If `writePolicy.plugin` is already set to something else, the updater normally l
 strfry only has one `writePolicy.plugin` slot, so running Eighty-Six and some other plugin (a spam filter, a rate limiter, anything that speaks strfry's own plugin protocol) used to mean picking one — the updater would refuse to overwrite an existing value and just warn. plugin86.py can now chain to that other plugin instead: when it finds `writePolicy.plugin` already set to something else, the updater offers (interactively) to record it as `next_plugin` in `config.json`. Every event Eighty-Six itself would *accept* is then forwarded to that downstream process and its verdict relayed verbatim; an event Eighty-Six *rejects* (a banned pubkey, for instance) short-circuits and never reaches it. If the downstream hangs, dies, or replies with something malformed, plugin86.py falls back to its own verdict, logs it once, and stops forwarding for the rest of that run — it never retries and never blocks the relay's write path waiting on it. The decision log (Stats & Console) records which stage actually made each call. `next_plugin` and its per-event timeout (`next_plugin_timeout`, default 2s) are both editable on the Settings page; both take effect the next time plugin86.py restarts, not immediately on save.
 
 ## Trust model
+
+The NIP-86 endpoint above is the only part of Eighty-Six meant to be reachable from the
+open internet, and the only thing guarding it is a signature check: `lib86/bip340.py`
+verifying that a kind-27235 event was signed by `admin_pubkey_hex`. There are no sessions,
+tokens or second factors anywhere in this project. That file is 116 lines of vendored
+reference code, exercised against every BIP-340 test vector — valid and invalid — on each
+`./test.sh` run, one named check per vector.
 
 The updater executes code fetched from this repo's `main` branch on every run — don't point it at someone else's fork unless you trust it as much as you'd trust running their code directly.

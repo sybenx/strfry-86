@@ -564,6 +564,91 @@ def find_relay_info_pubkey():
     return None
 
 
+def find_relay_info_url():
+    """Best-effort scan of strfry.conf for the relay.info.url field."""
+    conf_path = get_strfry_conf_path()
+    if not conf_path:
+        return None
+    try:
+        with open(conf_path, "r") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+
+    in_info_block = False
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if not in_info_block:
+            if re.match(r'^\s*info\s*\{', line):
+                in_info_block = True
+                depth = line.count("{") - line.count("}")
+            continue
+        depth += line.count("{") - line.count("}")
+        m = re.search(r'url\s*=\s*"([^"]*)"', line)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate:
+                return candidate
+        if depth <= 0:
+            in_info_block = False
+    return None
+
+
+# The direct admin-port URL, always seeded alongside whatever public URL the
+# operator gives. Without it nak and every development test against
+# 127.0.0.1:8686 fail on day one with an auth error that looks like a signing
+# problem.
+LOCAL_CANONICAL_URL = f"http://127.0.0.1:{DEFAULT_PORT}/"
+
+
+def prompt_canonical_urls():
+    """Ask for the public URLs a NIP-86 management client may sign auth for.
+
+    Deliberately ASKED, never derived. This is the highest-consequence value
+    in the NIP-86 feature — get it wrong and every request fails with an auth
+    error that looks like a client-side signing problem — and nothing here can
+    know the operator's public URL. relay.info.url is offered as a suggestion
+    the operator CONFIRMS, because guessing from it silently would produce a
+    plausible wrong answer, which is worse than no answer at all.
+
+    Returns a list; blank leaves only the local URL, which disables NIP-86
+    from the outside without disabling development against it."""
+    urls = []
+    found = find_relay_info_url()
+    suggestion = None
+    if found:
+        # wss:// -> https:// is exactly the derivation Amethyst performs on
+        # the relay's own socket URL to find this endpoint.
+        suggestion = re.sub(r'^ws(s?)://', r'http\1://', found.strip(), count=1)
+        if "://" not in suggestion:
+            suggestion = "https://" + suggestion
+    if suggestion:
+        answer = input(
+            f"Found relay.info.url {found} in strfry.conf — allow NIP-86 auth signed "
+            f"for {suggestion}? [Y/n] "
+        ).strip().lower()
+        if answer in ("", "y", "yes"):
+            urls.append(suggestion)
+    if not urls:
+        print(
+            "  Public https:// URL a NIP-86 client (Amethyst) will reach this relay on.\n"
+            "  Amethyst has no endpoint field: it swaps wss://host/path to https://host/path,\n"
+            "  so this must be the relay's own URL, not the admin port's."
+        )
+        raw = input("  URL (comma-separated for more than one, blank for none): ").strip()
+        for tok in raw.replace(",", " ").split():
+            if "://" not in tok:
+                tok = "https://" + tok
+            if tok not in urls:
+                urls.append(tok)
+    if LOCAL_CANONICAL_URL not in urls:
+        urls.append(LOCAL_CANONICAL_URL)
+    return urls
+
+
 def prompt_contact_appeal():
     return input(
         "Optional appeal contact, shown publicly on the admin page (email, "
@@ -617,7 +702,18 @@ def prompt_admin_pubkey():
 INSTALLER_PROMPTED_FIELDS = (
     ("admin_pubkey_hex", prompt_admin_pubkey),
     ("contact_appeal", prompt_contact_appeal),
+    ("canonical_urls", prompt_canonical_urls),
 )
+
+# Installer-prompted fields that a non-interactive first run may skip rather
+# than block on, and the value it writes instead. admin_pubkey_hex is
+# deliberately absent: it has no usable default and is always prompted.
+# canonical_urls falls back to the local URL alone, which leaves NIP-86
+# working for nak and closed from the outside until an operator sets it.
+INSTALLER_OPTIONAL_DEFAULTS = {
+    "contact_appeal": "",
+    "canonical_urls": [LOCAL_CANONICAL_URL],
+}
 
 
 def _write_config(cfg):
@@ -633,12 +729,11 @@ def ensure_config():
     if not os.path.exists(CONFIG_JSON_PATH):
         cfg = {"port": DEFAULT_PORT, "bind": DEFAULT_BIND}
         for key, prompt_fn in INSTALLER_PROMPTED_FIELDS:
-            # contact_appeal is the one optional field — skip the prompt
-            # (blank, same as before) rather than blocking a non-interactive
-            # first run on it. admin_pubkey_hex has no such default and is
-            # always prompted, exactly as before this refactor.
-            if key == "contact_appeal" and not sys.stdin.isatty():
-                cfg[key] = ""
+            # The optional fields skip their prompt on a non-interactive first
+            # run rather than blocking it. admin_pubkey_hex has no such
+            # default and is always prompted, exactly as before.
+            if key in INSTALLER_OPTIONAL_DEFAULTS and not sys.stdin.isatty():
+                cfg[key] = INSTALLER_OPTIONAL_DEFAULTS[key]
             else:
                 cfg[key] = prompt_fn()
         _write_config(cfg)

@@ -46,7 +46,11 @@ Three processes live in this repo; strfry itself does not.
   verdict permanently, never blocking strfry's write path.
 - **`server86.py`** is the admin HTTP server (default port 8686). It reads/writes the
   JSON state files, reads `decisions.jsonl` (never writes it), and shells out to
-  `strfry scan`/`count`/`delete`/`compact`/`export` on demand.
+  `strfry scan`/`count`/`delete`/`compact`/`export` on demand. It also answers **NIP-86**
+  relay-management RPC (`supportedmethods`/`banpubkey`/`unbanpubkey`/`listbannedpubkeys`)
+  for phone clients like Amethyst — dispatched on the `application/nostr+json+rpc` media
+  type at any path, authorized by a kind-27235 event in an `Authorization: Nostr` header,
+  and writing through the same `lib86/blacklist.py` as every other ban path.
 - **`strfry-86-updater.py`** is a separate, manually-run installer/updater — not
   scheduled by anything in this repo. It syncs files from a bundle or the network,
   patches `strfry.conf`'s plugin line, and restarts `server86.py` every run. It never
@@ -58,7 +62,28 @@ Three processes live in this repo; strfry itself does not.
   `*-cache.json` scan results, `decisions.jsonl`) — no database, no ORM.
 - NIP-98 auth travels inside the POST JSON body as `auth`, not an `Authorization`
   header, and is the one gate before path dispatch for every mutating/authenticated
-  endpoint — enforced once, not per-route.
+  endpoint — enforced once, not per-route. **NIP-86 is the one exception and has its own
+  verifier** (`verify_nip86_auth`): the event arrives base64'd in an `Authorization`
+  header and its `payload` tag hashes the RAW request bytes, not this project's
+  re-serialized non-auth body, so neither contract can serve the other. It checks
+  cheap-to-expensive (structure → `u` → payload → freshness → signature → admin) because
+  it faces the internet and `lib86/bip340.py` is pure-Python point math at ~112ms a
+  verification; a token bucket gates only that last expensive step. Auth failures return
+  real 401/403 with a JSON body — never bodyless, never a 200 — and the body carries a
+  fixed reason string only. Diagnostics go to `nip86-auth.jsonl`, never to the caller.
+- `via` on an audit record is the fixed enum `AUDIT_VIA`
+  (`dashboard`/`nip86`/`plugin`/`undo`), never free text: the actor pubkey is always the
+  same admin, so `via` is the only field that answers "what changed my relay". `plugin`
+  is reserved — `plugin86.py` cannot append to `audit-log.json` while that file is a
+  whole-file rewrite under a lock no second process shares; auto-bans stay in
+  `decisions.jsonl`, and the cheap fix later is synthesizing those records on read from
+  `blacklist.json`'s `report_event_id`, not adding a second writer.
+- `config.json`'s `canonical_urls` is what a NIP-86 `u` tag is matched against — never
+  the request's `Host` header, or an auth event signed for another relay would replay
+  here. Empty means the endpoint is off; there is no separate flag. The updater PROMPTS
+  for it (`INSTALLER_PROMPTED_FIELDS`) rather than deriving it from `relay.info.url`,
+  because a plausible wrong value fails every request with what looks like a client-side
+  signing bug.
 - The console (`/api/console`) only ever runs verbs from a fixed allowlist
   (`scan`/`info`/`export`); `delete` and `compact` exist only as separate,
   confirm-gated forms elsewhere.
@@ -95,7 +120,8 @@ Three processes live in this repo; strfry itself does not.
 - `ensure-server86.sh` — optional Docker `HEALTHCHECK` wrapper; keeps server86.py alive
   independent of relay traffic (see README, "Keep the admin page up across restarts").
 - `lib86/` — shared library (ban list, BIP-340 verify, name cache), used by more than
-  one of the processes above.
+  one of the processes above. `bip340.py` only ever VERIFIES; signing exists solely in
+  `test.sh`, self-validated against the reference vectors before anything trusts it.
 - `common86.js` — shared client code: page chrome, nav, search, theme toggle, record
   lines. Hardcodes its own copies of a few server-side constants (see PROJECT-MAP.md
   §6).

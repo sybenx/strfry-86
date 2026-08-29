@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=456
+EXPECTED_MIN=611
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -629,6 +629,63 @@ EOF
 # other test above, this one covers a failure you would NOT notice by using
 # the thing. See tests/README.md for fixture provenance.
 
+# BIP-340 SIGNING, FOR TESTS ONLY — never vendored into shipped code, which
+# only ever verifies (tests/README.md says why). It exists because the NIP-86
+# suite below needs many independently-signed auth events whose `payload` tag
+# is welded to the exact raw bytes of each request it sends: frozen fixtures
+# would have to be regenerated for every body the suite posts, and "a valid
+# signature from a NON-admin" needs a second key the repo does not carry.
+#
+# It is built on lib86/bip340.py's own already-exported point math, and it is
+# self-validated against the reference vectors before anything trusts it: a
+# signer that is subtly wrong would mint events that fail verification and
+# make every auth test below pass for entirely the wrong reason.
+cat > "$TESTDIR/nip86_sign.py" <<'PYEOF'
+import hashlib
+import json
+
+from lib86 import bip340
+
+
+def schnorr_sign(msg, seckey, aux_rand):
+    if len(msg) != 32:
+        raise ValueError("msg must be 32 bytes")
+    d0 = int.from_bytes(seckey, "big")
+    if not (1 <= d0 <= bip340.n - 1):
+        raise ValueError("secret key out of range")
+    P = bip340.point_mul(bip340.G, d0)
+    d = d0 if bip340.has_even_y(P) else bip340.n - d0
+    t = d ^ int.from_bytes(bip340.tagged_hash("BIP0340/aux", aux_rand), "big")
+    k0 = int.from_bytes(bip340.tagged_hash(
+        "BIP0340/nonce",
+        bip340.bytes_from_int(t) + bip340.bytes_from_int(bip340.x(P)) + msg,
+    ), "big") % bip340.n
+    if k0 == 0:
+        raise RuntimeError("nonce is zero")
+    R = bip340.point_mul(bip340.G, k0)
+    k = k0 if bip340.has_even_y(R) else bip340.n - k0
+    e = int.from_bytes(bip340.tagged_hash(
+        "BIP0340/challenge",
+        bip340.bytes_from_int(bip340.x(R)) + bip340.bytes_from_int(bip340.x(P)) + msg,
+    ), "big") % bip340.n
+    return bip340.bytes_from_int(bip340.x(R)) + bip340.bytes_from_int((k + e * d) % bip340.n)
+
+
+def pubkey_of(seckey):
+    P = bip340.point_mul(bip340.G, int.from_bytes(seckey, "big"))
+    return bip340.bytes_from_int(bip340.x(P))
+
+
+def sign_event(seckey, kind, tags, content="", created_at=0):
+    pk = pubkey_of(seckey).hex()
+    ser = json.dumps([0, pk, created_at, kind, tags, content],
+                     separators=(",", ":"), ensure_ascii=False)
+    eid = hashlib.sha256(ser.encode("utf-8")).hexdigest()
+    sig = schnorr_sign(bytes.fromhex(eid), seckey, b"\x00" * 32).hex()
+    return {"id": eid, "pubkey": pk, "created_at": created_at, "kind": kind,
+            "tags": tags, "content": content, "sig": sig}
+PYEOF
+
 CRYPTO_TEST_SCRIPT="$(mktemp)"
 cat > "$CRYPTO_TEST_SCRIPT" <<'PYEOF'
 import csv
@@ -638,9 +695,12 @@ import secrets
 import sys
 
 REPO_ROOT = sys.argv[1]
+TESTDIR = sys.argv[2]
 sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, TESTDIR)
 
 from lib86 import bech32, bip340  # noqa: E402
+import nip86_sign  # noqa: E402
 import server86  # noqa: E402
 
 results = []  # (ok, name, detail)
@@ -652,10 +712,16 @@ def check(ok, name, detail=None):
 
 # --- BIP-340 reference vectors (tests/bip340-vectors.csv, vendored verbatim)
 
+# ONE NAMED CHECK PER VECTOR, valid and invalid alike. These used to be
+# collapsed into a single aggregate check, which was adequate while
+# lib86/bip340.py only ever verified events the operator had signed
+# themselves over a loopback-only port. It is not adequate now that the same
+# 116 lines gate an internet-facing NIP-86 endpoint: the failure that matters
+# is an INVALID vector starting to verify as valid, and that must name itself
+# on the failing line instead of hiding inside "1 mismatch(es)".
 vectors_path = os.path.join(REPO_ROOT, "tests", "bip340-vectors.csv")
 applicable = 0
 skipped = 0
-mismatches = []
 with open(vectors_path, newline="") as f:
     for row in csv.DictReader(f):
         msg_hex = row["message"]
@@ -668,22 +734,53 @@ with open(vectors_path, newline="") as f:
             skipped += 1
             continue
         applicable += 1
-        pubkey = bytes.fromhex(row["public key"])
-        sig = bytes.fromhex(row["signature"])
         expected = row["verification result"].strip().upper() == "TRUE"
         try:
-            actual = bip340.schnorr_verify(msg, pubkey, sig)
+            actual = bip340.schnorr_verify(
+                msg, bytes.fromhex(row["public key"]), bytes.fromhex(row["signature"]))
         except Exception as e:
             actual = f"raised {type(e).__name__}"
-        if actual != expected:
-            mismatches.append(
-                f"vector {row['index']} ({row.get('comment', '')}): expected {expected}, got {actual}"
-            )
+        comment = (row.get("comment") or "").strip()
+        label = "accepts" if expected else "rejects"
+        check(actual == expected,
+              f"bip340 vector {row['index']} {label}"
+              + (f": {comment}" if comment else ""),
+              None if actual == expected else f"expected {expected}, got {actual}")
+check(applicable >= 15,
+      f"bip340 vectors: {applicable} fixed-32-byte-message rows exercised "
+      f"({skipped} skipped: variable-length message)",
+      None if applicable >= 15 else "the vendored CSV lost rows")
 
-if mismatches:
-    check(False, "bip340 test vectors", f"{len(mismatches)} mismatch(es): " + "; ".join(mismatches))
-else:
-    check(True, f"bip340 test vectors ({applicable} applicable rows, {skipped} skipped: variable-length message)")
+# --- the test-only signer must reproduce the reference signatures ----------
+# Everything the NIP-86 suite asserts rests on events this signer mints, so it
+# is validated against the upstream vectors that carry a secret key and
+# aux_rand before a single one of those assertions runs. Byte-for-byte, not
+# "verifies OK" — a signer that produced *a* valid signature by a different
+# nonce rule would still be a second, unreviewed implementation.
+signed = 0
+for row in csv.DictReader(open(vectors_path, newline="")):
+    sk_hex = (row["secret key"] or "").strip()
+    msg = bytes.fromhex(row["message"]) if row["message"] else b""
+    if not sk_hex or len(msg) != 32:
+        continue
+    sk = bytes.fromhex(sk_hex)
+    got_sig = nip86_sign.schnorr_sign(msg, sk, bytes.fromhex(row["aux_rand"])).hex().upper()
+    got_pk = nip86_sign.pubkey_of(sk).hex().upper()
+    check(got_sig == row["signature"].strip().upper(),
+          f"test signer reproduces bip340 vector {row['index']} signature byte-for-byte")
+    check(got_pk == row["public key"].strip().upper(),
+          f"test signer derives bip340 vector {row['index']} public key")
+    signed += 1
+check(signed >= 3, f"test signer validated against {signed} reference vectors")
+
+_sk = bytes.fromhex("11" * 32)
+_ev = nip86_sign.sign_event(_sk, 27235, [["u", "https://relay.example/"]], "", 1700000000)
+check(server86.compute_event_id(_ev["pubkey"], _ev["created_at"], _ev["kind"],
+                                _ev["tags"], _ev["content"]) == _ev["id"],
+      "test signer's event id matches server86.compute_event_id")
+check(bip340.schnorr_verify(bytes.fromhex(_ev["id"]), bytes.fromhex(_ev["pubkey"]),
+                            bytes.fromhex(_ev["sig"])),
+      "an event minted by the test signer verifies under the shipped verifier")
 
 
 # --- NIP-98 fixture + mutations (tests/nip98-fixture.json) ------------------
@@ -852,7 +949,7 @@ for ok, name, detail in results:
         print(line)
 PYEOF
 
-CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
+CRYPTO_OUTPUT="$(python3 "$CRYPTO_TEST_SCRIPT" "$REPO_ROOT" "$TESTDIR" 2>&1)"
 echo "$CRYPTO_OUTPUT"
 CRYPTO_FAIL_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^FAIL: ')"
 CRYPTO_PASS_COUNT="$(echo "$CRYPTO_OUTPUT" | grep -c '^PASS: ')"
@@ -873,7 +970,10 @@ import os
 import sys
 
 REPO_ROOT = sys.argv[1]
+TESTDIR = sys.argv[2]
 sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, TESTDIR)
+import nip86_sign  # noqa: E402
 import server86  # noqa: E402
 
 results = []
@@ -1404,6 +1504,52 @@ check("setrlimit" not in _server86_src,
       "server86 never sets an rlimit — RLIMIT_AS would kill every strfry LMDB mmap")
 check(not hasattr(server86, "MEMORY_HARD_BYTES"),
       "no MEMORY_HARD_BYTES address-space ceiling exists to be re-applied")
+
+# --- audit `via` is a fixed enum, not free text --------------------------
+# The actor pubkey on every audit record is the same admin, so `via` is the
+# only field that makes the log answer "what changed my relay". It used to
+# carry free text ("raw editor", "settings purge now", f"domain {domain}"),
+# which meant the UI had to parse it and no two call sites agreed on a
+# vocabulary. A source grep, because the failure this covers is a NEW
+# audit_append landing with an invented via value — that is invisible in
+# every functional test, and only shows up as an audit log that has quietly
+# stopped being groupable.
+import re as _re_via
+
+_via_literals = _re_via.findall(r'"via":\s*"([^"]*)"', _server86_src)
+_via_assigns = _re_via.findall(r'\["via"\]\s*=\s*"([^"]*)"', _server86_src)
+_via_colons = _re_via.findall(r'"via":\s*', _server86_src)
+_via_quoted = _re_via.findall(r'"via":\s*"[^"]*"', _server86_src)
+check(len(_via_colons) == len(_via_quoted),
+      "every audit `via` in server86.py is a plain string literal — no f-string, no "
+      "conditional, nothing for the UI to have to parse back apart",
+      f"{len(_via_colons)} via sites, {len(_via_quoted)} literal")
+_bad_via = sorted({v for v in (_via_literals + _via_assigns) if v not in server86.AUDIT_VIA})
+check(not _bad_via,
+      f"every audit `via` value is one of AUDIT_VIA {server86.AUDIT_VIA}",
+      f"unknown: {_bad_via}")
+check(set(server86.AUDIT_VIA) == {"dashboard", "nip86", "plugin", "undo"},
+      "AUDIT_VIA is exactly dashboard/nip86/plugin/undo")
+check("plugin" not in (_via_literals + _via_assigns),
+      "no server86 call site writes via='plugin' yet — it is reserved for plugin86's kind-1984 "
+      "auto-ban, which cannot append to audit-log.json while that file is a whole-file rewrite "
+      "under a lock no second process shares")
+check(len(set(_via_literals + _via_assigns)) >= 3,
+      "server86 actually uses more than one via value — a single value would make the field "
+      "decorative")
+
+# --- NIP-86 dispatch runs before path routing ----------------------------
+# The media-type test must come BEFORE the do_POST path allowlist, or a
+# NIP-86 POST to "/" 404s before it is ever recognised. Ordering, so a
+# functional test cannot catch it if the allowlist later gains "/".
+_do_post_at = _server86_src.index("    def do_POST(self):")
+_dispatch_at = _server86_src.index("self._handle_nip86()", _do_post_at)
+_allowlist_at = _server86_src.index("if path not in (", _do_post_at)
+check(_dispatch_at < _allowlist_at,
+      "the NIP-86 media-type check runs before do_POST's path allowlist, so a NIP-86 request "
+      "to any path (including /) is never 404'd before it is recognised")
+check("_media_type(self.headers.get(\"Content-Type\"))" in _server86_src,
+      "NIP-86 dispatch keys on the parsed media type, not on a raw header string comparison")
 import resource as _resource
 check(_resource.getrlimit(_resource.RLIMIT_AS)[1] == _resource.RLIM_INFINITY
       or "MEMORY_HARD_BYTES" not in _server86_src,
@@ -3279,6 +3425,465 @@ try:
         check(False, "POST /api/profile/new without auth is rejected")
     except _urllib_error.HTTPError as e:
         check(e.code == 401, "POST /api/profile/new without a valid NIP-98 auth is rejected with 401 — it's dispatchable (not 404) but still admin-only")
+
+    # --- NIP-86 relay management RPC -------------------------------------
+    # This endpoint is the ONLY thing in this project reachable from the open
+    # internet, and lib86/bip340.py is the only thing between a stranger and
+    # write access to blacklist.json. Unlike almost every other test here, the
+    # failures covered below are ones you would NOT notice by using the thing:
+    # a verifier that wrongly returns True, an error body that hands back the
+    # server's own configuration, or a "hardening" change that quietly breaks
+    # a phone's connection-failure retry all look exactly like success.
+    #
+    # Every auth event here is minted by the test-only signer validated
+    # against the BIP-340 reference vectors in the crypto block above.
+
+    import base64 as _b64
+    import hashlib as _hashlib
+    import re as _re
+    import time as _time
+
+    _n86_admin_sk = bytes.fromhex("11" * 32)
+    _n86_admin = nip86_sign.pubkey_of(_n86_admin_sk).hex()
+    _n86_other_sk = bytes.fromhex("22" * 32)
+    _n86_other = nip86_sign.pubkey_of(_n86_other_sk).hex()
+    _n86_url = "https://relay.example.com/"
+    _n86_target = "ab" * 32
+
+    # Redirect the audit log: banpubkey writes a real audit record, and
+    # AUDIT_LOG_PATH is otherwise the repo's own file. Same reasoning as the
+    # cache/config/blacklist redirects further up.
+    _n86_orig_audit_path = server86.AUDIT_LOG_PATH
+    _n86_orig_audit_log = server86._audit_log
+    _n86_orig_cfg_path = server86.CONFIG_PATH
+    _n86_orig_httpd_cfg = _httpd.strfry86_config
+    server86.AUDIT_LOG_PATH = os.path.join(_cache_tmpdir, "nip86-audit-log.json")
+    server86._audit_log = {"records": []}
+    server86.NIP86_AUTH_LOG_PATH = os.path.join(_cache_tmpdir, "nip86-auth.jsonl")
+    server86.NIP86_AUTH_LOG_PREV_PATH = server86.NIP86_AUTH_LOG_PATH + ".1"
+    server86.CONFIG_PATH = os.path.join(_cache_tmpdir, "nip86-config.json")
+    _httpd.strfry86_config = {"admin_pubkey_hex": _n86_admin, "port": 0, "bind": "127.0.0.1"}
+
+    def _n86_config(urls, skew=None):
+        data = {"admin_pubkey_hex": _n86_admin, "canonical_urls": list(urls)}
+        if skew is not None:
+            data["nip86_auth_max_skew"] = skew
+        with open(server86.CONFIG_PATH, "w") as fh:
+            json.dump(data, fh)
+
+    def _n86_reset_bucket():
+        server86._nip86_bucket.update(
+            {"tokens": float(server86.NIP86_AUTH_FAIL_BURST), "at": None, "suppressed": 0})
+
+    def _n86_authlog():
+        try:
+            with open(server86.NIP86_AUTH_LOG_PATH) as fh:
+                return [json.loads(ln) for ln in fh if ln.strip()]
+        except OSError:
+            return []
+
+    def _n86_event(sk=None, u=None, method_tag="POST", kind=27235, payload=None,
+                   created_at=None, body=b"", sig=None):
+        tags = [["u", _n86_url if u is None else u], ["method", method_tag]]
+        if payload is not False:
+            tags.append(["payload",
+                         _hashlib.sha256(body).hexdigest() if payload is None else payload])
+        ev = nip86_sign.sign_event(sk or _n86_admin_sk, kind, tags, "",
+                                   int(_time.time()) if created_at is None else created_at)
+        if sig is not None:
+            ev["sig"] = sig
+        return ev
+
+    def _n86_post(body_obj=None, header=None, ct=None, path="/", raw=None):
+        """-> (status, content_type, parsed_body, raw_body_text)."""
+        body = raw if raw is not None else json.dumps(
+            {"method": "supportedmethods", "params": []} if body_obj is None else body_obj
+        ).encode("utf-8")
+        headers = {"Content-Type": server86.NIP86_CONTENT_TYPE if ct is None else ct}
+        if header is not None:
+            headers["Authorization"] = header
+        req = _urllib_request.Request(_base_url + path, data=body, method="POST",
+                                      headers=headers)
+        try:
+            with _urllib_request.urlopen(req, timeout=5) as resp:
+                text = resp.read().decode("utf-8", "replace")
+                return resp.status, resp.headers.get("Content-Type"), json.loads(text), text
+        except _urllib_error.HTTPError as e:
+            text = e.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            return e.code, e.headers.get("Content-Type"), parsed, text
+
+    def _n86_auth(**kw):
+        """Sign an auth event over the body this call will actually send."""
+        body = json.dumps(kw.pop("body_obj", {"method": "supportedmethods", "params": []})
+                          ).encode("utf-8")
+        ev = _n86_event(body=body, **kw)
+        return ("Nostr " + _b64.b64encode(json.dumps(ev).encode("utf-8")).decode("ascii"),
+                body)
+
+    _n86_config([_n86_url, "http://127.0.0.1:8686/"])
+    _n86_reset_bucket()
+
+    # --- the happy path ---------------------------------------------------
+    _hdr, _body = _n86_auth()
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 200, "nip86 supportedmethods returns 200 for a valid admin signature", _txt[:200])
+    check(_ct == server86.NIP86_CONTENT_TYPE,
+          "nip86 responses carry Content-Type application/nostr+json+rpc", _ct)
+    check(_js.get("result") == sorted(server86.NIP86_METHODS),
+          "nip86 supportedmethods output equals sorted(NIP86_METHODS) — it cannot drift from "
+          "the dispatch table because it IS the dispatch table")
+    check(sorted(server86.NIP86_METHODS) ==
+          ["banpubkey", "listbannedpubkeys", "supportedmethods", "unbanpubkey"],
+          "nip86 implements exactly the four agreed methods — unbanpubkey, not allowpubkey "
+          "(allowlisting is a separate NIP-86 concept this project does not implement)")
+
+    # --- every auth check refused independently, with the right status ----
+    # A single check that "bad auth is refused" would pass even if only one of
+    # these were actually enforced; each mutation has to fail on its own.
+    _n86_reset_bucket()
+    _n86_reject_cases = [
+        ("missing Authorization header", None, None, 401, "missing_header"),
+        ("Authorization header that is not 'Nostr <base64>'", "Bearer abc", None, 401,
+         "malformed_header"),
+        ("Authorization credential that is not base64", "Nostr !!!not-base64!!!", None, 401,
+         "bad_base64"),
+        ("Authorization credential that is not JSON", "Nostr " + _b64.b64encode(
+            b"not json at all").decode("ascii"), None, 401, "bad_json"),
+        ("auth event that is not kind 27235", None, {"kind": 1}, 401, "wrong_kind"),
+        ("auth event whose method tag is not POST", None, {"method_tag": "GET"}, 401,
+         "wrong_method_tag"),
+        ("auth event signed for a different relay's URL", None,
+         {"u": "https://evil.example/"}, 401, "u_mismatch"),
+        ("auth event with no payload tag at all", None, {"payload": False}, 401,
+         "payload_missing"),
+        ("auth event whose payload tag is not this body's hash", None,
+         {"payload": "cd" * 32}, 401, "payload_mismatch"),
+        ("auth event older than the freshness window", None,
+         {"created_at": int(_time.time()) - 5000}, 401, "stale"),
+        ("auth event dated far into the future", None,
+         {"created_at": int(_time.time()) + 5000}, 401, "future"),
+        ("auth event whose id does not match its own fields", None,
+         {"__mangle_id__": True}, 401, "id_mismatch"),
+        ("auth event with a well-formed but invalid signature", None,
+         {"sig": "ab" * 64}, 401, "bad_signature"),
+        ("valid signature from a pubkey that is not the admin", None,
+         {"sk": _n86_other_sk}, 403, "not_admin"),
+    ]
+    for _name, _raw_hdr, _evkw, _want_status, _want_reason in _n86_reject_cases:
+        _before = len(_n86_authlog())
+        if _raw_hdr is not None or _evkw is None:
+            _hdr, _body = _raw_hdr, json.dumps(
+                {"method": "supportedmethods", "params": []}).encode("utf-8")
+        else:
+            _kw = dict(_evkw)
+            _mangle = _kw.pop("__mangle_id__", False)
+            _body = json.dumps({"method": "supportedmethods", "params": []}).encode("utf-8")
+            _ev = _n86_event(body=_body, **_kw)
+            if _mangle:
+                _ev["id"] = "0" * 63 + ("1" if _ev["id"][-1] != "1" else "2")
+            _hdr = "Nostr " + _b64.b64encode(
+                json.dumps(_ev).encode("utf-8")).decode("ascii")
+        _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+        check(_st == _want_status,
+              f"nip86 rejects with {_want_status}: {_name}", f"got {_st}: {_txt[:160]}")
+        # Never bodyless, at any status. welshman calls res.json() with no
+        # status check: a JSON body reads correctly at any code, but an EMPTY
+        # 401 body makes it throw and degrade to a generic message.
+        check(isinstance(_js, dict) and isinstance(_js.get("error"), str) and _js["error"],
+              f"nip86 rejection carries a JSON error body: {_name}", repr(_txt[:160]))
+        # The response says WHAT failed; nip86-auth.jsonl says why, with the
+        # datum that fixes it. An unauthenticated caller must not be able to
+        # read the server's configuration back out of its own error messages.
+        check(isinstance(_js, dict) and _js.get("error") in
+              [t for _c, t in server86.NIP86_ERRORS.values()],
+              f"nip86 error body is a fixed NIP86_ERRORS string, never an interpolated "
+              f"runtime value: {_name}", repr(_js))
+        _leaks = [f for f in ("expected_u", "received_u", "expected_payload",
+                              "received_payload", "skew_seconds", "window_seconds",
+                              "expected_id", "pubkey", "127.0.0.1", "relay.example.com",
+                              _n86_admin, _n86_other) if f in _txt]
+        check(not _leaks,
+              f"nip86 error body leaks no diagnostic detail: {_name}", str(_leaks))
+        _after = _n86_authlog()
+        check(len(_after) == _before + 1 and _after[-1].get("reason") == _want_reason,
+              f"nip86-auth.jsonl records reason {_want_reason!r} for: {_name}",
+              str(_after[-1]) if _after else "no record written")
+
+    # --- the log carries the one datum that fixes each failure ------------
+    _n86_reset_bucket()
+    _by_reason = {}
+    for _rec in _n86_authlog():
+        _by_reason.setdefault(_rec["reason"], _rec)
+    check(_by_reason.get("u_mismatch", {}).get("expected_u") == [
+              "relay.example.com/", "127.0.0.1:8686/"],
+          "nip86-auth.jsonl u_mismatch names the configured canonical URLs, normalized — the "
+          "web's default ports fold away so scheme tolerance is real, while :8686 stays "
+          "explicit and therefore stays strict",
+          str(_by_reason.get("u_mismatch")))
+    check(_by_reason.get("u_mismatch", {}).get("received_u") == "https://evil.example/"
+          and _by_reason["u_mismatch"].get("received_u_normalized") == "evil.example/",
+          "nip86-auth.jsonl u_mismatch names the received u BOTH raw and normalized, so the "
+          "comparison it failed is not apples-to-oranges")
+    check(_by_reason.get("payload_mismatch", {}).get("expected_payload")
+          and _by_reason["payload_mismatch"].get("received_payload") == "cd" * 32,
+          "nip86-auth.jsonl payload_mismatch names both hashes")
+    check(_by_reason.get("stale", {}).get("skew_seconds", 0) < -100
+          and _by_reason["stale"].get("window_seconds") == server86.NIP86_AUTH_MAX_SKEW_DEFAULT,
+          "nip86-auth.jsonl stale records the measured skew and the window it broke",
+          str(_by_reason.get("stale")))
+    check(_by_reason.get("future", {}).get("skew_seconds", 0) > 100,
+          "nip86-auth.jsonl future records a POSITIVE skew — the window is symmetric, unlike "
+          "khatru's unbounded future, which leaves a far-future auth event replayable forever")
+    check(_by_reason.get("not_admin", {}).get("pubkey") == _n86_other
+          and _by_reason["not_admin"].get("status") == 403,
+          "nip86-auth.jsonl not_admin names the signer and the 403 it got")
+
+    # --- an unconfigured relay says so, instead of blaming the client -----
+    # An empty canonical_urls is the feature's off switch, but "deliberately
+    # off" and "misconfigured" must not produce the same diagnostic — the
+    # second is the one an operator is debugging at 2am, and a u_mismatch
+    # naming an empty list reads as a client-side signing problem.
+    _n86_config([])
+    _n86_reset_bucket()
+    _hdr, _body = _n86_auth()
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 401, "nip86 with no canonical_urls configured refuses every request", _txt[:160])
+    check(_n86_authlog()[-1]["reason"] == "not_configured",
+          "nip86 with no canonical_urls logs not_configured, NOT u_mismatch")
+    _n86_config([_n86_url, "http://127.0.0.1:8686/"])
+
+    # --- u normalization: the #1 real-world failure mode -------------------
+    # Lenient about scheme and a trailing slash, strict about host, port and
+    # path — the way khatru's NormalizeURL is. Chorus compares raw strings
+    # instead, and it bites people.
+    _n86_reset_bucket()
+    for _variant, _should in (
+        ("https://relay.example.com/", True),
+        ("https://relay.example.com", True),
+        ("https://relay.example.com:443/", True),
+        ("http://relay.example.com/", True),
+        ("https://RELAY.example.COM/", True),
+        ("https://relay.example.com:8443/", False),
+        ("https://relay.example.com/admin", False),
+        ("https://other.example.com/", False),
+    ):
+        _hdr, _body = _n86_auth(u=_variant)
+        _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+        check((_st == 200) == _should,
+              f"nip86 u normalization {'accepts' if _should else 'rejects'} {_variant}",
+              f"got {_st}")
+
+    # --- replay across relays ---------------------------------------------
+    # The u tag is matched against config.json's canonical_urls and NEVER
+    # against the request's own Host header — otherwise an auth event signed
+    # for another relay would replay here verbatim.
+    _n86_reset_bucket()
+    _hdr_for_a, _body = _n86_auth(u=_n86_url)
+    _n86_config(["https://second-relay.example.com/"])
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr_for_a)
+    check(_st == 401,
+          "nip86 rejects an auth event valid for canonical URL A when this relay's canonical "
+          "URL is B — the u tag binds to configuration, never to the request's Host header")
+    _n86_config([_n86_url, "http://127.0.0.1:8686/"])
+
+    # --- replay WITHIN a relay is deliberately allowed ---------------------
+    # Pinned so a future "hardening" change that adds one-shot consumption
+    # fails here loudly instead of silently breaking mobile clients. The rule:
+    # one-shot for NON-idempotent operations (the dashboard's settings saves,
+    # purges and undo), freshness-window-plus-payload-binding for idempotent
+    # ones. OkHttp retries on connection failure by default, so a phone whose
+    # response was lost on mobile data resends the identical Authorization
+    # header — consuming it would report "unauthorized" for an operation that
+    # actually succeeded.
+    _n86_reset_bucket()
+    _hdr, _body = _n86_auth()
+    _first = _n86_post(raw=_body, header=_hdr)[0]
+    _second = _n86_post(raw=_body, header=_hdr)[0]
+    check(_first == 200 and _second == 200,
+          "nip86 accepts a byte-identical replay of the same auth event (idempotent methods "
+          "are not one-shot; a lost-response retry from a phone must still succeed)",
+          f"first={_first} second={_second}")
+
+    # --- dispatch is keyed on Content-Type, never on path ------------------
+    _n86_reset_bucket()
+    _hdr, _body = _n86_auth()
+    check(_n86_post(raw=_body, header=_hdr,
+                    ct=server86.NIP86_CONTENT_TYPE + "; charset=utf-8")[0] == 200,
+          "nip86 dispatches on the media type PREFIX, so a proxy appending '; charset=utf-8' "
+          "does not silently fall through to the relay's website")
+    check(_n86_post(raw=_body, header=_hdr,
+                    ct=" APPLICATION/Nostr+JSON+RPC ")[0] == 200,
+          "nip86 media-type matching is case- and whitespace-insensitive, per RFC 7231")
+    check(_n86_post(raw=_body, header=_hdr, ct="application/json")[0] == 404,
+          "a POST to / with Content-Type application/json is NOT a NIP-86 request")
+    check(_n86_post(raw=_body, header=_hdr, path="/some/proxied/path")[0] == 200,
+          "nip86 dispatches regardless of path — Amethyst posts to whatever path the relay's "
+          "socket URL carries, and the operator's proxy may rewrite it")
+
+    # --- methods -----------------------------------------------------------
+    _n86_reset_bucket()
+    _n86_body = {"method": "banpubkey", "params": [_n86_target, "spam from the phone"]}
+    _hdr, _body = _n86_auth(body_obj=_n86_body)
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 200 and _js.get("result") is True, "nip86 banpubkey returns true", _txt[:160])
+    _stored = server86.blacklist.load().get(_n86_target)
+    check(isinstance(_stored, dict) and _stored.get("reason") == "spam from the phone",
+          "nip86 banpubkey writes through lib86/blacklist.py — one ban store, not a parallel list")
+    check(_stored.get("report_type") == "manual",
+          "a NIP-86 ban has the SAME record shape as a dashboard ban (report_type 'manual'); "
+          "the RPC/dashboard distinction lives in the audit record's via, not in blacklist.json")
+
+    _hdr, _body = _n86_auth(body_obj=_n86_body)
+    check(_n86_post(raw=_body, header=_hdr)[2].get("result") is True,
+          "nip86 banpubkey is idempotent — re-banning an already-banned pubkey is a success")
+
+    _hdr, _body = _n86_auth(body_obj={"method": "listbannedpubkeys", "params": []})
+    _listed = _n86_post(raw=_body, header=_hdr)[2].get("result")
+    check(isinstance(_listed, list)
+          and {"pubkey": _n86_target, "reason": "spam from the phone"} in _listed,
+          "nip86 listbannedpubkeys reads the same store", str(_listed)[:200])
+
+    _n86_audit = server86.get_audit_records()
+    check(_n86_audit and _n86_audit[0].get("via") == "nip86"
+          and _n86_audit[0].get("actor") == _n86_admin,
+          "a NIP-86 mutation writes an audit record tagged via='nip86'", str(_n86_audit[:1])[:200])
+    check(_n86_audit[0].get("user_agent"),
+          "the audit record carries the client's User-Agent verbatim — informational only, "
+          "never parsed and never treated as identity")
+    check(not any("X-Forwarded-For" in json.dumps(r) or "remote_ip" in json.dumps(r)
+                  for r in _n86_audit),
+          "no remote IP is recorded: behind the proxy it is the proxy's address, and trusting "
+          "X-Forwarded-For from an unauthenticated source is a footgun for no benefit")
+
+    _hdr, _body = _n86_auth(body_obj={"method": "unbanpubkey", "params": [_n86_target]})
+    check(_n86_post(raw=_body, header=_hdr)[2].get("result") is True,
+          "nip86 unbanpubkey returns true")
+    check(_n86_target not in server86.blacklist.load(),
+          "nip86 unbanpubkey removes the ban from the shared store")
+    _hdr, _body = _n86_auth(body_obj={"method": "unbanpubkey", "params": [_n86_target]})
+    check(_n86_post(raw=_body, header=_hdr)[2].get("result") is True,
+          "nip86 unbanpubkey is idempotent — unbanning an unbanned pubkey is a success")
+
+    # The admin pubkey can never be banned. blacklist.add refuses it too, but
+    # returns a bare False for both "is the admin" and "is not hex", so this
+    # path refuses it explicitly and says which.
+    _hdr, _body = _n86_auth(body_obj={"method": "banpubkey", "params": [_n86_admin]})
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 400 and "admin" in (_js.get("error") or ""),
+          "nip86 refuses to ban the admin pubkey, explicitly", _txt[:160])
+    check(_n86_admin not in server86.blacklist.load(),
+          "the admin pubkey is not in the ban store after that attempt")
+
+    for _bad_params, _why in (
+        ([], "no pubkey at all"),
+        (["not-hex"], "a pubkey that is not 64 hex characters"),
+        ([_n86_target, "x" * (server86.get_reason_max_len() + 1)], "an over-long reason"),
+    ):
+        _hdr, _body = _n86_auth(body_obj={"method": "banpubkey", "params": _bad_params})
+        _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+        check(_st == 400 and _js.get("error"),
+              f"nip86 banpubkey rejects {_why} with an error body", _txt[:160])
+
+    _hdr, _body = _n86_auth(body_obj={"method": "allowpubkey", "params": [_n86_target]})
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st != 200 and "allowpubkey" in (_js.get("error") or ""),
+          "nip86 refuses an unknown method EXPLICITLY and names it — a management client told "
+          "'ok' for an unimplemented method would show a moderation action that never happened",
+          _txt[:160])
+    check(_n86_target not in server86.blacklist.load(),
+          "the refused unknown method changed nothing — it is not a silent no-op")
+
+    # --- the failure limiter ----------------------------------------------
+    # Exercised with an injected monotonic clock: driving it over real HTTP
+    # would make the assertion depend on how fast this machine happens to run
+    # a 112ms pure-Python scalar multiplication.
+    _n86_reset_bucket()
+    _t = 1000.0
+    check(server86.nip86_bucket_allows(_t), "nip86 failure bucket allows a request when full")
+    _n86_log_before = len(_n86_authlog())
+    for _ in range(server86.NIP86_AUTH_FAIL_BURST + 5):
+        server86.nip86_bucket_charge(_t)
+    check(not server86.nip86_bucket_allows(_t),
+          "nip86 failure bucket closes the crypto gate once the burst is spent")
+    check(server86.nip86_bucket_allows(_t) is False and
+          server86._nip86_bucket["tokens"] < 1.0,
+          "nip86_bucket_allows consumes nothing — a verification that SUCCEEDS must never "
+          "spend a token, or the operator would ration themselves out under their own use")
+    check(server86._nip86_bucket["suppressed"] >= 1,
+          "a rejection past the burst is COUNTED, not logged one line at a time — the log is "
+          "otherwise exactly the disk-I/O amplifier the bucket exists to prevent")
+    _rl_records = [r for r in _n86_authlog() if r["reason"] == "rate_limited"]
+    check(len(_rl_records) == 1,
+          "exactly ONE rate_limited record is written when suppression engages",
+          str(len(_rl_records)))
+    check(len(_n86_authlog()) - _n86_log_before == 1,
+          "35 rejections past the burst added exactly one log line between them")
+    check(server86.nip86_bucket_allows(_t + 1.0),
+          "the gate reopens as the bucket refills at NIP86_AUTH_FAIL_RATE per second")
+    server86.nip86_bucket_release(_t + 1.0)
+    check(server86._nip86_bucket["suppressed"] == 0
+          and len([r for r in _n86_authlog() if r["reason"] == "rate_limited"]) == 2,
+          "a success closes out the suppressed run with a second record carrying its count")
+
+    # The gate covers ONLY the signature check. Everything cheaper still
+    # reports its own real reason while drained — an operator debugging a
+    # wrong u tag during a flood must not be told "rate limited" instead.
+    _n86_reset_bucket()
+    _now = _time.monotonic()
+    for _ in range(server86.NIP86_AUTH_FAIL_BURST + 5):
+        server86.nip86_bucket_charge(_now)
+    _hdr, _body = _n86_auth(u="https://evil.example/")
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 401 and _js.get("error") == server86.NIP86_ERRORS["u_mismatch"][1],
+          "a drained bucket still returns the REAL reason for a failure that never needed the "
+          "crypto — the limiter gates the scalar multiplication, not the diagnostics",
+          f"{_st}: {_txt[:160]}")
+    _hdr, _body = _n86_auth(sig="ab" * 64)
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 429 and isinstance(_js, dict) and _js.get("error"),
+          "a request that WOULD reach the crypto is refused 429, with a JSON body, without "
+          "doing the scalar multiplication", f"{_st}: {_txt[:160]}")
+
+    # The honest cost of a global (not per-IP) bucket, pinned so nobody
+    # re-derives the wrong version of it: under a flood the admin's own valid
+    # request competes for the same budget and CAN be refused. It cannot be
+    # locked out, because success spends nothing and a token returns every
+    # 1/NIP86_AUTH_FAIL_RATE seconds — so the operator is delayed, then gets
+    # through. Proving admin-ness IS the scalar multiplication, so there is no
+    # way to recognise the operator without first spending what is rationed.
+    _hdr, _body = _n86_auth()
+    check(_n86_post(raw=_body, header=_hdr)[0] == 429,
+          "a valid admin request IS refused while the bucket is fully drained — the limiter "
+          "cannot recognise the admin without doing the very work it is rationing")
+    server86.nip86_bucket_charge(_time.monotonic() - (2.0 / server86.NIP86_AUTH_FAIL_RATE))
+    _hdr, _body = _n86_auth()
+    _st, _ct, _js, _txt = _n86_post(raw=_body, header=_hdr)
+    check(_st == 200,
+          "...and gets through as soon as one token has refilled: delayed by ~1/rate seconds, "
+          "never locked out, because success consumes nothing", f"{_st}: {_txt[:160]}")
+    _n86_reset_bucket()
+
+    # --- auth log rotation -------------------------------------------------
+    server86.nip86_auth_log("missing_header", {"marker": "pre-rotation"})
+    for _i in range(server86.NIP86_AUTH_LOG_MAX_LINES + 5):
+        server86.nip86_auth_log("missing_header", {"i": _i})
+    check(os.path.exists(server86.NIP86_AUTH_LOG_PREV_PATH),
+          "nip86-auth.jsonl rotates to .1 past NIP86_AUTH_LOG_MAX_LINES, same shape as "
+          "plugin86's decisions.jsonl")
+    check(len(_n86_authlog()) < server86.NIP86_AUTH_LOG_MAX_LINES,
+          "the live nip86-auth.jsonl segment is bounded, not unbounded")
+    check(not os.path.exists(server86.NIP86_AUTH_LOG_PREV_PATH + ".1"),
+          "exactly two nip86-auth.jsonl segments are retained")
+
+    server86.AUDIT_LOG_PATH = _n86_orig_audit_path
+    server86._audit_log = _n86_orig_audit_log
+    server86.CONFIG_PATH = _n86_orig_cfg_path
+    _httpd.strfry86_config = _n86_orig_httpd_cfg
+
 finally:
     _httpd.shutdown()
     _httpd_thread.join(timeout=5)
@@ -3336,7 +3941,7 @@ for ok, name, detail in results:
         print(line)
 PYEOF
 
-BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT" 2>&1)"
+BOUNDS_OUTPUT="$(python3 "$BOUNDS_TEST_SCRIPT" "$REPO_ROOT" "$TESTDIR" 2>&1)"
 echo "$BOUNDS_OUTPUT"
 BOUNDS_FAIL_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^FAIL: ')"
 BOUNDS_PASS_COUNT="$(echo "$BOUNDS_OUTPUT" | grep -c '^PASS: ')"
@@ -3547,7 +4152,7 @@ def with_tmp_install_dir(fn):
 
 
 def scenario_fresh(tmpdir):
-    inputs = iter([ADMIN_HEX, "npub1contactxxxx"])
+    inputs = iter([ADMIN_HEX, "npub1contactxxxx", "https://relay.example.com/"])
     orig_isatty, orig_input = sys.stdin.isatty, builtins.input
     sys.stdin.isatty = lambda: True
     builtins.input = lambda prompt="": next(inputs)
@@ -3561,11 +4166,54 @@ def scenario_fresh(tmpdir):
     check(cfg["contact_appeal"] == "npub1contactxxxx", "fresh install: contact_appeal prompted and written")
     check(cfg["port"] == updater.DEFAULT_PORT and cfg["bind"] == updater.DEFAULT_BIND,
           "fresh install: port/bind defaulted, never prompted")
+    # canonical_urls is ASKED, never derived: nothing in the installer can
+    # know the operator's public URL, and a plausible wrong answer here makes
+    # every NIP-86 request fail with what looks like a client signing bug.
+    check(cfg["canonical_urls"][0] == "https://relay.example.com/",
+          "fresh install: canonical_urls prompted and written", str(cfg.get("canonical_urls")))
+    check(updater.LOCAL_CANONICAL_URL in cfg["canonical_urls"],
+          "fresh install: the direct http://127.0.0.1:8686/ URL is ALWAYS seeded alongside "
+          "whatever public URL was given — without it nak and every development test fail on "
+          "day one with an auth error that looks like a signing problem")
+
+
+def scenario_canonical_urls_suggested_from_conf(tmpdir):
+    # relay.info.url is OFFERED as a default the operator confirms, never
+    # adopted silently — and wss:// is converted to https://, which is exactly
+    # the derivation Amethyst performs on the relay's own socket URL.
+    conf_path = os.path.join(tmpdir, "strfry.conf")
+    with open(conf_path, "w") as f:
+        f.write('relay {\n    info {\n        url = "wss://relay.example.com"\n'
+                '        pubkey = "' + ADMIN_HEX + '"\n    }\n}\n')
+    orig_conf = updater.STRFRY_CONF_PATH
+    updater.STRFRY_CONF_PATH = conf_path
+    orig_isatty, orig_input = sys.stdin.isatty, builtins.input
+    sys.stdin.isatty = lambda: True
+    try:
+        check(updater.find_relay_info_url() == "wss://relay.example.com",
+              "find_relay_info_url reads relay.info.url out of strfry.conf")
+        builtins.input = lambda prompt="": ""      # bare Return accepts the suggestion
+        urls = updater.prompt_canonical_urls()
+        check(urls[0] == "https://relay.example.com",
+              "an accepted relay.info.url suggestion is stored as https://, the scheme swap "
+              "Amethyst itself performs", str(urls))
+        check(updater.LOCAL_CANONICAL_URL in urls,
+              "the local URL is seeded even when the suggestion was accepted")
+        builtins.input = lambda prompt="": ("n" if "use it" in prompt or "allow NIP-86" in prompt
+                                            else "https://typed.example.com/")
+        urls = updater.prompt_canonical_urls()
+        check(urls[0] == "https://typed.example.com/",
+              "declining the suggestion falls back to manual entry — the suggestion is never "
+              "adopted silently", str(urls))
+    finally:
+        builtins.input, sys.stdin.isatty = orig_input, orig_isatty
+        updater.STRFRY_CONF_PATH = orig_conf
 
 
 def scenario_missing_contact_only(tmpdir):
     cfg_path = os.path.join(tmpdir, "config.json")
-    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0"}, open(cfg_path, "w"))
+    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0",
+               "canonical_urls": [updater.LOCAL_CANONICAL_URL]}, open(cfg_path, "w"))
     orig_isatty, orig_input = sys.stdin.isatty, builtins.input
     sys.stdin.isatty = lambda: True
     builtins.input = lambda prompt="": "someone@example.com"
@@ -3582,7 +4230,7 @@ def scenario_missing_contact_only(tmpdir):
 def scenario_missing_both(tmpdir):
     cfg_path = os.path.join(tmpdir, "config.json")
     json.dump({"port": 8686, "bind": "0.0.0.0"}, open(cfg_path, "w"))
-    inputs = iter([ADMIN_HEX, "https://example.com/appeal"])
+    inputs = iter([ADMIN_HEX, "https://example.com/appeal", "https://relay.example.com/"])
     orig_isatty, orig_input = sys.stdin.isatty, builtins.input
     sys.stdin.isatty = lambda: True
     builtins.input = lambda prompt="": next(inputs)
@@ -3591,15 +4239,21 @@ def scenario_missing_both(tmpdir):
     finally:
         builtins.input, sys.stdin.isatty = orig_input, orig_isatty
     cfg = json.load(open(cfg_path))
-    check("admin_pubkey_hex" in status and "contact_appeal" in status,
-          "update: a config missing BOTH installer-prompted fields tops up both, not just contact_appeal")
+    check(all(k in status for k in ("admin_pubkey_hex", "contact_appeal", "canonical_urls")),
+          "update: a config missing EVERY installer-prompted field tops up every one of them, "
+          "not just the ones that existed when the top-up loop was written", status)
     check(cfg["admin_pubkey_hex"] == ADMIN_HEX, "update: admin_pubkey_hex itself is topped up when missing")
     check(cfg["contact_appeal"] == "https://example.com/appeal", "update: contact_appeal topped up in the same run")
+    check(cfg["canonical_urls"][0] == "https://relay.example.com/",
+          "update: canonical_urls topped up in the same run — a field added to "
+          "INSTALLER_PROMPTED_FIELDS is asked on BOTH the fresh and the existing path, with no "
+          "second block to remember")
 
 
 def scenario_nothing_missing(tmpdir):
     cfg_path = os.path.join(tmpdir, "config.json")
-    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0", "contact_appeal": "x"}, open(cfg_path, "w"))
+    json.dump({"admin_pubkey_hex": ADMIN_HEX, "port": 8686, "bind": "0.0.0.0", "contact_appeal": "x",
+               "canonical_urls": [updater.LOCAL_CANONICAL_URL]}, open(cfg_path, "w"))
     def boom(prompt=""):
         raise AssertionError("input() must not be called when nothing is missing")
     orig_isatty, orig_input = sys.stdin.isatty, builtins.input
@@ -3627,6 +4281,9 @@ def scenario_noninteractive(tmpdir):
     cfg = json.load(open(cfg_path))
     check(status == "unchanged", "update: a missing field found non-interactively is left for the next run")
     check("contact_appeal" not in cfg, "update: a non-interactive run never writes a guessed/blank value")
+    check("canonical_urls" not in cfg,
+          "update: a non-interactive run never guesses canonical_urls either — the value is "
+          "asked or it is absent, never derived from relay.info")
 
 
 def scenario_conf_discovery_and_backup(tmpdir):
@@ -4027,6 +4684,7 @@ def scenario_server86_port_bound_check(tmpdir):
 
 
 with_tmp_install_dir(scenario_fresh)
+with_tmp_install_dir(scenario_canonical_urls_suggested_from_conf)
 with_tmp_install_dir(scenario_missing_contact_only)
 with_tmp_install_dir(scenario_missing_both)
 with_tmp_install_dir(scenario_nothing_missing)
