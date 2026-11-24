@@ -1,8 +1,8 @@
 # Eighty-Six (repo: `strfry-86`)
 
-A pure-Python moderation sidecar for a [strfry](https://github.com/hoytech/strfry) Nostr relay. Deployed *inside* your existing strfry Docker container — zero image changes, zero pip installs, zero new compose services. ("86" is restaurant slang for banning someone from the establishment — fitting for a relay literally named stir fry.)
+A moderation sidecar for a [strfry](https://github.com/hoytech/strfry) Nostr relay, written in Python with no pip dependencies. It installs inside the existing strfry Docker container, with no image change and no extra compose service. ("86" is restaurant slang for refusing someone service.)
 
-Report a user from any normal Nostr client (e.g. [jumble.social](https://jumble.social)) and Eighty-Six blacklists them at the relay's write policy. Unban them again from a bare admin web page, logged in with your NIP-07 browser extension.
+A report sent from an ordinary Nostr client (for example [jumble.social](https://jumble.social)) adds the reported user to the relay's write-policy blacklist. Bans are lifted from an admin web page that logs in with a NIP-07 browser extension.
 
 ## Install
 
