@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=694
+EXPECTED_MIN=765
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -4823,6 +4823,399 @@ FAILURES=$((FAILURES + UPDATER_FAIL_COUNT))
 CHECKS=$((CHECKS + UPDATER_FAIL_COUNT + UPDATER_PASS_COUNT))
 if [ "$UPDATER_EXIT" -ne 0 ]; then
     fail "updater test script exited $UPDATER_EXIT — a crash reached outside any single scenario's run_scenario() isolation; checks after the crash point never ran and are NOT covered by the PASS/FAIL counts above"
+fi
+
+# --- sidecar86.py: reports, roles, keeping, good sample, log-only ---------
+SIDECAR_TEST_SCRIPT="$TESTDIR/sidecar_test.py"
+cat > "$SIDECAR_TEST_SCRIPT" <<'PYEOF'
+import base64
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+
+repo, testdir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+sys.path.insert(0, testdir)
+import sidecar86  # noqa: E402
+from lib86 import ws  # noqa: E402
+from nip86_sign import pubkey_of, sign_event  # noqa: E402
+
+
+def check(cond, name):
+    print(("PASS: " if cond else "FAIL: ") + name)
+
+
+ADMIN_SK = bytes.fromhex("11" * 32)
+MOD_SK = bytes.fromhex("22" * 32)
+RANDO_SK = bytes.fromhex("33" * 32)
+SPAMMER_SK = bytes.fromhex("44" * 32)
+ADMIN = pubkey_of(ADMIN_SK).hex()
+MOD = pubkey_of(MOD_SK).hex()
+RANDO = pubkey_of(RANDO_SK).hex()
+SPAMMER = pubkey_of(SPAMMER_SK).hex()
+
+spam_note = sign_event(SPAMMER_SK, 1, [["t", "airdrop"]], "claim 1 ETH", created_at=1000)
+spam_profile = sign_event(SPAMMER_SK, 0, [], '{"name":"x"}', created_at=900)
+mod_list = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-moderators"], ["p", MOD], ["p", ADMIN], ["p", "zz"]],
+                      created_at=500)
+
+
+def report(sk, tags, created_at=2000):
+    return sign_event(sk, 1984, tags, "", created_at=created_at)
+
+
+def new_sidecar(data_dir=None, store=(spam_note, spam_profile), **over):
+    cfg = dict(sidecar86.DEFAULTS, relay_url="ws://127.0.0.1:1", admin_pubkey=ADMIN,
+               data_dir=data_dir or tempfile.mkdtemp(dir=testdir), **over)
+    calls = []
+
+    def fetch(filters):
+        calls.append(filters)
+        out = []
+        for ev in store:
+            for f in filters:
+                if "ids" in f and ev["id"] not in f["ids"]:
+                    continue
+                if "kinds" in f and ev["kind"] not in f["kinds"]:
+                    continue
+                if "authors" in f and ev["pubkey"] not in f["authors"]:
+                    continue
+                out.append(ev)
+                break
+        return out
+
+    return sidecar86.Sidecar(cfg, fetch=fetch, now=lambda: 12345), calls, cfg
+
+
+def read_jsonl(path):
+    try:
+        with open(path) as f:
+            return [json.loads(l) for l in f]
+    except FileNotFoundError:
+        return []
+
+
+# verify_event
+check(sidecar86.verify_event(spam_note), "verify_event accepts a correctly signed event")
+check(not sidecar86.verify_event(dict(spam_note, content="changed")), "verify_event rejects edited content")
+check(not sidecar86.verify_event(dict(spam_note, sig="00" * 64)), "verify_event rejects a bad signature")
+check(not sidecar86.verify_event({"id": "x"}), "verify_event rejects a malformed event without raising")
+
+# moderators_from / role_of
+mods = sidecar86.moderators_from(mod_list, ADMIN)
+check(mods == {MOD}, "moderator list keeps valid p tags, drops the admin and junk")
+check(sidecar86.moderators_from(dict(mod_list, pubkey=RANDO), ADMIN) is None,
+      "a moderator list not authored by the admin is ignored")
+check(sidecar86.role_of(ADMIN, ADMIN, mods) == "admin", "role_of: admin")
+check(sidecar86.role_of(MOD, ADMIN, mods) == "moderator", "role_of: moderator")
+check(sidecar86.role_of(RANDO, ADMIN, mods) is None, "role_of: anyone else has no role")
+
+# report_actions
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"], ["e", spam_note["id"], "spam"]]}, ADMIN, mods, "admin")
+check(acts == [{"method": "banpubkey", "target": SPAMMER, "reason": "spam"},
+               {"method": "banevent", "target": spam_note["id"], "reason": "spam"}],
+      "a report naming a pubkey and a post bans both, since a pubkey ban may leave posts up")
+acts = sidecar86.report_actions({"tags": [["e", spam_note["id"], "illegal"]]}, ADMIN, mods, "admin")
+check(acts == [{"method": "banevent", "target": spam_note["id"], "reason": "illegal"}],
+      "a report naming only an event bans the event")
+acts = sidecar86.report_actions({"tags": [["p", ADMIN, "spam"]]}, ADMIN, mods, "moderator")
+check(acts == [], "nobody bans the admin")
+acts = sidecar86.report_actions({"tags": [["p", MOD, "spam"]]}, ADMIN, mods, "moderator")
+check(acts == [], "a moderator cannot ban another moderator")
+acts = sidecar86.report_actions({"tags": [["p", MOD, "spam"]]}, ADMIN, mods, "admin")
+check([a["target"] for a in acts] == [MOD], "the admin can ban a moderator")
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER], ["p", SPAMMER], ["p", "nothex"]]}, ADMIN, mods, "admin")
+check([a["target"] for a in acts] == [SPAMMER], "duplicate and malformed p tags are dropped")
+acts = sidecar86.report_actions({"tags": [["p", MOD, "spam"], ["e", spam_note["id"], "spam"]]}, ADMIN, mods, "moderator")
+check(acts == [], "when every named pubkey is protected, the reported post is left alone too")
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"]]}, ADMIN, mods, "moderator", {SPAMMER})
+check(acts == [], "a moderator cannot ban someone on the admin's pardon list")
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"]]}, ADMIN, mods, "admin", {SPAMMER})
+check([a["target"] for a in acts] == [SPAMMER], "the admin can still ban someone they pardoned")
+
+# handle_report: requests are logged, never acted on, never fetched
+side, calls, cfg = new_sidecar()
+side.handle_moderator_list(mod_list)
+rec = side.handle_report(report(RANDO_SK, [["p", SPAMMER, "spam"]]))
+check(rec["result"] == "request" and "actions" not in rec, "a stranger's report is recorded as a request only")
+check(calls == [], "a stranger's report fetches nothing")
+check(read_jsonl(os.path.join(cfg["data_dir"], "kept-spam.jsonl")) == [], "a stranger's report keeps nothing")
+
+# admin report: kept first, then the would-ban decision
+r = report(ADMIN_SK, [["p", SPAMMER, "spam"], ["e", spam_note["id"], "spam"]])
+rec = side.handle_report(r)
+check(rec["result"] == "would-ban" and rec["role"] == "admin", "an admin report is a would-ban in log-only mode")
+check(rec["report"] == r["id"] and rec["signer"] == ADMIN, "the decision records the report id and its signer")
+kept = read_jsonl(os.path.join(cfg["data_dir"], "kept-spam.jsonl"))
+check(len(kept) == 1 and kept[0]["report"]["id"] == r["id"], "the admin report's content was kept")
+check(kept and [e["id"] for e in kept[0]["reported_events"]] == [spam_note["id"]],
+      "the kept record holds the reported event itself")
+check(kept and kept[0]["profiles"].get(SPAMMER, {}).get("id") == spam_profile["id"],
+      "the kept record holds the reported author's profile")
+check(kept and spam_note["id"] in [e["id"] for e in kept[0]["recent"].get(SPAMMER, [])],
+      "the kept record holds the reported author's recent posts")
+decisions = read_jsonl(os.path.join(cfg["data_dir"], "sidecar-decisions.jsonl"))
+check([d["type"] for d in decisions] == ["moderators", "report", "report"], "every report lands in the decision log")
+check(side.handle_report(r) is None, "a report already handled is ignored")
+
+# moderator report acts; forged admin report does not
+rec = side.handle_report(report(MOD_SK, [["e", spam_note["id"], "spam"]], created_at=2100))
+check(rec["result"] == "would-ban" and rec["role"] == "moderator", "a moderator's report is acted on")
+forged = report(RANDO_SK, [["p", SPAMMER, "spam"]], created_at=2200)
+forged = dict(forged, pubkey=ADMIN)
+rec = side.handle_report(forged)
+check(rec["result"] == "request" and rec["role"] is None, "a report claiming the admin's key with a bad signature is not acted on")
+
+# state survives a restart
+side2, _, _ = new_sidecar(data_dir=cfg["data_dir"])
+check(side2.since == 2200, "the report checkpoint survives a restart")
+check(side2.handle_report(r) is None, "a report handled before a restart is not handled again")
+
+# catch_up pages past a relay's per-query cap, oldest first
+backlog = [report(RANDO_SK, [["p", SPAMMER, "spam"]], created_at=5000 + i) for i in range(5)]
+
+
+def capped_fetch(filters):
+    f = filters[0]
+    rows = [e for e in backlog if e["created_at"] >= f.get("since", 0) and e["created_at"] <= f.get("until", 10**10)]
+    return sorted(rows, key=lambda e: -e["created_at"])[:2]
+
+
+cdir2 = tempfile.mkdtemp(dir=testdir)
+side5 = sidecar86.Sidecar(dict(sidecar86.DEFAULTS, admin_pubkey=ADMIN, data_dir=cdir2), fetch=capped_fetch)
+check(side5.catch_up() == 5, "catch_up finds every report even when the relay caps each answer at 2")
+logged = [d["report"] for d in read_jsonl(os.path.join(cdir2, "sidecar-decisions.jsonl"))]
+check(logged == [e["id"] for e in backlog], "catch_up handles the backlog oldest first")
+
+# keep reads through lookup, which can span other relays
+looked = []
+side6 = sidecar86.Sidecar(dict(sidecar86.DEFAULTS, admin_pubkey=ADMIN, data_dir=tempfile.mkdtemp(dir=testdir)),
+                          fetch=lambda f: [], lookup=lambda f: looked.append(f) or [spam_note, spam_profile])
+side6.handle_report(report(ADMIN_SK, [["p", SPAMMER, "spam"]], created_at=6000))
+check(looked != [], "the kept copy is fetched through the lookup relays, not only the watched relay")
+
+# moderator list updates
+side3, _, _ = new_sidecar()
+check(side3.handle_moderator_list(mod_list), "the admin's moderator list is loaded")
+older = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-moderators"]], created_at=400)
+check(not side3.handle_moderator_list(older) and side3.moderators == {MOD}, "an older moderator list is ignored")
+other_d = sign_event(ADMIN_SK, 30000, [["d", "friends"]], created_at=600)
+check(not side3.handle_moderator_list(other_d), "a list with another d tag is ignored")
+newer = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-moderators"]], created_at=700)
+check(side3.handle_moderator_list(newer) and side3.moderators == set(), "a newer list replaces the moderators")
+rec = side3.handle_report(report(MOD_SK, [["p", SPAMMER, "spam"]], created_at=2300))
+check(rec["result"] == "request", "a removed moderator's report is only a request")
+
+# pardon list: the admin overrides moderators
+side7, _, _ = new_sidecar()
+side7.handle_list(mod_list)
+pardons = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-pardons"], ["p", SPAMMER]], created_at=800)
+check(side7.handle_list(pardons) and side7.pardoned == {SPAMMER} and side7.moderators == {MOD},
+      "the admin's pardon list loads without touching the moderator list")
+forged = sign_event(RANDO_SK, 30000, [["d", "eighty-six-pardons"], ["p", RANDO]], created_at=900)
+check(not side7.handle_list(forged) and side7.pardoned == {SPAMMER}, "a pardon list from anyone else is ignored")
+rec = side7.handle_report(report(MOD_SK, [["p", SPAMMER, "spam"]], created_at=2400))
+check(rec["result"] == "nothing-to-ban" and rec.get("pardoned") == [SPAMMER],
+      "a moderator's report on a pardoned pubkey bans nothing and says why")
+rec = side7.handle_report(report(ADMIN_SK, [["p", SPAMMER, "spam"]], created_at=2401))
+check(rec["result"] == "would-ban", "the admin's own report still bans a pardoned pubkey")
+unpardon = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-pardons"]], created_at=1000)
+check(side7.handle_list(unpardon) and side7.pardoned == set(), "a newer, empty pardon list lifts the pardon")
+
+# good sample
+side4, _, cfg4 = new_sidecar(good_sample_every=3)
+kept_flags = [side4.handle_note(dict(spam_note, id=f"{i:064x}")) for i in range(9)]
+check(kept_flags.count(True) == 3, "one note in every good_sample_every is kept")
+check(len(read_jsonl(os.path.join(cfg4["data_dir"], "kept-good.jsonl"))) == 3, "kept notes land in kept-good.jsonl")
+check(not side4.handle_note(dict(spam_note, kind=7)), "only kind 1 notes are sampled")
+
+# file rotation
+d = tempfile.mkdtemp(dir=testdir)
+jf = sidecar86.JsonlFile(os.path.join(d, "x.jsonl"), max_bytes=100)
+for i in range(10):
+    jf.append({"i": i, "pad": "x" * 30})
+check(os.path.exists(jf.path + ".1") and os.path.getsize(jf.path) <= 100, "a kept file rotates to .1 at its size cap")
+
+# config
+cdir = tempfile.mkdtemp(dir=testdir)
+cpath = os.path.join(cdir, "sidecar.json")
+
+
+def cfg_error(obj):
+    with open(cpath, "w") as f:
+        json.dump(obj, f)
+    try:
+        sidecar86.load_config(cpath)
+        return None
+    except ValueError as exc:
+        return str(exc)
+
+
+check(cfg_error({"relay_url": "wss://r.example", "admin_pubkey": ADMIN}) is None, "a valid config loads in log-only mode")
+check(cfg_error({"relay_url": "wss://r.example", "admin_pubkey": ADMIN, "mode": "enforce"}) is not None,
+      "any mode other than log-only is refused")
+check(cfg_error({"relay_url": "https://r.example", "admin_pubkey": ADMIN}) is not None, "a non-websocket relay url is refused")
+check(cfg_error({"relay_url": "wss://r.example", "admin_pubkey": "npub1x"}) is not None, "a non-hex admin pubkey is refused")
+check(cfg_error({"relay_url": "wss://r.example", "admin_pubkey": ADMIN, "lookup_relays": ["https://x"]}) is not None,
+      "a lookup relay that is not a websocket url is refused")
+
+
+# end to end: run() against a fake relay on 127.0.0.1
+class FakeRelay:
+    def __init__(self, events):
+        self.events = events
+        self.reqs = []
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(8)
+        self.port = self.srv.getsockname()[1]
+        self.alive = True
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while self.alive:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+
+    def _send(self, c, obj):
+        data = json.dumps(obj).encode()
+        n = len(data)
+        head = bytes([0x81]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n))
+        c.sendall(head + data)
+
+    def _serve(self, c):
+        try:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += c.recv(4096)
+            key = [l.split(b":", 1)[1].strip() for l in buf.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
+            acc = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                      b"Sec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+            buf = b""
+            while self.alive:
+                while len(buf) < 2:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        return
+                    buf += chunk
+                n = buf[1] & 0x7F
+                off = 2
+                if n == 126:
+                    while len(buf) < 4:
+                        buf += c.recv(65536)
+                    n = struct.unpack(">H", buf[2:4])[0]
+                    off = 4
+                while len(buf) < off + 4 + n:
+                    buf += c.recv(65536)
+                mask = buf[off:off + 4]
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(buf[off + 4:off + 4 + n]))
+                opcode = buf[0] & 0x0F
+                buf = buf[off + 4 + n:]
+                if opcode == 0x8:
+                    return
+                msg = json.loads(payload)
+                if msg[0] != "REQ":
+                    continue
+                self.reqs.append(msg)
+                sub, filters = msg[1], msg[2:]
+                for ev in self.events:
+                    if any(ev["kind"] in f.get("kinds", [ev["kind"]]) and
+                           ev["pubkey"] in f.get("authors", [ev["pubkey"]]) and
+                           ev["id"] in f.get("ids", [ev["id"]]) for f in filters):
+                        self._send(c, ["EVENT", sub, ev])
+                self._send(c, ["EOSE", sub])
+        except (OSError, IndexError, ValueError):
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.alive = False
+        self.srv.close()
+
+
+# draft spam rules (tools/spam_rules.py)
+sys.path.insert(0, os.path.join(repo, "tools"))
+import spam_rules  # noqa: E402
+
+check(spam_rules.is_homoglyph_word("ClᎪim"), "a Latin word with a Cherokee look-alike letter is a homoglyph")
+check(not spam_rules.is_homoglyph_word("идempотент"),
+      "a mostly-Cyrillic word with a Latin slip is not a homoglyph")
+check(not spam_rules.is_homoglyph_word("ai乱真"), "Latin next to Chinese is not a homoglyph")
+
+
+def note(pk, at, content, hashtags=0):
+    return {"id": hashlib.sha256(f"{pk}{at}{content}".encode()).hexdigest(), "pubkey": pk, "created_at": at,
+            "kind": 1, "tags": [["t", f"t{i}"] for i in range(hashtags)], "content": content}
+
+
+burst = [note(f"{i:064x}", 1000 + i, f"claim https://drop.example/?ref=c{i}") for i in range(10)]
+check(spam_rules.link_bursts(burst, {}) == {"drop.example"},
+      "ten keys linking one host, each with its own referral code, inside an hour is a burst")
+check(spam_rules.link_bursts(burst[:9], {}) == set(), "nine keys is not a burst")
+spread = [dict(e, created_at=1000 + i * 4000) for i, e in enumerate(burst)]
+check(spam_rules.link_bursts(spread, {}) == set(), "the same links spread over hours are not a burst")
+same_key = [dict(e, pubkey="ab" * 32) for e in burst]
+check(spam_rules.link_bursts(same_key, {}) == set(), "one key posting its own referral link is not a burst")
+check(spam_rules.tier_of(spam_rules.classify(burst[0], {}, {"drop.example"})) == "reject",
+      "a post in a referral burst is in the reject tier")
+check(spam_rules.tier_of(spam_rules.classify(note("cd" * 32, 1, "gm", hashtags=6), {}, set())) == "review",
+      "a profile-less key stuffing hashtags is only queued for review")
+check(spam_rules.tier_of(spam_rules.classify(note("cd" * 32, 1, "gm https://x.example/a.jpg", 1), {"cd" * 32: {}}, set())) is None,
+      "an ordinary post with a link passes")
+
+admin_report = report(ADMIN_SK, [["p", SPAMMER, "spam"]], created_at=3000)
+stranger_report = report(RANDO_SK, [["p", SPAMMER, "spam"]], created_at=3001)
+relay = FakeRelay([mod_list, spam_note, spam_profile, admin_report, stranger_report])
+try:
+    got = ws.query(f"ws://127.0.0.1:{relay.port}", [{"kinds": [1]}], timeout=5)
+    check([e["id"] for e in got] == [spam_note["id"]], "ws.query returns the matching events up to EOSE")
+
+    e2e_dir = tempfile.mkdtemp(dir=testdir)
+    e2e_cfg = dict(sidecar86.DEFAULTS, relay_url=f"ws://127.0.0.1:{relay.port}", admin_pubkey=ADMIN, data_dir=e2e_dir)
+    stop = {"now": False}
+    t = threading.Thread(target=sidecar86.run, args=(e2e_cfg, stop), daemon=True)
+    t.start()
+    dpath = os.path.join(e2e_dir, "sidecar-decisions.jsonl")
+    deadline = time.time() + 20
+    while time.time() < deadline and len([d for d in read_jsonl(dpath) if d["type"] == "report"]) < 2:
+        time.sleep(0.2)
+    stop["now"] = True
+    decisions = {d.get("report"): d for d in read_jsonl(dpath) if d["type"] == "report"}
+    check(decisions.get(admin_report["id"], {}).get("result") == "would-ban",
+          "end to end: the admin's report on the relay becomes a would-ban")
+    check(decisions.get(stranger_report["id"], {}).get("result") == "request",
+          "end to end: a stranger's report on the relay stays a request")
+    kept = read_jsonl(os.path.join(e2e_dir, "kept-spam.jsonl"))
+    check(len(kept) == 1 and kept[0]["profiles"].get(SPAMMER), "end to end: the reported author's profile was kept")
+    order = [r[1] for r in relay.reqs if r[1] in ("mods", "reports", "good")]
+    check(order[:1] == ["mods"] and "reports" in order and order.index("reports") > 0,
+          "end to end: the moderator list is read before any report is handled")
+    t.join(timeout=15)
+    check(not t.is_alive(), "end to end: run() stops when asked")
+finally:
+    relay.close()
+PYEOF
+SIDECAR_OUTPUT="$(cd "$REPO_ROOT" && python3 "$SIDECAR_TEST_SCRIPT" "$REPO_ROOT" "$TESTDIR" 2>&1)"
+SIDECAR_EXIT=$?
+echo "$SIDECAR_OUTPUT"
+SIDECAR_FAIL_COUNT="$(echo "$SIDECAR_OUTPUT" | grep -c '^FAIL: ')"
+SIDECAR_PASS_COUNT="$(echo "$SIDECAR_OUTPUT" | grep -c '^PASS: ')"
+FAILURES=$((FAILURES + SIDECAR_FAIL_COUNT))
+CHECKS=$((CHECKS + SIDECAR_FAIL_COUNT + SIDECAR_PASS_COUNT))
+if [ "$SIDECAR_EXIT" -ne 0 ]; then
+    fail "sidecar test script exited $SIDECAR_EXIT — checks after the crash point never ran"
 fi
 
 # --- the scan sections have no control bound to a page-assembled set -----

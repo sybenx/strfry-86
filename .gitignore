@@ -14,3 +14,5 @@ server86.log
 .DS_Store
 nip86-auth.jsonl
 nip86-auth.jsonl.1
+sidecar.json
+sidecar-data/
