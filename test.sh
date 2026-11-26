@@ -19,7 +19,7 @@ CHECKS=0
 # checks than this, for ANY reason (a crash, an early exit, a silently
 # skipped section), fails loudly instead of quietly reporting whatever
 # subset happened to complete as "ALL TESTS PASSED".
-EXPECTED_MIN=757
+EXPECTED_MIN=765
 # Set to 1 only by the real final-tally block at the bottom of this file.
 # The EXIT trap below uses this to detect "the script stopped running
 # before it ever tallied its results" — a truncation that a plain FAILURES
@@ -4918,8 +4918,9 @@ check(sidecar86.role_of(RANDO, ADMIN, mods) is None, "role_of: anyone else has n
 
 # report_actions
 acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"], ["e", spam_note["id"], "spam"]]}, ADMIN, mods, "admin")
-check(acts == [{"method": "banpubkey", "target": SPAMMER, "reason": "spam"}],
-      "a report naming a pubkey bans the pubkey (and not the event)")
+check(acts == [{"method": "banpubkey", "target": SPAMMER, "reason": "spam"},
+               {"method": "banevent", "target": spam_note["id"], "reason": "spam"}],
+      "a report naming a pubkey and a post bans both, since a pubkey ban may leave posts up")
 acts = sidecar86.report_actions({"tags": [["e", spam_note["id"], "illegal"]]}, ADMIN, mods, "admin")
 check(acts == [{"method": "banevent", "target": spam_note["id"], "reason": "illegal"}],
       "a report naming only an event bans the event")
@@ -4931,6 +4932,12 @@ acts = sidecar86.report_actions({"tags": [["p", MOD, "spam"]]}, ADMIN, mods, "ad
 check([a["target"] for a in acts] == [MOD], "the admin can ban a moderator")
 acts = sidecar86.report_actions({"tags": [["p", SPAMMER], ["p", SPAMMER], ["p", "nothex"]]}, ADMIN, mods, "admin")
 check([a["target"] for a in acts] == [SPAMMER], "duplicate and malformed p tags are dropped")
+acts = sidecar86.report_actions({"tags": [["p", MOD, "spam"], ["e", spam_note["id"], "spam"]]}, ADMIN, mods, "moderator")
+check(acts == [], "when every named pubkey is protected, the reported post is left alone too")
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"]]}, ADMIN, mods, "moderator", {SPAMMER})
+check(acts == [], "a moderator cannot ban someone on the admin's pardon list")
+acts = sidecar86.report_actions({"tags": [["p", SPAMMER, "spam"]]}, ADMIN, mods, "admin", {SPAMMER})
+check([a["target"] for a in acts] == [SPAMMER], "the admin can still ban someone they pardoned")
 
 # handle_report: requests are logged, never acted on, never fetched
 side, calls, cfg = new_sidecar()
@@ -5004,6 +5011,22 @@ newer = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-moderators"]], created_at
 check(side3.handle_moderator_list(newer) and side3.moderators == set(), "a newer list replaces the moderators")
 rec = side3.handle_report(report(MOD_SK, [["p", SPAMMER, "spam"]], created_at=2300))
 check(rec["result"] == "request", "a removed moderator's report is only a request")
+
+# pardon list: the admin overrides moderators
+side7, _, _ = new_sidecar()
+side7.handle_list(mod_list)
+pardons = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-pardons"], ["p", SPAMMER]], created_at=800)
+check(side7.handle_list(pardons) and side7.pardoned == {SPAMMER} and side7.moderators == {MOD},
+      "the admin's pardon list loads without touching the moderator list")
+forged = sign_event(RANDO_SK, 30000, [["d", "eighty-six-pardons"], ["p", RANDO]], created_at=900)
+check(not side7.handle_list(forged) and side7.pardoned == {SPAMMER}, "a pardon list from anyone else is ignored")
+rec = side7.handle_report(report(MOD_SK, [["p", SPAMMER, "spam"]], created_at=2400))
+check(rec["result"] == "nothing-to-ban" and rec.get("pardoned") == [SPAMMER],
+      "a moderator's report on a pardoned pubkey bans nothing and says why")
+rec = side7.handle_report(report(ADMIN_SK, [["p", SPAMMER, "spam"]], created_at=2401))
+check(rec["result"] == "would-ban", "the admin's own report still bans a pardoned pubkey")
+unpardon = sign_event(ADMIN_SK, 30000, [["d", "eighty-six-pardons"]], created_at=1000)
+check(side7.handle_list(unpardon) and side7.pardoned == set(), "a newer, empty pardon list lifts the pardon")
 
 # good sample
 side4, _, cfg4 = new_sidecar(good_sample_every=3)

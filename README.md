@@ -230,6 +230,12 @@ would do), `kept-spam.jsonl`, `kept-good.jsonl`, and `sidecar-state.json` (the
 checkpoint). The moderator list is a kind 30000 list signed by the admin with
 `d` = `eighty-six-moderators`; its `p` tags are the moderators.
 
+A report bans every pubkey and every post it names, because on many relays banning a
+pubkey leaves that person's stored posts up. Nobody can ban the admin, and a moderator
+cannot ban another moderator. To overrule a moderator, the admin puts the pubkey on a
+second kind 30000 list with `d` = `eighty-six-pardons`: after that, moderator reports
+against it ban nothing, though the admin's own reports still do.
+
 `tools/spam_rules.py replay corpus.json` scores the draft spam rules against labeled
 posts; see `docs/spam-replay.md` for the first run.
 

@@ -2,6 +2,7 @@
   "relay_url": "wss://relay.example.com",
   "admin_pubkey": "0000000000000000000000000000000000000000000000000000000000000000",
   "moderator_list_d": "eighty-six-moderators",
+  "pardon_list_d": "eighty-six-pardons",
   "mode": "log-only",
   "good_sample_every": 50,
   "context_limit": 20,

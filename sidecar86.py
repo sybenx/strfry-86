@@ -26,6 +26,7 @@ DEFAULTS = {
     "relay_url": "",
     "admin_pubkey": "",
     "moderator_list_d": "eighty-six-moderators",
+    "pardon_list_d": "eighty-six-pardons",
     "mode": "log-only",
     "good_sample_every": 50,
     "context_limit": 20,
@@ -72,7 +73,8 @@ def tag_values(ev, name):
 
 
 def moderators_from(list_event, admin):
-    """The moderator set a list event names, or None if it isn't the admin's list."""
+    """The pubkeys an admin list event names (moderators or pardons), or None if it
+    isn't the admin's list."""
     if list_event.get("pubkey") != admin or list_event.get("kind") != MODERATOR_LIST_KIND:
         return None
     return {p for p in tag_values(list_event, "p") if is_hex64(p) and p != admin}
@@ -86,25 +88,29 @@ def role_of(pubkey, admin, moderators):
     return None
 
 
-def report_actions(report, admin, moderators, signer_role):
-    """Ban calls a report asks for. Reported pubkeys are banned; a reported event is
-    banned only when the report names no pubkey. A moderator cannot ban the admin or
-    another moderator; nobody bans the admin."""
+def report_actions(report, admin, moderators, signer_role, pardoned=frozenset()):
+    """Ban calls a report asks for: every reported pubkey and every reported event,
+    since on many relays banning a pubkey leaves its stored posts up.
+
+    Nobody bans the admin. A moderator cannot ban another moderator or anyone on the
+    admin's pardon list; the admin can. If every pubkey a report names is protected,
+    its events are left alone too, because they are almost always that person's."""
     reason = ""
     actions = []
     for t in report.get("tags", []):
         if isinstance(t, list) and len(t) >= 3 and t[0] in ("p", "e") and isinstance(t[2], str):
             reason = reason or t[2]
+    named = [p for p in tag_values(report, "p") if is_hex64(p)]
     pubkeys = []
-    for p in tag_values(report, "p"):
-        if not is_hex64(p) or p in pubkeys or p == admin:
+    for p in named:
+        if p in pubkeys or p == admin:
             continue
-        if signer_role == "moderator" and p in moderators:
+        if signer_role == "moderator" and (p in moderators or p in pardoned):
             continue
         pubkeys.append(p)
     for p in pubkeys:
         actions.append({"method": "banpubkey", "target": p, "reason": reason})
-    if not tag_values(report, "p"):
+    if pubkeys or not named:
         for e in tag_values(report, "e"):
             if is_hex64(e) and not any(a["target"] == e for a in actions):
                 actions.append({"method": "banevent", "target": e, "reason": reason})
@@ -144,6 +150,8 @@ class Sidecar:
         self.state_path = os.path.join(data, "sidecar-state.json")
         self.moderators = set()
         self.moderator_list_at = -1
+        self.pardoned = set()
+        self.pardon_list_at = -1
         self.good_counter = 0
         self.since = 0
         self.seen = []
@@ -176,6 +184,26 @@ class Sidecar:
                                "moderators": sorted(mods)})
         return True
 
+    def handle_pardon_list(self, ev):
+        """The admin's pardon list: pubkeys a moderator's report can no longer ban.
+        Taking someone off it lets moderator reports reach them again."""
+        pardoned = moderators_from(ev, self.admin)
+        if pardoned is None or ev.get("created_at", -1) <= self.pardon_list_at:
+            return False
+        if self.cfg["pardon_list_d"] not in tag_values(ev, "d") or not verify_event(ev):
+            return False
+        self.pardoned = pardoned
+        self.pardon_list_at = ev["created_at"]
+        self.decisions.append({"at": int(self.now()), "type": "pardons", "list_event": ev["id"],
+                               "pardoned": sorted(pardoned)})
+        return True
+
+    def handle_list(self, ev):
+        d = tag_values(ev, "d")
+        if self.cfg["pardon_list_d"] in d:
+            return self.handle_pardon_list(ev)
+        return self.handle_moderator_list(ev)
+
     def handle_report(self, ev):
         rid = ev.get("id")
         if ev.get("kind") != 1984 or not is_hex64(rid) or rid in self.seen:
@@ -188,7 +216,11 @@ class Sidecar:
         if role is None:
             record["result"] = "request"
         else:
-            actions = report_actions(ev, self.admin, self.moderators, role)
+            actions = report_actions(ev, self.admin, self.moderators, role, self.pardoned)
+            if role == "moderator":
+                spared = sorted({p for p in tag_values(ev, "p") if p in self.pardoned})
+                if spared:
+                    record["pardoned"] = spared
             if actions:
                 self.keep(ev, role, actions)
             record["result"] = "would-ban" if actions else "nothing-to-ban"
@@ -290,7 +322,7 @@ def run(cfg, stop):
         try:
             conn = ws.WebSocket(url)
             conn.send(["REQ", "mods", {"kinds": [MODERATOR_LIST_KIND], "authors": [side.admin],
-                                       "#d": [cfg["moderator_list_d"]]}])
+                                       "#d": [cfg["moderator_list_d"], cfg["pardon_list_d"]]}])
             ready = False
             while not stop["now"]:
                 try:
@@ -302,7 +334,7 @@ def run(cfg, stop):
                 if msg[0] == "EVENT" and len(msg) >= 3 and isinstance(msg[2], dict):
                     ev = msg[2]
                     if msg[1] == "mods":
-                        side.handle_moderator_list(ev)
+                        side.handle_list(ev)
                     elif msg[1] == "reports":
                         side.handle_report(ev)
                     elif msg[1] == "good":
