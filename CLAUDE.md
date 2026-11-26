@@ -116,10 +116,15 @@ Three processes live in this repo; strfry itself does not.
 
 - `server86.py` — admin HTTP server: routing, auth, scans, job machinery, pages/API.
 - `plugin86.py` — write-policy plugin: auto-ban, decision log, server86 spawn.
+- `sidecar86.py` — relay-agnostic daemon (log-only so far): reads kind 1984 and the
+  admin's moderator list (kind 30000, d `eighty-six-moderators`), keeps a copy of
+  reported content and a sample of ordinary notes, logs the bans it would make.
+  Config `sidecar.json`, data in `sidecar-data/`. Not in the deploy bundle yet.
 - `strfry-86-updater.py` — manual installer/updater.
 - `ensure-server86.sh` — optional Docker `HEALTHCHECK` wrapper; keeps server86.py alive
   independent of relay traffic (see README, "Keep the admin page up across restarts").
-- `lib86/` — shared library (ban list, BIP-340 verify, name cache), used by more than
+- `lib86/` — shared library (ban list, BIP-340 verify, name cache, `ws.py` websocket
+  client), used by more than
   one of the processes above. `bip340.py` only ever VERIFIES; signing exists solely in
   `test.sh`, self-validated against the reference vectors before anything trusts it.
 - `common86.js` — shared client code: page chrome, nav, search, theme toggle, record
@@ -129,6 +134,8 @@ Three processes live in this repo; strfry itself does not.
   `profile.html`, `domain.html` — the eight pages.
 - `tools/style86.css` — the one canonical style block.
 - `tools/stamp_style.py`, `tools/make_bundle.py` — style stamping and deploy bundling.
+- `tools/spam_rules.py` — draft spam rules (reject/review tiers) and a replay that scores
+  them against labeled posts. Not wired into any write path yet.
 - `tests/` — fixtures for `test.sh`; see `tests/README.md` for provenance.
 - `manifest.json` — deploy manifest the updater diffs against.
 - `test-relay/` — disposable local strfry + Eighty-Six for measurement/delete testing;

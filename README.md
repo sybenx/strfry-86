@@ -210,6 +210,29 @@ If `writePolicy.plugin` is already set to something else, the updater normally l
 
 strfry only has one `writePolicy.plugin` slot, so running Eighty-Six and some other plugin (a spam filter, a rate limiter, anything that speaks strfry's own plugin protocol) used to mean picking one — the updater would refuse to overwrite an existing value and just warn. plugin86.py can now chain to that other plugin instead: when it finds `writePolicy.plugin` already set to something else, the updater offers (interactively) to record it as `next_plugin` in `config.json`. Every event Eighty-Six itself would *accept* is then forwarded to that downstream process and its verdict relayed verbatim; an event Eighty-Six *rejects* (a banned pubkey, for instance) short-circuits and never reaches it. If the downstream hangs, dies, or replies with something malformed, plugin86.py falls back to its own verdict, logs it once, and stops forwarding for the rest of that run — it never retries and never blocks the relay's write path waiting on it. The decision log (Stats & Console) records which stage actually made each call. `next_plugin` and its per-event timeout (`next_plugin_timeout`, default 2s) are both editable on the Settings page; both take effect the next time plugin86.py restarts, not immediately on save.
 
+## Sidecar (work in progress, log-only)
+
+`sidecar86.py` is the start of the relay-agnostic version. It connects to any relay as
+an ordinary client, reads kind 1984 reports and the admin's moderator list, and for each
+report from the admin or a moderator keeps a copy of the reported content (the event,
+the author's profile and recent posts) and logs the ban it would make. Reports from
+anyone else are logged as requests. It also keeps every Nth ordinary note as a sample
+of what normally gets through. It does not ban anything yet: the only mode is
+`log-only`, and it holds no key.
+
+```
+cp sidecar.example.json sidecar.json   # set relay_url and admin_pubkey
+python3 sidecar86.py
+```
+
+Output goes to `sidecar-data/`: `sidecar-decisions.jsonl` (every report and what it
+would do), `kept-spam.jsonl`, `kept-good.jsonl`, and `sidecar-state.json` (the
+checkpoint). The moderator list is a kind 30000 list signed by the admin with
+`d` = `eighty-six-moderators`; its `p` tags are the moderators.
+
+`tools/spam_rules.py replay corpus.json` scores the draft spam rules against labeled
+posts; see `docs/spam-replay.md` for the first run.
+
 ## Trust model
 
 The NIP-86 endpoint above is the only part of Eighty-Six meant to be reachable from the
